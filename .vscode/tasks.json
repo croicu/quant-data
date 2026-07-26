@@ -1,0 +1,133 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "create",
+      "type": "shell",
+      "problemMatcher": [],
+      "windows": {
+        "command": "if not exist .venv python -m venv .venv"
+      },
+      "linux": {
+        "command": "test -d .venv || python3 -m venv .venv"
+      },
+      "osx": {
+        "command": "test -d .venv || python3 -m venv .venv"
+      }
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "problemMatcher": [],
+      "windows": {
+        "command": ".venv\\Scripts\\python -m build"
+      },
+      "linux": {
+        "command": "./.venv/bin/python -m build"
+      },
+      "osx": {
+        "command": "./.venv/bin/python -m build"
+      }
+    },
+    {
+      "label": "rebuild",
+      "type": "shell",
+      "problemMatcher": [],
+      "windows": {
+        "command": "rd /s/q dist 2>nul & .venv\\Scripts\\python -m build"
+      },
+      "linux": {
+        "command": "rm -rf ./dist && ./.venv/bin/python -m build"
+      },
+      "osx": {
+        "command": "rm -rf ./dist && ./.venv/bin/python -m build"
+      }
+    },
+    {
+      "label": "install",
+      "type": "shell",
+      "dependsOn": "create",
+      "problemMatcher": [],
+      "windows": {
+        "command": ".\\.venv\\Scripts\\python.exe -m pip install -e .[dev]"
+      },
+      "linux": {
+        "command": "./.venv/bin/python -m pip install -e .[dev]"
+      },
+      "osx": {
+        "command": "./.venv/bin/python -m pip install -e .[dev]"
+      }
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "problemMatcher": [],
+      "windows": {
+        "command": ".\\.venv\\Scripts\\python.exe -m pytest"
+      },
+      "linux": {
+        "command": "./.venv/bin/python -m pytest"
+      },
+      "osx": {
+        "command": "./.venv/bin/python -m pytest"
+      }
+    },
+    {
+      "label": "lint",
+      "type": "shell",
+      "problemMatcher": [],
+      "windows": {
+        "command": ".\\.venv\\Scripts\\python.exe -m ruff check ."
+      },
+      "linux": {
+        "command": "./.venv/bin/python -m ruff check ."
+      },
+      "osx": {
+        "command": "./.venv/bin/python -m ruff check ."
+      }
+    },
+    {
+      "label": "format",
+      "type": "shell",
+      "problemMatcher": [],
+      "windows": {
+        "command": ".\\.venv\\Scripts\\python.exe -m ruff format ."
+      },
+      "linux": {
+        "command": "./.venv/bin/python -m ruff format ."
+      },
+      "osx": {
+        "command": "./.venv/bin/python -m ruff format ."
+      }
+    },
+    {
+      "label": "zap",
+      "type": "shell",
+      "problemMatcher": [],
+      "windows": {
+        "command": "rmdir /s /q .venv"
+      },
+      "linux": {
+        "command": "rm -rf .venv"
+      },
+      "osx": {
+        "command": "rm -rf .venv"
+      }
+    },
+    {
+      "label": "publish",
+      "type": "shell",
+      "dependsOn": "rebuild",
+      "problemMatcher": [],
+      "windows": {
+        "command": ".venv\\Scripts\\python -m twine upload dist/*"
+      },
+      "linux": {
+        "command": "./.venv/bin/python -m twine upload dist/*"
+      },
+      "osx": {
+        "command": "./.venv/bin/python -m twine upload dist/*"
+      }
+    }
+  ]
+}

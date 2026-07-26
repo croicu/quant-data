@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Python cache files
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# venv
+.venv/
+
+# ruff
+.ruff_cache/
+
+# Claude Code
+.claude/
+
+# pytest temp
+.pytest_tmp/
+
+# Local settings override (personal overrides, not committed)
+settings.local.json
+
+# Secrets / credentials — never commit real DB or SSH credentials
+.env
+*.pem
+*.key

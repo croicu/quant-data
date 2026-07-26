@@ -1,0 +1,8 @@
+{
+  "settings": {
+    "debug": false,
+    "logLevel": "error",
+    "logCategories": [],
+    "excludedCategories": []
+  }
+}
