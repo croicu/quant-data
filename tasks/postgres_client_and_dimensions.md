@@ -1,4 +1,4 @@
-# Postgres Client
+# Postgres Client + Ingest
 
 ## Status: Brainstorm
 
@@ -6,10 +6,18 @@
 
 The initial bootstrap (`migrations/001_init_schema.sql`, `docs/SCHEMA.md`/`DATABASE.md`/`SETUP.md`)
 shipped the star schema only — no Python code, no way to read or write bars from code. This task is
-the deliberate follow-up: a read client (and eventually a write/ingest path) against the schema.
+the deliberate follow-up: both a read client and the ingest/write path against the schema, both
+living in this repo.
 
 PostgreSQL is now provisioned on `CroicuWS1` and `dim_date`/`dim_time` are populated (see the
-now-closed ad-hoc infra issue) — this task is scoped to the Python client only from here on.
+now-closed ad-hoc infra issue).
+
+**Single-writer, many-reader**: `quant-data` is the sole author of the data — it owns ingest and is
+the only thing with write access to the database. `quant-scratch` and any future consumer repos are
+read-only clients, going through `MarketDataProvider`; no client should hold write credentials to
+the database at all. This resolves the "where does ingest live" question below in favor of this
+repo, and turns "no client should write" from a convention into a requirement enforced at the
+database-privilege level (see the new open question on role separation).
 
 This content originates from `quant-scratch`'s `tasks/database_layer.md`, which envisioned this
 Python client living in `quant-scratch` itself (`shared.postgres.PostgresDatabase`,
@@ -19,16 +27,18 @@ Python client living in `quant-scratch` itself (`shared.postgres.PostgresDatabas
 
 ## Design decisions
 
-Carried over from `database_layer.md`, adapted to this repo's actual package name
-(`quant_data`, not `shared`/`defs`):
+Carried over from `database_layer.md`, adapted to this repo's actual package layout
+(`src/defs/`, `src/shared/`, `src/ingest/` — see `docs/ARCHITECTURE.md`):
 
-- **`quant_data.contracts.MarketDataProvider(Protocol)`** — `fetch_bars(ticker, start_date,
+- **`defs.contracts.MarketDataProvider(Protocol)`** — `fetch_bars(ticker, start_date,
   end_date) -> list[OHLCV]`, read-only. No write methods in this first pass.
-- **`quant_data.protocols.OHLCV`** — a dataclass carrying ticker + resolved date/time + OHLCV
+- **`defs.protocols.OHLCV`** — a dataclass carrying ticker + resolved date/time + OHLCV
   values, structured the way `day_chart`'s `DayBar` is in `quant-scratch` (pure data, no methods).
-- **`quant_data.postgres.PostgresDatabase`** — the concrete `MarketDataProvider` implementation.
+- **`shared.postgres.PostgresDatabase`** — the concrete `MarketDataProvider` implementation.
   Single connection per invocation, no pooling. Wraps database errors as `AppError`, matching the
-  rest of this template's error-handling convention.
+  rest of this template's error-handling convention. Lives in `shared/` (not `ingest/`) since
+  external consumers import it directly as the read client, same as `ingest` would for its own
+  reads — it isn't owned by one app.
 - **Settings**: add a `postgres` section to `settings.json`/`settings.local.json` (`host`, `port`,
   `user`, `password`, `dbname`) — the password belongs in `settings.local.json` (gitignored), never
   the committed `settings.json`.
@@ -43,15 +53,39 @@ Carried over from `database_layer.md`, adapted to this repo's actual package nam
   or any client. Setting up reachability itself (opening a tunnel, configuring a VPC/security
   group, whatever a given host requires) is the operator's job, done before the app runs — not
   something the client's code manages.
+- **Distribution: git dependency, not PyPI**: consumers install the `quant-data` distribution
+  directly from this repo — `pip install "git+https://github.com/croicu/quant-data.git@<ref>"`,
+  pinned to a tag or commit SHA, not a published PyPI package. This is an internal data-layer
+  package for a known, small set of consumer repos (`quant-scratch` today, others later per
+  Cross-Repo Coordination), not a general-purpose public library, so PyPI packaging/versioning
+  overhead doesn't pay for itself. `defs.contracts.MarketDataProvider`/`defs.protocols.OHLCV` are
+  the public contract consumers import (see `docs/ARCHITECTURE.md` for the full package layout).
+- **The Python contract is ergonomics, not the security boundary**: because consumers install the
+  `quant-data` distribution as a real package, they get `psycopg` and can instantiate
+  `shared.postgres.PostgresDatabase` themselves with their own connection settings — a live DB
+  connection, not a narrow read-only RPC surface. `MarketDataProvider` omitting a write method
+  stops accidental misuse, not deliberate or buggy writes via `psycopg` directly. The actual
+  enforcement of "no client can write" is the DB-role split below — connection privileges, not the
+  Python interface.
+- **Two DB roles: `quant_reader` and `quant_writer`** — resolves the role-separation open question.
+  `quant_writer` is password-protected (`scram-sha-256`), owns the schema, read/write; used only by
+  this repo's own ingest pipeline. `quant_reader` is `SELECT`-only and **trust-authenticated** — no
+  DB password at all — for connections from `127.0.0.1`. The gate for readers is reaching that
+  loopback port in the first place (i.e. holding an SSH key authorized on the box, per
+  `docs/DATABASE.md`'s tunnel), not a second password on top of it. This needs role-specific
+  `pg_hba.conf` lines ordered before the current generic `host all all 127.0.0.1/32 scram-sha-256`
+  rule (first match wins), e.g. `host quant_data quant_reader 127.0.0.1/32 trust` placed above it.
+  The existing `quant_data` role (schema owner, created during provisioning) still needs to be
+  reconciled into this split — likely repurposed as (or replaced by) `quant_writer` — at
+  implementation time.
 
 ## Open questions
 
-- **Where does ingest live?** This task is read-only by design (matching `database_layer.md`'s
-  original scope), but *something* has to populate `fact_market_data_1min` from a real provider
-  (see `quant-scratch`'s `tasks/ibkr_tws_extended_hours.md` — IBKR is the chosen intraday source).
-  Does the ingest tool live in this repo (`quant_data`, as a second CLI alongside the read client),
-  or in `quant-scratch` as a new experiment package that happens to write to `quant-data`'s
-  database instead of a local CSV? Undecided — revisit once IBKR's own task has moved past
+- **Ingest tool shape**: decided that ingest lives in this repo (`quant-data`, as `src/ingest/` —
+  see the reorg in `docs/ARCHITECTURE.md`), as a second CLI alongside the read client — not in
+  `quant-scratch`. Still open: exact CLI shape, and how it
+  pulls from IBKR (see `quant-scratch`'s `tasks/ibkr_tws_extended_hours.md` — IBKR is the chosen
+  intraday source); revisit the IBKR integration specifics once that task has moved past
   Brainstorm.
 - **Connection pooling**: fine to skip for a single-CLI-invocation read pattern (matches
   `quant-scratch`'s own precedent of "single connection per CLI invocation, no pooling"). Revisit

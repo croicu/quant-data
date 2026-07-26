@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from quant_data.cli import main
+from ingest.cli import main
 
 SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
 

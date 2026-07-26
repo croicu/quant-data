@@ -109,13 +109,13 @@ ON CONFLICT (date) DO NOTHING;
 ## Connection testing from Python (future)
 
 No Python database client ships with this bootstrap — see `tasks/postgres_client_and_dimensions.md`
-for the follow-up that adds `quant_data`'s `PostgresDatabase`/`MarketDataProvider`. Once that
+for the follow-up that adds `quant-data`'s `PostgresDatabase`/`MarketDataProvider`. Once that
 exists, a connection test will look roughly like:
 
 ```python
-from quant_data.postgres import PostgresDatabase  # not implemented yet
+from shared.postgres import PostgresDatabase  # not implemented yet
 
-db = PostgresDatabase(host="localhost", port=5433, user="<role>", password="...", dbname="quant_data")
+db = PostgresDatabase(host="localhost", port=5433, user="quant_reader", password=None, dbname="quant_data")
 bars = db.fetch_bars("AAPL", start_date="2026-01-15", end_date="2026-01-15")
 print(len(bars))
 ```

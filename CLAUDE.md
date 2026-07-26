@@ -169,16 +169,16 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 ## Architecture conventions
 
 1. Internal processing uses strongly typed dataclasses.
-2. `protocols.py` contains persisted/shared data contracts — pure data only, no behavior. Behavior that operates on protocol types belongs in a dedicated entity/service layer, not on the protocol classes themselves.
-3. `contracts.py` contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors), not data.
-4. Unit tests (`tests/unit/`) must run offline. Integration tests (`tests/integration/`), if the project has them, may hit real external services — that's a deliberate scope split, not a loophole in rule 4. Note `pytest.ini`'s `testpaths = tests` runs both by default, so adding an integration suite means accepting network calls in the default `pytest` invocation unless you also gate it behind a marker.
-5. Prefer explicit, readable Python over clever abstractions.
-6. Prefer constructor/parameter injection over monkeypatching this project's own module internals in tests — e.g. a component that talks to the outside world (network, filesystem, clock, database) should take that dependency as an argument, defaulting to the real implementation, so tests can pass a fake object instead of patching a function inside the module under test. Monkeypatching is still the right tool for faking a *third-party* library's own internals (e.g. a DB driver class you don't own) — the distinction is whether the thing being faked is your code or someone else's.
-7. If this repo ever grows beyond a single `src/quant_data/` package (e.g. splitting a shared framework package from ingest/read-side tools), setuptools' src-layout automatic discovery picks up multiple packages under `src/` with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`. Don't pre-build this structure speculatively — it's here so you don't have to rediscover it if the need actually arrives.
+2. **Package layout**: `src/` follows `quant-scratch`'s convention — one folder per app (e.g. `src/ingest/`), plus two repo-wide non-app packages: `src/shared/` (cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`) and `src/defs/` (`protocols.py` + `contracts.py`). `defs/` is kept separate from `shared/` on purpose: contracts are the specification, not owned by whichever package happens to implement them. There is no top-level `quant_data` package or generic `quant-data` console script — each app gets its own named script (e.g. `quant-ingest`), matching `quant-scratch` having no generic script either. Cross-package imports are absolute (`from shared.diagnostics import ...`, `from defs.contracts import ...`); same-package imports stay relative (`from .errors import ...`). setuptools' src-layout automatic discovery picks up every package under `src/` with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`.
+3. `protocols.py` (in `src/defs/`) contains persisted/shared data contracts — pure data only, no behavior. Behavior that operates on protocol types belongs in a dedicated entity/service layer, not on the protocol classes themselves.
+4. `contracts.py` (in `src/defs/`) contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors), not data.
+5. Unit tests (`tests/unit/`) must run offline. Integration tests (`tests/integration/`), if the project has them, may hit real external services — that's a deliberate scope split, not a loophole in rule 4. Note `pytest.ini`'s `testpaths = tests` runs both by default, so adding an integration suite means accepting network calls in the default `pytest` invocation unless you also gate it behind a marker.
+6. Prefer explicit, readable Python over clever abstractions.
+7. Prefer constructor/parameter injection over monkeypatching this project's own module internals in tests — e.g. a component that talks to the outside world (network, filesystem, clock, database) should take that dependency as an argument, defaulting to the real implementation, so tests can pass a fake object instead of patching a function inside the module under test. Monkeypatching is still the right tool for faking a *third-party* library's own internals (e.g. a DB driver class you don't own) — the distinction is whether the thing being faked is your code or someone else's.
 
 ## Logging
 
-- **Use `Logger`** (`from quant_data.diagnostics import Logger`) — not bare `print()`.
+- **Use `Logger`** (`from shared.diagnostics import Logger`) — not bare `print()`.
 - **All features log success and errors** — no silent success, no swallowed errors.
 - **Message length by severity**:
   - **Success (info)** — short: feature started, feature ended.
