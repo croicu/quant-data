@@ -69,6 +69,21 @@ necessarily where the need originated:
 - Use `gh issue create --repo <owner>/<repo>` to open a cross-repo issue directly from wherever
   you're working — no need to switch working directories first.
 
+**Future: multiple consumers.** Not built yet — there's only one consumer (`quant-scratch`) as of
+2026-07-26, and building this ahead of a second real consumer would be speculative. When a second
+consumer repo actually arrives, extend the convention above with:
+
+- **Consumer registry**: keep a short list of known consumer repos right here in `CLAUDE.md` (just
+  `quant-scratch` today), so a breaking change has a concrete list to notify rather than relying on
+  memory of who depends on this schema.
+- **Fan-out on breaking changes**: instead of one announcement issue in one consumer repo, open one
+  in *every* registered consumer, each cross-linking back to the same migration/change.
+- **Rollout tracking (the actual "handshake")**: open a tracking issue in `quant-data` itself with
+  a checklist linking to each per-consumer issue. Close the tracker only once every consumer issue
+  is closed — that's the confirmation that each client actually adapted, not just that they were
+  notified. Useful gate before doing something irreversible on the schema side, e.g. dropping a
+  column once superseded.
+
 ## Collaboration rules
 
 - Before implementing any feature or non-trivial change, ask clarifying questions until the intent is unambiguous.
