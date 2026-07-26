@@ -201,6 +201,12 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Ticker normalization**: always store and compare tickers uppercased (matching `quant-scratch`'s convention). The schema enforces this with a `CHECK` constraint on `dim_ticker.ticker` — Python code should still uppercase at the boundary rather than relying on the database to catch it.
 
 ## New Task
+- **File**: [Scheduled jobs](tasks/scheduled_jobs.md)
+- **Status**: Brainstorm, postponed (see issue #3) — deprioritized, not actively worked
+- **Key Context**: How recurring background/maintenance work (DB maintenance now, ingest scheduling
+  later) gets tracked without baking `CroicuWS1`-specific detail into this public repo — leaning
+  toward a `jobs` table living in the database itself (data, not committed code), still in
+  investigation.
 
 ## Pending Tasks
 - **File**: [Postgres client](tasks/postgres_client_and_dimensions.md)
