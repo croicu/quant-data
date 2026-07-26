@@ -1,7 +1,7 @@
 -- 001_init_schema.sql
 --
 -- Initial star schema for 1-minute OHLCV market data.
--- Apply with: psql -h <host> -U <user> -d quant_scratch -f migrations/001_init_schema.sql
+-- Apply with: psql -h <host> -U <user> -d quant_data -f migrations/001_init_schema.sql
 --
 -- Design: see docs/SCHEMA.md. Four tables — three dimensions (dim_ticker, dim_date, dim_time)
 -- and one fact table (fact_market_data_1min) — read-optimized for date-range and time-of-day

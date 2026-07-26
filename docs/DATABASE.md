@@ -18,7 +18,7 @@ sudo systemctl enable --now postgresql
 
 # Create a role and database for this project
 sudo -u postgres createuser --interactive --pwprompt   # follow the prompts for a new role
-sudo -u postgres createdb -O <role> quant_scratch
+sudo -u postgres createdb -O <role> quant_data
 ```
 
 By default, PostgreSQL only listens on `localhost` and only accepts local `peer`-authenticated
@@ -38,7 +38,7 @@ This forwards local port `5433` to the box's Postgres on `5432`. Leave that comm
 connect as if Postgres were local:
 
 ```bash
-psql -h localhost -p 5433 -U <role> -d quant_scratch
+psql -h localhost -p 5433 -U <role> -d quant_data
 ```
 
 For a tunnel that survives reboots/reconnects rather than a manual `ssh` you have to babysit, a
@@ -65,7 +65,7 @@ systemctl --user enable --now quant-data-tunnel.service
 ## Applying the schema migration
 
 ```bash
-psql -h localhost -p 5433 -U <role> -d quant_scratch -f migrations/001_init_schema.sql
+psql -h localhost -p 5433 -U <role> -d quant_data -f migrations/001_init_schema.sql
 ```
 
 See `docs/SETUP.md` for the full step-by-step first-time setup checklist.
@@ -73,7 +73,7 @@ See `docs/SETUP.md` for the full step-by-step first-time setup checklist.
 ## Verifying the schema
 
 ```bash
-psql -h localhost -p 5433 -U <role> -d quant_scratch -c '\dt'
+psql -h localhost -p 5433 -U <role> -d quant_data -c '\dt'
 ```
 
 Expect to see `schema_migrations`, `dim_ticker`, `dim_date`, `dim_time`, and
@@ -115,7 +115,7 @@ exists, a connection test will look roughly like:
 ```python
 from quant_data.postgres import PostgresDatabase  # not implemented yet
 
-db = PostgresDatabase(host="localhost", port=5433, user="<role>", password="...", dbname="quant_scratch")
+db = PostgresDatabase(host="localhost", port=5433, user="<role>", password="...", dbname="quant_data")
 bars = db.fetch_bars("AAPL", start_date="2026-01-15", end_date="2026-01-15")
 print(len(bars))
 ```

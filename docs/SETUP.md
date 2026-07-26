@@ -14,7 +14,7 @@ behind each step.
 1. **Create the database and a role**, on the box:
    ```bash
    sudo -u postgres createuser --interactive --pwprompt
-   sudo -u postgres createdb -O <role> quant_scratch
+   sudo -u postgres createdb -O <role> quant_data
    ```
 
 2. **Open an SSH tunnel** from your machine (see `docs/DATABASE.md` for a systemd-service version
@@ -25,12 +25,12 @@ behind each step.
 
 3. **Apply the schema migration**, through the tunnel:
    ```bash
-   psql -h localhost -p 5433 -U <role> -d quant_scratch -f migrations/001_init_schema.sql
+   psql -h localhost -p 5433 -U <role> -d quant_data -f migrations/001_init_schema.sql
    ```
 
 4. **Verify the schema exists**:
    ```bash
-   psql -h localhost -p 5433 -U <role> -d quant_scratch -c '\dt'
+   psql -h localhost -p 5433 -U <role> -d quant_data -c '\dt'
    ```
    Expect `schema_migrations`, `dim_ticker`, `dim_date`, `dim_time`, `fact_market_data_1min`.
 
