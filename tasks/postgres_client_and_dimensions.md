@@ -1,14 +1,15 @@
-# Postgres Client + Dimension Population
+# Postgres Client
 
 ## Status: Brainstorm
 
 ## Problem statement
 
 The initial bootstrap (`migrations/001_init_schema.sql`, `docs/SCHEMA.md`/`DATABASE.md`/`SETUP.md`)
-shipped the star schema only — no Python code, no populated dimensions, no way to read or write
-bars from code. This task is the deliberate follow-up: a read client (and eventually a write/ingest
-path) against the schema, plus actually running the one-time `dim_date`/`dim_time` population SQL
-from `docs/DATABASE.md` against the real database.
+shipped the star schema only — no Python code, no way to read or write bars from code. This task is
+the deliberate follow-up: a read client (and eventually a write/ingest path) against the schema.
+
+PostgreSQL is now provisioned on `CroicuWS1` and `dim_date`/`dim_time` are populated (see the
+now-closed ad-hoc infra issue) — this task is scoped to the Python client only from here on.
 
 This content originates from `quant-scratch`'s `tasks/database_layer.md`, which envisioned this
 Python client living in `quant-scratch` itself (`shared.postgres.PostgresDatabase`,

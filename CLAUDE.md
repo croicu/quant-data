@@ -203,12 +203,16 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 ## New Task
 
 ## Pending Tasks
-- **File**: [Postgres client + dimension population](tasks/postgres_client_and_dimensions.md)
+- **File**: [Postgres client](tasks/postgres_client_and_dimensions.md)
 - **Status**: Brainstorm
 - **Key Context**: This bootstrap task shipped schema + docs only, no code. The read client
-  (`MarketDataProvider(Protocol)` + `PostgresDatabase` implementation) and one-time `dim_date`/
-  `dim_time` population are deliberately deferred to this follow-up task.
+  (`MarketDataProvider(Protocol)` + `PostgresDatabase` implementation) is deliberately deferred to
+  this follow-up task.
 
 ## Completed Tasks
 - **Repository bootstrap** (schema, migrations, docs, Python scaffold) — seeded from
   `quant-scratch`'s `tasks/bootstrap_quant_data.md` and `tasks/database_layer.md`.
+- **Provision PostgreSQL on CroicuWS1 + populate dimensions** — ad-hoc infra task, see the closed
+  GitHub issue. PostgreSQL 16 installed (data directory on the `storage` zpool), `quant_data`
+  role/database created, `001_init_schema` applied, `dim_time`/`dim_date` populated
+  (2000-01-01–2030-12-31).
