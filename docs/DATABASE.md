@@ -2,6 +2,13 @@
 
 Installing PostgreSQL, connecting to it, and populating dimension tables for `quant-data`.
 
+**On hosting/transport**: everything below (Ubuntu box, SSH tunnel) describes *today's* hosting
+choice, not an architectural requirement. If this database ever moves to AWS RDS, Azure Database
+for PostgreSQL, or anywhere else, this file is what changes — `PostgresDatabase` (see
+`tasks/postgres_client_and_dimensions.md`) only ever takes connection details from
+`settings.json`/`settings.local.json`, never anything hardcoded, so a hosting change should never
+require a code change in `quant-data` or any client.
+
 ## Installing PostgreSQL on the Ubuntu box
 
 ```bash

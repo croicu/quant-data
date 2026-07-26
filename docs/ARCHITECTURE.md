@@ -17,7 +17,10 @@ The follow-up task (`tasks/postgres_client_and_dimensions.md`) will add:
 - `contracts.py` — `MarketDataProvider(Protocol)`: `fetch_bars(ticker, start_date, end_date) -> list[OHLCV]`, read-only
 - `protocols.py` — an `OHLCV` dataclass (ticker, date, time, open, high, low, close, volume)
 - `postgres.py` — `PostgresDatabase`, the concrete `MarketDataProvider` implementation, wrapping a
-  single connection per invocation (no pooling yet), translating DB errors to `AppError`
+  single connection per invocation (no pooling yet), translating DB errors to `AppError`.
+  Endpoint/transport-agnostic by construction — takes host/port/credentials purely from settings,
+  never embeds assumptions about the current SSH-tunnel-to-an-Ubuntu-box setup, so a future move
+  to AWS/Azure/elsewhere is a settings + `docs/DATABASE.md` change only, never a code change here.
 
 ## Data flow
 

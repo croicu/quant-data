@@ -31,6 +31,17 @@ Carried over from `database_layer.md`, adapted to this repo's actual package nam
 - **Settings**: add a `postgres` section to `settings.json`/`settings.local.json` (`host`, `port`,
   `user`, `password`, `dbname`) — the password belongs in `settings.local.json` (gitignored), never
   the committed `settings.json`.
+- **Transport/endpoint-agnostic by construction**: the current box (`CroicuWS1`, reached over an
+  SSH tunnel — see `docs/DATABASE.md`) is today's hosting choice, not an architectural given. It
+  may move to AWS RDS, Azure Database for PostgreSQL, or elsewhere later. `PostgresDatabase` must
+  only ever take connection details from `settings.json`/`settings.local.json` (`host`, `port`,
+  `user`, `password`, `dbname`, and an `sslmode`/similar field once a cloud target needs one) — it
+  must never embed assumptions about *how* that host is reached (no SSH-tunnel logic, no
+  hardcoded endpoint). A future migration to a different host/provider should be a settings change
+  plus a `docs/DATABASE.md` update, never a code change in `PostgresDatabase`, `MarketDataProvider`,
+  or any client. Setting up reachability itself (opening a tunnel, configuring a VPC/security
+  group, whatever a given host requires) is the operator's job, done before the app runs — not
+  something the client's code manages.
 
 ## Open questions
 
