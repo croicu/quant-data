@@ -88,8 +88,9 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
 - One (ticker, date) pair failing (bad ticker, no data for that day — e.g. a weekend) logs a
   warning and continues rather than aborting the rest of the range/batch; the exit code is `1` if
   anything failed, `0` if everything succeeded.
-- No scheduling or IBKR integration yet; those are open items in
-  `tasks/postgres_client_and_dimensions.md`.
+- No scheduling or IBKR integration yet — recurring/unattended runs and swapping Yahoo Finance for
+  IBKR as the real intraday source are unaddressed, to become their own tasks if/when
+  `quant-scratch` actually needs them.
 
 ### `src/client/`
 

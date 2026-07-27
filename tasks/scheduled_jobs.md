@@ -9,8 +9,8 @@ into the warehouse, serving it to consumers, and running recurring background ma
 (vacuum/analyze, reindexing, and eventually whatever the ingest cadence needs). That maintenance
 work has to run *somewhere* on a schedule, but today "somewhere" means `CroicuWS1` specifically —
 and the roadmap is to eventually migrate the database to AWS RDS or Azure Database for PostgreSQL
-(see the transport/endpoint-agnostic design decision in
-`tasks/postgres_client_and_dimensions.md`). Baking `CroicuWS1`-specific scheduling (cron entries,
+(see the transport/endpoint-agnostic design decision in `docs/ARCHITECTURE.md`). Baking
+`CroicuWS1`-specific scheduling (cron entries,
 systemd timers naming that host, box-specific paths/secrets) into this **public** GitHub repo would
 leak location-specific operational detail that doesn't belong in public source control, and would
 need to be redone by hand on every future migration.
@@ -48,8 +48,8 @@ need to be redone by hand on every future migration.
   decided how that second repo would relate to this one (submodule? fully separate? deployed via
   SSH directly, no repo at all?) — revisit once there's an actual first job to deploy.
 - **Role/permissions**: does `quant_writer` own this table, or does it need its own role? Not yet
-  considered — revisit alongside the `quant_reader`/`quant_writer` split in
-  `tasks/postgres_client_and_dimensions.md`.
+  considered — `quant_data`/`quant_writer`/`quant_reader` already exist (see `docs/ARCHITECTURE.md`
+  and `CLAUDE.md`'s Database section) and are the roles to reconcile this against.
 
 ## Implementation plan
 

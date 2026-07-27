@@ -11,10 +11,12 @@ infrastructure for 1-minute OHLCV bars. It's the shared data layer behind
 and re-store the same historical bars from their own data providers.
 
 The star schema, migrations, and docs shipped first; a Python read client
-(`MarketDataProvider`/`PostgresDatabase`) and a first-cut `quant-ingest` CLI (pulling from Yahoo
-Finance) followed — see `docs/ARCHITECTURE.md`. Remaining open work (a dedicated read-only
-`quant_reader` DB role, swapping in IBKR as the real intraday source, batching/scheduling) is
-tracked in `tasks/postgres_client_and_dimensions.md`.
+(`client.market_data.MarketData`, `defs.contracts.MarketDataProvider`/`shared.postgres.PostgresDatabase`)
+and a `quant-ingest` CLI (pulling from Yahoo Finance) followed, along with the `quant_writer`/
+`quant_reader` DB roles enforcing single-writer/many-reader at the privilege level — see
+`docs/ARCHITECTURE.md`. Swapping in IBKR as the real intraday source and recurring/unattended
+scheduling remain open; they'll become their own tasks if/when `quant-scratch` actually needs
+them.
 
 ## Template Sync
 
@@ -218,13 +220,8 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   investigation.
 
 ## Pending Tasks
-- **File**: [Postgres client](tasks/postgres_client_and_dimensions.md)
-- **Status**: Brainstorm — first cut, batch/settings, and read-client increments shipped (closed
-  issues #4, #5, #6), remaining scope open
-- **Key Context**: The read client (`client.market_data.MarketData`, `quant_reader` role) and a
-  Yahoo-Finance-backed `quant-ingest` CLI are built, with settings-driven ticker lists/date ranges
-  and multi-ticker/multi-day batching (see `docs/ARCHITECTURE.md`). Left open: swapping in IBKR as
-  the real intraday source, and recurring/unattended scheduling.
+
+_(none — see New Task above for the postponed scheduled-jobs brainstorm)_
 
 ## Completed Tasks
 - **Repository bootstrap** (schema, migrations, docs, Python scaffold) — seeded from
@@ -248,7 +245,13 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   DateOutOfRangeError`, and the `quant_reader` role created for real (trust-authenticated,
   `SELECT`-only). Verified directly against the real database: reads work with no password over
   the tunnel, and a write attempt through `quant_reader` gets a real Postgres `permission denied`.
-  `pytest` grew to 32 passed.
+  `pytest` grew to 32 passed. Announced to `quant-scratch` via
+  [croicu/quant-scratch#7](https://github.com/croicu/quant-scratch/issues/7).
+  **Postgres client + ingest is now closed out** (`tasks/postgres_client_and_dimensions.md`
+  deleted, issues #4/#5/#6 are the source of truth) — IBKR-as-real-source and
+  recurring/unattended scheduling were deliberately not carried forward as open items; they'll
+  become their own tasks if/when `quant-scratch` actually needs them, rather than being
+  speculatively tracked here.
 - **Provision PostgreSQL on CroicuWS1 + populate dimensions** — ad-hoc infra task, see the closed
   GitHub issue. PostgreSQL 16 installed (data directory on the `storage` zpool), `quant_data`
   role/database created, `001_init_schema` applied, `dim_time`/`dim_date` populated

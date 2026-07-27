@@ -39,6 +39,5 @@ behind each step.
 
 ## Next steps
 
-This bootstrap stops here — schema and dimensions only, no data loaded and no ingest tool yet.
-Follow-up work (reading/writing bars from Python, populating `fact_market_data_1min` from a real
-provider) is tracked in `tasks/postgres_client_and_dimensions.md`.
+This checklist stops at schema + dimensions — see `docs/DATABASE.md`'s "Populating real data"
+section for `quant-ingest`, and `docs/ARCHITECTURE.md` for the full read/write client design.

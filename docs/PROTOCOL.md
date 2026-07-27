@@ -6,14 +6,27 @@ CLI signature and file format schemas for `quant-data`.
 
 <!-- Command name, arguments, flags, exit codes. -->
 
-### `quant-data`
+### `quant-ingest`
 
-- Usage: `quant-data [--debug]`
-- Placeholder only — logs a start/end message and exits `0`. No read/write commands yet; those
-  arrive with the follow-up in `tasks/postgres_client_and_dimensions.md`.
-- `--debug` overrides `settings.json`'s `debug` flag.
-- Exit codes: `0` success, `1` settings load failure, `2` argument parsing error (argparse's
-  default behavior on missing/bad args).
+- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD]] [--ticker TICKER] [--debug]`
+- Fetches 1-minute OHLCV bars from Yahoo Finance and writes them into the warehouse — see
+  `docs/ARCHITECTURE.md` for the full design.
+- `--ticker` — single ticker (e.g. `AAPL`); omit to use every ticker in `settings.tickers` instead.
+- `--start-date` — first trading date, `YYYY-MM-DD`; omit to use `settings.startDate`.
+- `--end-date` — last trading date (inclusive); omit (with `--start-date` given) for a single day.
+  Requires `--start-date` — rejected on its own.
+- `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
+  instead of printing a one-line error, for upfront failures (settings load, no ticker/date
+  configured at all).
+- Exit codes: `0` every (ticker, date) pair succeeded; `1` settings load failure, no
+  ticker/date-range configured at all, or one or more (ticker, date) pairs failed (a failing pair
+  logs a warning and the run continues rather than aborting — `1` here can mean "partial success",
+  not necessarily "nothing happened"); `2` argument parsing error (argparse's default behavior on
+  missing/bad args, e.g. malformed dates or `--end-date` without `--start-date`).
+
+There is no generic `quant-data` command — `quant-ingest` (write side, `src/ingest/`) and
+`client.market_data.MarketData` (read side, `src/client/` — a library, not a CLI) are the two
+consumer-facing entry points.
 
 ## File formats
 
