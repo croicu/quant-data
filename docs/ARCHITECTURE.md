@@ -4,27 +4,38 @@ Modules, data flow, and contracts for `quant-data`.
 
 ## Layout
 
-Mirrors `quant-scratch`'s convention: one folder per app under `src/`, plus two repo-wide
-non-app packages shared across all of them.
+`src/quant_data/` is the sole top-level package, with one subpackage per app plus two repo-wide
+non-app subpackages shared across all of them:
 
-- `src/defs/` — `contracts.py` (behavioral `Protocol`s) + `protocols.py` (pure-data contracts).
-  Kept separate from `shared/` deliberately: they're the specification, not owned by whichever
-  package happens to implement them.
-- `src/shared/` — cross-app infra: `diagnostics.py` (`Logger`), `errors.py` (`AppError`/
-  `TaskError`/`DateOutOfRangeError`), `settings.py` (`Settings`), `postgres.py`
+- `src/quant_data/defs/` — `contracts.py` (behavioral `Protocol`s) + `protocols.py` (pure-data
+  contracts). Kept separate from `shared/` deliberately: they're the specification, not owned by
+  whichever package happens to implement them.
+- `src/quant_data/shared/` — cross-app infra: `diagnostics.py` (`Logger`), `errors.py`
+  (`AppError`/`TaskError`/`DateOutOfRangeError`), `settings.py` (`Settings`), `postgres.py`
   (`PostgresDatabase`), `providers/` (external data-source clients, e.g. `yf.py`).
-- `src/ingest/` — the ingest CLI. Console script: `quant-ingest`.
-- `src/client/` — the read client external consumers (`quant-scratch`) actually import:
-  `market_data.py` (`MarketData`). Its own top-level package, not part of `shared/`, since it's
-  consumer-facing rather than cross-app infra — mirrors `ingest/` being its own package for the
+- `src/quant_data/ingest/` — the ingest CLI. Console script: `quant-ingest`.
+- `src/quant_data/client/` — the read client external consumers (`quant-scratch`) actually import:
+  `market_data.py` (`MarketData`). Its own subpackage, not part of `shared/`, since it's
+  consumer-facing rather than cross-app infra — mirrors `ingest/` being its own subpackage for the
   write side.
 
-There is no top-level `quant_data` package and no generic `quant-data` console script — same as
-`quant-scratch` has no generic `quant-scratch` script, only per-app ones.
+**Why nested under `quant_data/`, unlike `quant-scratch`'s flat `defs`/`shared`/`day_chart`/...**:
+this repo initially mirrored `quant-scratch`'s flat top-level-package convention (see commit
+4ca99cf), but that broke the moment `quant-data` was actually installed as a pip dependency
+*alongside* `quant-scratch` in the same environment — both repos' top-level `defs`/`shared`
+packages have the same import names, so whichever installs last silently shadows the other's
+entirely (see the bug report, croicu/quant-data#7, reproduced both installation orders). The fix:
+`quant-scratch`'s flat convention is fine for a repo that's never installed next to anything else,
+but `quant-data` is specifically meant to be installed as a dependency of other projects, so its
+packages need a distribution-specific namespace. Every subpackage now lives under `quant_data.*`
+(`quant_data.defs`, `quant_data.shared`, `quant_data.ingest`, `quant_data.client`); there is no
+bare top-level `defs`/`shared`/`ingest`/`client` anymore. Cross-package imports are absolute with
+the full `quant_data.` prefix (`from quant_data.shared.diagnostics import Logger`); same-package
+imports stay relative (`from .errors import ...`).
 
 ## Modules
 
-### `src/defs/`
+### `quant_data.defs`
 
 - `protocols.py` — `OHLCV`: ticker, timestamp (UTC), open/high/low/close, volume, and
   `incomplete` (defaults `False`) — set when the provider couldn't supply full data for that
@@ -37,10 +48,10 @@ There is no top-level `quant_data` package and no generic `quant-data` console s
     session day. The ingest-side contract for external data sources — `ingest` depends on this
     abstraction, not concretely on whichever provider is plugged in.
 
-### `src/shared/`
+### `quant_data.shared`
 
 - `diagnostics.py`/`errors.py`/`settings.py` — standard `tpl-py` infra, unchanged in behavior from
-  the single-package layout this was split out of.
+  earlier layouts this was carried over from.
 - `settings.py` additionally defines `PostgresSettings` (`host`, `port`, `user`, `password`,
   `dbname`) and a `Settings.postgres` field, parsed from a `postgres` object under `settings.json`/
   `settings.local.json`'s `settings` key. The password belongs only in `settings.local.json`
@@ -71,7 +82,7 @@ There is no top-level `quant_data` package and no generic `quant-data` console s
   `YahooFinanceIntraDay` concretely, so swapping providers later doesn't touch `ingest/cli.py`'s
   logic.
 
-### `src/ingest/`
+### `quant_data.ingest`
 
 `cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD]] [--ticker TICKER]`:
 fetches bars over an inclusive date range via an injected `IntraDayProvider` (defaults to
@@ -92,12 +103,13 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
   IBKR as the real intraday source are unaddressed, to become their own tasks if/when
   `quant-scratch` actually needs them.
 
-### `src/client/`
+### `quant_data.client`
 
-`market_data.py` — `MarketData`: a thin, read-only wrapper around `shared.postgres.PostgresDatabase`,
-connecting as `quant_reader` by default. This is what external consumers (`quant-scratch`) actually
-import — it deliberately doesn't expose `write_bars` at all, on top of (not instead of)
-`quant_reader`'s DB-level `SELECT`-only privileges being the real enforcement.
+`market_data.py` — `MarketData`: a thin, read-only wrapper around
+`quant_data.shared.postgres.PostgresDatabase`, connecting as `quant_reader` by default. This is
+what external consumers (`quant-scratch`) actually import — it deliberately doesn't expose
+`write_bars` at all, on top of (not instead of) `quant_reader`'s DB-level `SELECT`-only privileges
+being the real enforcement.
 
 ## Data flow
 
@@ -121,7 +133,8 @@ interface (verified directly: a write attempt through `quant_reader` gets a real
 
 ## Contracts
 
-`defs/protocols.py`'s `OHLCV` and `defs/contracts.py`'s `MarketDataProvider`/`IntraDayProvider` are
-the actual Python-level data contract now (see "Modules" above for their shapes). The database
-schema itself (four tables: `dim_ticker`, `dim_date`, `dim_time`, `fact_market_data_1min`) remains
-the underlying persisted contract — see `docs/SCHEMA.md`.
+`quant_data.defs.protocols`'s `OHLCV` and `quant_data.defs.contracts`'s
+`MarketDataProvider`/`IntraDayProvider` are the actual Python-level data contract now (see
+"Modules" above for their shapes). The database schema itself (four tables: `dim_ticker`,
+`dim_date`, `dim_time`, `fact_market_data_1min`) remains the underlying persisted contract — see
+`docs/SCHEMA.md`.

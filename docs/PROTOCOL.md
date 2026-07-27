@@ -24,8 +24,8 @@ CLI signature and file format schemas for `quant-data`.
   not necessarily "nothing happened"); `2` argument parsing error (argparse's default behavior on
   missing/bad args, e.g. malformed dates or `--end-date` without `--start-date`).
 
-There is no generic `quant-data` command — `quant-ingest` (write side, `src/ingest/`) and
-`client.market_data.MarketData` (read side, `src/client/` — a library, not a CLI) are the two
+There is no generic `quant-data` command — `quant-ingest` (write side, `quant_data.ingest`) and
+`quant_data.client.market_data.MarketData` (read side — a library, not a CLI) are the two
 consumer-facing entry points.
 
 ## File formats

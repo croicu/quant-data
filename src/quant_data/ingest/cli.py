@@ -8,12 +8,12 @@ from datetime import date as date_type
 from datetime import timedelta
 from pathlib import Path
 
-from defs.contracts import IntraDayProvider
-from shared.diagnostics import ConsoleLogSink, Logger
-from shared.errors import AppError
-from shared.postgres import PostgresDatabase
-from shared.providers.yf import YahooFinanceIntraDay
-from shared.settings import PostgresSettings, Settings
+from quant_data.defs.contracts import IntraDayProvider
+from quant_data.shared.diagnostics import ConsoleLogSink, Logger
+from quant_data.shared.errors import AppError
+from quant_data.shared.postgres import PostgresDatabase
+from quant_data.shared.providers.yf import YahooFinanceIntraDay
+from quant_data.shared.settings import PostgresSettings, Settings
 
 CATEGORY_INGEST = "ingest"
 

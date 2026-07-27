@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from ingest import cli
+from quant_data.ingest import cli
 from tests.mocks.postgres import MockPostgresDatabase
 from tests.mocks.yf import MockIntraDayProvider
 

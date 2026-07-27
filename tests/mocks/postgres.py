@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from defs.protocols import OHLCV
+from quant_data.defs.protocols import OHLCV
 
 
 class MockPostgresDatabase:

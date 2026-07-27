@@ -3,10 +3,10 @@ from __future__ import annotations
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
-from client.market_data import MarketData
+from quant_data.client.market_data import MarketData
 
 
-@patch("shared.postgres.psycopg")
+@patch("quant_data.shared.postgres.psycopg")
 def test_fetch_bars_delegates_to_postgres_database(mock_psycopg):
     mock_connection = MagicMock()
     mock_cursor = MagicMock()
@@ -22,14 +22,14 @@ def test_fetch_bars_delegates_to_postgres_database(mock_psycopg):
     assert bars[0].volume == 100
 
 
-@patch("shared.postgres.psycopg")
+@patch("quant_data.shared.postgres.psycopg")
 def test_connects_as_quant_reader_by_default(mock_psycopg):
     MarketData(host="localhost", port=5433, dbname="quant_data")
 
     mock_psycopg.connect.assert_called_once_with(host="localhost", port=5433, user="quant_reader", password="", dbname="quant_data")
 
 
-@patch("shared.postgres.psycopg")
+@patch("quant_data.shared.postgres.psycopg")
 def test_close_delegates_to_postgres_database(mock_psycopg):
     mock_connection = MagicMock()
     mock_psycopg.connect.return_value = mock_connection

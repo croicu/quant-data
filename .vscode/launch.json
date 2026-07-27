@@ -5,7 +5,7 @@
       "name": "Python: Run (CLI)",
       "type": "debugpy",
       "request": "launch",
-      "module": "ingest.cli",
+      "module": "quant_data.ingest.cli",
       "args": [],
       "console": "integratedTerminal",
       "justMyCode": true

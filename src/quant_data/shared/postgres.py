@@ -4,7 +4,7 @@ from datetime import date
 
 import psycopg
 
-from defs.protocols import OHLCV
+from quant_data.defs.protocols import OHLCV
 
 from .errors import AppError, DateOutOfRangeError
 

@@ -5,9 +5,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from defs.protocols import OHLCV
-from shared.errors import AppError, DateOutOfRangeError
-from shared.postgres import PostgresDatabase
+from quant_data.defs.protocols import OHLCV
+from quant_data.shared.errors import AppError, DateOutOfRangeError
+from quant_data.shared.postgres import PostgresDatabase
 
 
 def _connect(mock_psycopg, fetchone_results: list) -> MagicMock:
@@ -19,7 +19,7 @@ def _connect(mock_psycopg, fetchone_results: list) -> MagicMock:
     return mock_connection
 
 
-@patch("shared.postgres.psycopg")
+@patch("quant_data.shared.postgres.psycopg")
 def test_write_bars_commits_on_success(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [(1,), (10,), (20,)])  # ticker_id, date_id, time_id
 
@@ -33,7 +33,7 @@ def test_write_bars_commits_on_success(mock_psycopg):
     mock_connection.rollback.assert_not_called()
 
 
-@patch("shared.postgres.psycopg")
+@patch("quant_data.shared.postgres.psycopg")
 def test_write_bars_rolls_back_on_missing_dim_date(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [(1,), None])  # ticker_id ok, date_id missing
 
@@ -47,7 +47,7 @@ def test_write_bars_rolls_back_on_missing_dim_date(mock_psycopg):
     mock_connection.commit.assert_not_called()
 
 
-@patch("shared.postgres.psycopg")
+@patch("quant_data.shared.postgres.psycopg")
 def test_write_bars_rolls_back_on_missing_dim_time(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [(1,), (10,), None])  # ticker_id, date_id ok, time_id missing
 

@@ -11,7 +11,8 @@ infrastructure for 1-minute OHLCV bars. It's the shared data layer behind
 and re-store the same historical bars from their own data providers.
 
 The star schema, migrations, and docs shipped first; a Python read client
-(`client.market_data.MarketData`, `defs.contracts.MarketDataProvider`/`shared.postgres.PostgresDatabase`)
+(`quant_data.client.market_data.MarketData`,
+`quant_data.defs.contracts.MarketDataProvider`/`quant_data.shared.postgres.PostgresDatabase`)
 and a `quant-ingest` CLI (pulling from Yahoo Finance) followed, along with the `quant_writer`/
 `quant_reader` DB roles enforcing single-writer/many-reader at the privilege level — see
 `docs/ARCHITECTURE.md`. Swapping in IBKR as the real intraday source and recurring/unattended
@@ -180,16 +181,16 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 ## Architecture conventions
 
 1. Internal processing uses strongly typed dataclasses.
-2. **Package layout**: `src/` follows `quant-scratch`'s convention — one folder per app (e.g. `src/ingest/` for the write-side CLI, `src/client/` for the read-side library external consumers import), plus two repo-wide non-app packages: `src/shared/` (cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`, `postgres.py`, `providers/`) and `src/defs/` (`protocols.py` + `contracts.py`). `defs/` is kept separate from `shared/` on purpose: contracts are the specification, not owned by whichever package happens to implement them. There is no top-level `quant_data` package or generic `quant-data` console script — each app gets its own named script where it has one (e.g. `quant-ingest`; `client/` is a plain importable library with no script), matching `quant-scratch` having no generic script either. Cross-package imports are absolute (`from shared.diagnostics import ...`, `from defs.contracts import ...`); same-package imports stay relative (`from .errors import ...`). setuptools' src-layout automatic discovery picks up every package under `src/` with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`.
-3. `protocols.py` (in `src/defs/`) contains persisted/shared data contracts — pure data only, no behavior. Behavior that operates on protocol types belongs in a dedicated entity/service layer, not on the protocol classes themselves.
-4. `contracts.py` (in `src/defs/`) contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors), not data.
+2. **Package layout**: everything lives under one top-level package, `src/quant_data/`, with a subpackage per app (`quant_data.ingest` for the write-side CLI, `quant_data.client` for the read-side library external consumers import) plus two repo-wide non-app subpackages: `quant_data.shared` (cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`, `postgres.py`, `providers/`) and `quant_data.defs` (`protocols.py` + `contracts.py`). `defs` is kept separate from `shared` on purpose: contracts are the specification, not owned by whichever package happens to implement them. **This deliberately does not mirror `quant-scratch`'s own flat top-level-package convention** (`defs`, `shared`, `day_chart`, ... with no common prefix) — that flat layout is fine for a repo that's never installed alongside anything else, but broke the moment `quant-data` was installed as a pip dependency *next to* `quant-scratch` in the same environment: both repos' top-level `defs`/`shared` packages share the same import name, so whichever installs last silently shadows the other's entirely (see croicu/quant-data#7, reproduced both installation orders). Since `quant-data` is specifically meant to be installed as a dependency of other projects, its packages need a distribution-specific namespace — `quant-scratch` doesn't have this requirement, so its own flat layout stays correct for it. There is no generic `quant-data` console script — each app gets its own named script where it has one (e.g. `quant-ingest`; `quant_data.client` is a plain importable library with no script). Cross-package imports are absolute with the full `quant_data.` prefix (`from quant_data.shared.diagnostics import ...`, `from quant_data.defs.contracts import ...`); same-package imports stay relative (`from .errors import ...`). setuptools' src-layout automatic discovery picks up `quant_data` and every subpackage beneath it with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`.
+3. `protocols.py` (in `quant_data.defs`) contains persisted/shared data contracts — pure data only, no behavior. Behavior that operates on protocol types belongs in a dedicated entity/service layer, not on the protocol classes themselves.
+4. `contracts.py` (in `quant_data.defs`) contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors), not data.
 5. Unit tests (`tests/unit/`) must run offline. Integration tests (`tests/integration/`), if the project has them, may hit real external services — that's a deliberate scope split, not a loophole in rule 4. Note `pytest.ini`'s `testpaths = tests` runs both by default, so adding an integration suite means accepting network calls in the default `pytest` invocation unless you also gate it behind a marker.
 6. Prefer explicit, readable Python over clever abstractions.
 7. Prefer constructor/parameter injection over monkeypatching this project's own module internals in tests — e.g. a component that talks to the outside world (network, filesystem, clock, database) should take that dependency as an argument, defaulting to the real implementation, so tests can pass a fake object instead of patching a function inside the module under test. Monkeypatching is still the right tool for faking a *third-party* library's own internals (e.g. a DB driver class you don't own) — the distinction is whether the thing being faked is your code or someone else's.
 
 ## Logging
 
-- **Use `Logger`** (`from shared.diagnostics import Logger`) — not bare `print()`.
+- **Use `Logger`** (`from quant_data.shared.diagnostics import Logger`) — not bare `print()`.
 - **All features log success and errors** — no silent success, no swallowed errors.
 - **Message length by severity**:
   - **Success (info)** — short: feature started, feature ended.
@@ -224,6 +225,15 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 _(none — see New Task above for the postponed scheduled-jobs brainstorm)_
 
 ## Completed Tasks
+- **Nest all packages under `quant_data.*`** — closed issue #7 (bug). `src/defs/`, `src/shared/`,
+  `src/ingest/`, `src/client/` moved to `src/quant_data/{defs,shared,ingest,client}/`; every
+  cross-package import, `pyproject.toml`'s console script, and `.vscode/launch.json` updated
+  accordingly. Fixes a real collision: quant-data's and quant-scratch's flat top-level `defs`/
+  `shared` packages shared the same import name, so installing both into one environment (exactly
+  what consuming quant-data as a pip dependency requires) made whichever installed last silently
+  shadow the other's entirely. Verified by actually reproducing the two-repo collision in a
+  scratch venv (broken before the fix, clean after) — not just re-running quant-data's own test
+  suite in isolation.
 - **Repository bootstrap** (schema, migrations, docs, Python scaffold) — seeded from
   `quant-scratch`'s `tasks/bootstrap_quant_data.md` and `tasks/database_layer.md`.
 - **Postgres read/write client + Yahoo Finance ingest CLI (first cut)** — closed issue #4.

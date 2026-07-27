@@ -114,7 +114,7 @@ over the tunnel) and doesn't expose a write method at all:
 
 ```python
 from datetime import date
-from client.market_data import MarketData
+from quant_data.client.market_data import MarketData
 
 client = MarketData(host="localhost", port=5433, dbname="quant_data")
 bars = client.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
@@ -123,7 +123,7 @@ client.close()
 ```
 
 `quant_writer` (password-protected, read/write) is for `ingest` only — see
-`shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly
+`quant_data.shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly
 (e.g. writing your own ingest tooling), with connection details from
 `settings.json`/`settings.local.json`'s `postgres` section (see `docs/ARCHITECTURE.md` for the
 full shape).
