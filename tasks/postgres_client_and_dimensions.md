@@ -1,6 +1,6 @@
 # Postgres Client + Ingest
 
-## Status: Brainstorm (first cut + batch/settings increment shipped — see closed [issue #4](https://github.com/croicu/quant-data/issues/4) and [issue #5](https://github.com/croicu/quant-data/issues/5); remaining scope below)
+## Status: Brainstorm (first cut, batch/settings, and read-client increments shipped — see closed [issue #4](https://github.com/croicu/quant-data/issues/4), [issue #5](https://github.com/croicu/quant-data/issues/5), and [issue #6](https://github.com/croicu/quant-data/issues/6); remaining scope below)
 
 ## Problem statement
 
@@ -61,30 +61,27 @@ Carried over from `database_layer.md`, adapted to this repo's actual package lay
   overhead doesn't pay for itself. `defs.contracts.MarketDataProvider`/`defs.protocols.OHLCV` are
   the public contract consumers import (see `docs/ARCHITECTURE.md` for the full package layout).
 - **The Python contract is ergonomics, not the security boundary**: because consumers install the
-  `quant-data` distribution as a real package, they get `psycopg` and can instantiate
+  `quant-data` distribution as a real package, they get `psycopg` and could in principle instantiate
   `shared.postgres.PostgresDatabase` themselves with their own connection settings — a live DB
-  connection, not a narrow read-only RPC surface. `MarketDataProvider` omitting a write method
-  stops accidental misuse, not deliberate or buggy writes via `psycopg` directly. The actual
-  enforcement of "no client can write" is the DB-role split below — connection privileges, not the
-  Python interface.
-- **Two DB roles: `quant_reader` and `quant_writer`** — resolves the role-separation open question.
-  `quant_writer` is password-protected (`scram-sha-256`), owns the schema, read/write; used only by
-  this repo's own ingest pipeline. `quant_reader` is `SELECT`-only and **trust-authenticated** — no
-  DB password at all — for connections from `127.0.0.1`. The gate for readers is reaching that
-  loopback port in the first place (i.e. holding an SSH key authorized on the box, per
-  `docs/DATABASE.md`'s tunnel), not a second password on top of it. This needs role-specific
-  `pg_hba.conf` lines ordered before the current generic `host all all 127.0.0.1/32 scram-sha-256`
-  rule (first match wins), e.g. `host quant_data quant_reader 127.0.0.1/32 trust` placed above it.
-  The existing `quant_data` role (schema owner, created during provisioning) still needs to be
-  reconciled into this split — likely repurposed as (or replaced by) `quant_writer` — at
-  implementation time.
+  connection, not a narrow read-only RPC surface. `client.market_data.MarketData` is
+  what consumers should actually import (thin, read-only, no `write_bars` at all), but even that's
+  ergonomics on top of, not instead of, the real enforcement: `quant_reader`'s DB-level privileges.
+  Verified directly — a write attempt through `quant_reader` gets a real Postgres `permission
+  denied`, not just a missing Python method.
+- **Three DB roles: `quant_data`, `quant_writer`, and `quant_reader`** — resolves the
+  role-separation open question. `quant_data` (created during provisioning) remains the schema
+  owner, used for migrations/admin. `quant_writer` is a separate password-protected
+  (`scram-sha-256`) role, granted `SELECT`/`INSERT`/`UPDATE`/`DELETE` (not ownership) on all
+  tables; used only by `ingest`. `quant_reader` is `SELECT`-only and **trust-authenticated** — no
+  DB password at all — for connections from `127.0.0.1`/`::1`. The gate for readers is reaching
+  that loopback port in the first place (i.e. holding an SSH key authorized on the box, per
+  `docs/DATABASE.md`'s tunnel), not a second password on top of it. Implemented via two
+  `pg_hba.conf` lines (`host quant_data quant_reader 127.0.0.1/32 trust` and the `::1/128`
+  equivalent) inserted before the pre-existing generic `scram-sha-256` rules (first match wins) —
+  purely additive, no existing lines touched.
 
 ## Open questions
 
-- **`quant_reader` role**: still not created — only `quant_writer` (read/write, used by ingest)
-  exists as a non-owner role so far, per the earlier decision to defer `quant_reader` until there's
-  an actual read consumer. When `quant-scratch` (or another consumer) actually starts reading,
-  create it then (trust-authenticated for `127.0.0.1`, per the Design decisions above).
 - **IBKR as the real intraday source**: `YahooFinanceIntraDay` (`shared/providers/yf.py`)
   is today's provider, used to validate the end-to-end pipeline with real data — not necessarily
   the long-term one. `quant-scratch`'s IBKR work (`tasks/ibkr_tws_extended_hours.md`) is the
@@ -139,6 +136,19 @@ Second increment, on top of the above (see closed issue for this batch of work):
 - Ingested 6 real tickers (`SPY`, `SH`, `QQQ`, `PSQ`, `DIA`, `DOG`) for `2026-07-24` via the new
   batch mode, confirming the whole settings-driven, multi-ticker/multi-day path end-to-end.
 
+Third increment — the `quant-scratch`-facing read client (on top of the above):
+
+- `shared.errors.DateOutOfRangeError(AppError)` — a specific exception (not generic `AppError`)
+  for `write_bars`' existing "no `dim_date` row for this date" case, so callers can distinguish it
+  from other failures.
+- `client.market_data.MarketData` — thin read-only wrapper around `PostgresDatabase`, connecting
+  as `quant_reader` by default; the actual thing `quant-scratch` imports. Its own top-level
+  package (`src/client/`), not part of `shared/`, mirroring `ingest/` on the write side. No
+  `write_bars` on this class at all.
+- `quant_reader` role created for real: `LOGIN`, no password, `SELECT` + default-privileges grants
+  on all tables, plus the `pg_hba.conf` trust rules and a `pg_reload_conf()` (see Design decisions
+  above) — this was the last piece of the single-writer/many-reader design still undone.
+
 ## Test results
 
 - `ruff format`/`ruff check` clean.
@@ -158,3 +168,10 @@ Second increment, on top of the above (see closed issue for this batch of work):
   extended for batch/range/settings-default behavior). Manually verified `quant-ingest` with no
   arguments at all (fully settings-driven: 6 tickers × 1 day) against the real database, plus the
   `--start-date`-only single-day default and CLI-overrides-settings precedence.
+- Third increment: `pytest` grew to 32 passed (`tests/unit/test_market_data.py` added,
+  `test_postgres.py` updated to assert `DateOutOfRangeError` specifically). Manually verified
+  against the real database: `MarketData` connecting as `quant_reader` (no password, over
+  the tunnel) read back the same 953 AAPL rows; a write attempt through `quant_reader`
+  (`PostgresDatabase.write_bars` directly, bypassing `MarketData` on purpose to test the
+  actual boundary) failed with a real Postgres `permission denied for table dim_ticker` — confirms
+  the DB-privilege enforcement, not just the Python interface's shape.

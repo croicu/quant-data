@@ -22,3 +22,7 @@ class AppError(Exception):
 
 class TaskError(AppError):
     pass
+
+
+class DateOutOfRangeError(AppError):
+    """Raised when a bar's date falls outside the populated dim_date range."""

@@ -11,9 +11,13 @@ non-app packages shared across all of them.
   Kept separate from `shared/` deliberately: they're the specification, not owned by whichever
   package happens to implement them.
 - `src/shared/` — cross-app infra: `diagnostics.py` (`Logger`), `errors.py` (`AppError`/
-  `TaskError`), `settings.py` (`Settings`), `postgres.py` (`PostgresDatabase`), `providers/`
-  (external data-source clients, e.g. `yf.py`).
+  `TaskError`/`DateOutOfRangeError`), `settings.py` (`Settings`), `postgres.py`
+  (`PostgresDatabase`), `providers/` (external data-source clients, e.g. `yf.py`).
 - `src/ingest/` — the ingest CLI. Console script: `quant-ingest`.
+- `src/client/` — the read client external consumers (`quant-scratch`) actually import:
+  `market_data.py` (`MarketData`). Its own top-level package, not part of `shared/`, since it's
+  consumer-facing rather than cross-app infra — mirrors `ingest/` being its own package for the
+  write side.
 
 There is no top-level `quant_data` package and no generic `quant-data` console script — same as
 `quant-scratch` has no generic `quant-scratch` script, only per-app ones.
@@ -49,10 +53,12 @@ There is no top-level `quant_data` package and no generic `quant-data` console s
 - `postgres.py` — `PostgresDatabase`: the concrete `MarketDataProvider` implementation, plus a
   `write_bars` method used only by `ingest` (not part of the `MarketDataProvider` Protocol itself —
   see "Contracts" below on why that's ergonomics, not the actual security boundary). Single
-  connection per invocation (no pooling); wraps `psycopg` errors as `AppError`. Takes connection
-  details purely as constructor parameters — never embeds assumptions about *how* the host is
-  reached (no SSH-tunnel logic, no hardcoded endpoint), so a future move to AWS/Azure/elsewhere is
-  a settings + `docs/DATABASE.md` change only, never a code change here.
+  connection per invocation (no pooling); wraps `psycopg` errors as `AppError`, or
+  `DateOutOfRangeError` (a specific `AppError` subclass) when a bar's date falls outside the
+  populated `dim_date` range. Takes connection details purely as constructor parameters — never
+  embeds assumptions about *how* the host is reached (no SSH-tunnel logic, no hardcoded endpoint),
+  so a future move to AWS/Azure/elsewhere is a settings + `docs/DATABASE.md` change only, never a
+  code change here.
 - `providers/yf.py` — `YahooFinanceIntraDay`, an `IntraDayProvider` implementation wrapping
   `yfinance`. Ported from `quant-scratch`'s `shared/providers/yahoo_finance.py`, adapted to
   produce `OHLCV` (which carries its own `ticker`, unlike `quant-scratch`'s `DayBar`) and to set
@@ -85,6 +91,13 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
 - No scheduling or IBKR integration yet; those are open items in
   `tasks/postgres_client_and_dimensions.md`.
 
+### `src/client/`
+
+`market_data.py` — `MarketData`: a thin, read-only wrapper around `shared.postgres.PostgresDatabase`,
+connecting as `quant_reader` by default. This is what external consumers (`quant-scratch`) actually
+import — it deliberately doesn't expose `write_bars` at all, on top of (not instead of)
+`quant_reader`'s DB-level `SELECT`-only privileges being the real enforcement.
+
 ## Data flow
 
 A caller supplies `ticker` + a date range → `MarketDataProvider.fetch_bars` joins
@@ -99,10 +112,11 @@ into `dim_ticker` (insert-or-fetch, single round trip via `ON CONFLICT ... RETUR
 UPDATE`) inside one transaction — any failure within that pair (e.g. a date outside the populated
 `dim_date` range) rolls back just that pair's writes, logs a warning, and the run continues with
 the rest of the range/batch rather than aborting entirely. `ingest` is the sole writer; consumer
-repos (`quant-scratch` and future others) only ever read. Today both read and write go through the single `quant_data`/`quant_writer` roles created
-during provisioning — a dedicated read-only `quant_reader` role (no write grant, enforced at the
-database-privilege level rather than just by the Python interface) is deferred until there's an
-actual read consumer, per `tasks/postgres_client_and_dimensions.md`.
+repos (`quant-scratch` and future others) only ever read, via `MarketData`/`quant_reader` —
+a `SELECT`-only, trust-authenticated role (no DB password; the SSH tunnel/key is the actual gate)
+with no write grant at all, enforced at the database-privilege level, not just by the Python
+interface (verified directly: a write attempt through `quant_reader` gets a real Postgres
+`permission denied`, not just a missing method).
 
 ## Contracts
 

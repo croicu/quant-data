@@ -108,21 +108,25 @@ ON CONFLICT (date) DO NOTHING;
 
 ## Connection testing from Python
 
+Consumers (e.g. `quant-scratch`) should use `MarketData`, not `PostgresDatabase` directly — it
+connects as `quant_reader` by default (`SELECT`-only, trust-authenticated, no password needed
+over the tunnel) and doesn't expose a write method at all:
+
 ```python
 from datetime import date
-from shared.postgres import PostgresDatabase
+from client.market_data import MarketData
 
-db = PostgresDatabase(host="localhost", port=5433, user="quant_writer", password="...", dbname="quant_data")
-bars = db.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
+client = MarketData(host="localhost", port=5433, dbname="quant_data")
+bars = client.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
 print(len(bars))
-db.close()
+client.close()
 ```
 
-Connection details (including the password) come from `settings.json`/`settings.local.json`'s
-`postgres` section — see `docs/ARCHITECTURE.md` for the full shape. A dedicated read-only
-`quant_reader` role doesn't exist yet (deferred until there's an actual read consumer — see
-`tasks/postgres_client_and_dimensions.md`); `quant_writer` (created for ingest) can also read in
-the meantime, but should be treated as ingest-only in new code going forward.
+`quant_writer` (password-protected, read/write) is for `ingest` only — see
+`shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly
+(e.g. writing your own ingest tooling), with connection details from
+`settings.json`/`settings.local.json`'s `postgres` section (see `docs/ARCHITECTURE.md` for the
+full shape).
 
 ## Populating real data
 

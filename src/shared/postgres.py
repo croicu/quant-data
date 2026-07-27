@@ -6,7 +6,7 @@ import psycopg
 
 from defs.protocols import OHLCV
 
-from .errors import AppError
+from .errors import AppError, DateOutOfRangeError
 
 
 class PostgresDatabase:
@@ -88,7 +88,7 @@ class PostgresDatabase:
                     cursor.execute("SELECT date_id FROM dim_date WHERE date = %s", (bar.timestamp.date(),))
                     date_row = cursor.fetchone()
                     if date_row is None:
-                        raise AppError(f"No dim_date row for {bar.timestamp.date()} — outside the populated date range.")
+                        raise DateOutOfRangeError(f"No dim_date row for {bar.timestamp.date()} — outside the populated date range.")
                     date_id = date_row[0]
 
                     cursor.execute(

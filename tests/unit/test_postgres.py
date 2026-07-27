@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from defs.protocols import OHLCV
-from shared.errors import AppError
+from shared.errors import AppError, DateOutOfRangeError
 from shared.postgres import PostgresDatabase
 
 
@@ -40,7 +40,7 @@ def test_write_bars_rolls_back_on_missing_dim_date(mock_psycopg):
     database = PostgresDatabase(host="localhost", port=5433, user="quant_writer", password="x", dbname="quant_data")
     bar = OHLCV(ticker="AAPL", timestamp=datetime(2026, 7, 24, 13, 30), open=1.0, high=2.0, low=0.5, close=1.5, volume=100)
 
-    with pytest.raises(AppError):
+    with pytest.raises(DateOutOfRangeError):
         database.write_bars([bar])
 
     mock_connection.rollback.assert_called_once()
