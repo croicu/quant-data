@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import date
 from types import TracebackType
 
+from quant_data._internal.contracts import MarketDataProvider
 from quant_data.protocols import OHLCV
-from quant_data_internal.contracts import MarketDataProvider
 
 
 class MarketData:

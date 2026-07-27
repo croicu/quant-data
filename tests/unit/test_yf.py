@@ -6,8 +6,8 @@ from unittest.mock import patch
 import pandas
 import pytest
 
-from quant_data_internal.shared.errors import AppError
-from quant_data_internal.shared.providers.yf import YahooFinanceIntraDay
+from quant_data._internal.shared.errors import AppError
+from quant_data._internal.shared.providers.yf import YahooFinanceIntraDay
 
 
 def _history_frame(rows: list[dict]) -> pandas.DataFrame:
@@ -38,7 +38,7 @@ def _history_frame(rows: list[dict]) -> pandas.DataFrame:
     )
 
 
-@patch("quant_data_internal.shared.providers.yf.yfinance")
+@patch("quant_data._internal.shared.providers.yf.yfinance")
 def test_fetch_bars_flags_nan_rows_as_incomplete(mock_yfinance):
     history = _history_frame(
         [
@@ -73,7 +73,7 @@ def test_fetch_bars_flags_nan_rows_as_incomplete(mock_yfinance):
     assert bars[1].open == 0.0
 
 
-@patch("quant_data_internal.shared.providers.yf.yfinance")
+@patch("quant_data._internal.shared.providers.yf.yfinance")
 def test_fetch_bars_flags_literal_zero_volume_as_incomplete(mock_yfinance):
     history = _history_frame(
         [
@@ -99,7 +99,7 @@ def test_fetch_bars_flags_literal_zero_volume_as_incomplete(mock_yfinance):
     assert bars[0].open == 100.0
 
 
-@patch("quant_data_internal.shared.providers.yf.yfinance")
+@patch("quant_data._internal.shared.providers.yf.yfinance")
 def test_fetch_bars_raises_on_empty_history(mock_yfinance):
     mock_yfinance.Ticker.return_value.history.return_value = pandas.DataFrame()
 
@@ -107,7 +107,7 @@ def test_fetch_bars_raises_on_empty_history(mock_yfinance):
         YahooFinanceIntraDay().fetch_bars("AAPL", date(2026, 7, 24))
 
 
-@patch("quant_data_internal.shared.providers.yf.yfinance")
+@patch("quant_data._internal.shared.providers.yf.yfinance")
 def test_fetch_bars_wraps_provider_exceptions(mock_yfinance):
     mock_yfinance.Ticker.return_value.history.side_effect = RuntimeError("network down")
 

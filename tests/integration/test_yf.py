@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
+from quant_data._internal.shared.providers.yf import YahooFinanceIntraDay
 from quant_data.protocols import OHLCV
-from quant_data_internal.shared.providers.yf import YahooFinanceIntraDay
 
 
 def _last_weekday(reference: date) -> date:

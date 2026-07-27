@@ -4,72 +4,74 @@ Modules, data flow, and contracts for `quant-data`.
 
 ## Layout
 
-Three top-level packages under `src/`, split by who's allowed to depend on them:
+Two top-level packages under `src/`:
 
-- `src/quant_data/` — the **public** surface. Everything here is either directly re-exported or
-  meant to be safe to read about.
-  - `__init__.py` — re-exports `MarketData`, `OHLCV`, and `create_postgres_provider`, lazily (see
-    "Why lazy" below).
-  - `protocols.py` — `OHLCV` (pure-data contract).
+- `src/quant_data/` — the distribution's namespaced package.
+  - `__init__.py` — plain re-exports of `MarketData`, `OHLCV`, and `create_postgres_provider`
+    (`__all__` + top-level imports; no laziness needed — see "Why no laziness" below).
+  - `protocols.py` — `OHLCV` (pure-data contract). **Public.**
   - `client/market_data.py` — `MarketData`, agnostic of the concrete backend (see "Contracts"
-    below).
+    below). **Public.**
   - `client/postgres_provider.py` — `create_postgres_provider`, today's factory for building a
-    Postgres-backed provider to hand to `MarketData`.
-- `src/quant_data_internal/` — **private** implementation detail. Nothing here is exported by
-  `quant_data`, and none of it should be imported directly by external consumers, even though
-  Python doesn't stop you.
-  - `contracts.py` — behavioral `Protocol`s (`MarketDataProvider`, `IntraDayProvider`).
-  - `shared/` — cross-app infra: `diagnostics.py` (`Logger`), `errors.py`
-    (`AppError`/`TaskError`/`DateOutOfRangeError`), `settings.py` (`Settings`), `postgres.py`
-    (`PostgresDatabase`), `providers/` (external data-source clients, e.g. `yf.py`).
+    Postgres-backed provider to hand to `MarketData`. **Public.**
+  - `_internal/` — **private** implementation detail, nested so its privacy is a folder-level
+    fact, not just an `__init__.py` allow-list. Nothing here is exported by `quant_data`, and none
+    of it should be imported directly by external consumers, even though Python doesn't stop you.
+    - `contracts.py` — behavioral `Protocol`s (`MarketDataProvider`, `IntraDayProvider`).
+    - `shared/` — cross-app infra: `diagnostics.py` (`Logger`), `errors.py`
+      (`AppError`/`TaskError`/`DateOutOfRangeError`), `settings.py` (`Settings`), `postgres.py`
+      (`PostgresDatabase`), `providers/` (external data-source clients, e.g. `yf.py`).
 - `src/ingest/` — the ingest CLI. Console script: `quant-ingest`, no importable surface at all.
 
 **Public surface**: external consumers (`quant-scratch`) should only depend on the `quant_data`
 top level — `from quant_data import MarketData, OHLCV, create_postgres_provider`. Since
-`client`/`protocols.py` hold only genuinely public content, the folder split itself signals what's
-safe to depend on, instead of relying solely on an `__init__.py` allow-list (see
-croicu/quant-data#10).
+`client`/`protocols.py` hold only genuinely public content and `_internal/` holds none, the folder
+split itself signals what's safe to depend on, instead of relying solely on an `__init__.py`
+allow-list (see croicu/quant-data#10).
 
-**Why three top-level packages, not one nested tree**: this repo initially mirrored
-`quant-scratch`'s flat top-level-package convention (`defs`, `shared`, ... with no common prefix,
-see commit 4ca99cf), but that broke the moment `quant-data` was installed as a pip dependency
-*alongside* `quant-scratch` in the same environment — both repos' top-level `defs`/`shared`
-packages shared the same import name, so whichever installed last silently shadowed the other's
-entirely (see the bug report, croicu/quant-data#7, reproduced both installation orders). The fix
-nested everything under `quant_data.*` for a while, but that conflated "collision-safe" with
-"public" — `quant_data.client`/`quant_data.defs`/`quant_data.shared` were all equally
-collision-proof, but only *some* of their contents were actually meant for external consumers.
-The current split separates the two concerns:
-  - **Collision safety** comes from the package *name* being specific enough that no other
-    distribution would independently choose it — true of `quant_data`, and just as true of
-    `quant_data_internal` (nobody else picks that literal name either). `shared` specifically
-    could never be bare/flat again — `quant-scratch` has its own top-level `shared`, so that one
-    name has an actual, already-reproduced collision; `quant_data_internal.shared` avoids it the
-    same way `quant_data.shared` did. `ingest` has no known collision and no importable surface at
-    all, so it doesn't need a distribution-specific prefix either way.
-  - **Public/private** is now a folder-level fact, not just an `__init__.py` allow-list: `defs`
-    used to mix `protocols.py` (public `OHLCV`) with `contracts.py` (private `Protocol`s) in one
-    folder — no folder-level split could represent that. Splitting them across the two top-level
-    packages (`protocols.py` into `quant_data`, `contracts.py` into `quant_data_internal`) removes
-    the ambiguity: `quant_data/` is public, `quant_data_internal/` isn't, no per-file exceptions.
+**Why nested `_internal/`, not a second top-level package**: this repo's history went through three
+shapes. First, it mirrored `quant-scratch`'s flat top-level-package convention (`defs`, `shared`,
+... with no common prefix, see commit 4ca99cf) — broke the moment `quant-data` was installed as a
+pip dependency *alongside* `quant-scratch` in the same environment, since both repos' top-level
+`defs`/`shared` packages shared the same import name and whichever installed last silently shadowed
+the other's entirely (croicu/quant-data#7, reproduced both installation orders). Second, everything
+moved under `quant_data.*` — collision-safe, but conflated "collision-safe" with "public":
+`quant_data.client`/`quant_data.defs`/`quant_data.shared` were all equally collision-proof, but only
+some of their contents were actually meant for external consumers. Third, the private half became
+its own sibling top-level package, `quant_data_internal` — folder-level public/private clarity, but
+this is what caused a real, reproduced circular-import crash (see "Why no laziness" below), because
+a second independent top-level package with a genuine two-way dependency on the first loses a
+Python import-ordering guarantee that nesting keeps. **Current (fourth) shape**: `_internal/`
+nested inside `quant_data/` — same folder-level public/private clarity as the sibling-package
+version, collision-safety unaffected (nesting under `quant_data.` was already sufficient — the
+sibling package's own name, `quant_data_internal`, was never actually the thing preventing
+collisions; `quant_data.`'s own uniqueness was), and the circular-import risk goes away because
+nesting keeps Python's own import-completion ordering on your side (see below).
 
 Cross-package imports are absolute with the full package prefix (`from
-quant_data_internal.shared.diagnostics import Logger`); same-package imports stay relative (`from
+quant_data._internal.shared.diagnostics import Logger`); same-package imports stay relative (`from
 .errors import ...`).
 
-**Why lazy** (`quant_data/__init__.py`'s `__getattr__` instead of a plain top-level import):
-`quant_data_internal.shared.postgres` needs `OHLCV` from `quant_data.protocols`, and
-`create_postgres_provider` needs `PostgresDatabase` from `quant_data_internal.shared.postgres` in
-turn — a real two-way dependency between the two packages (this is why `MarketData` itself is
-agnostic of `PostgresDatabase`, per "Contracts" below — it doesn't have this problem at all, only
-the Postgres-specific factory does). Eagerly importing at `quant_data/__init__.py`'s module scope
-turned that into an actual circular import whenever something touched `quant_data_internal` before
-`quant_data` itself (reproduced directly, back when `MarketData` still imported `PostgresDatabase`
-directly: `import quant_data_internal.shared.postgres` as the first import in a process raised
-`ImportError: cannot import name 'PostgresDatabase' from partially initialized module`). Deferring
-every re-export into a module-level `__getattr__` (PEP 562) means merely importing `quant_data`
-never pulls in the rest of the chain, so the cycle can't trigger regardless of which package gets
-touched first or which re-exported name is added later.
+**Why no laziness is needed** (unlike the earlier sibling-package shape, which needed a
+module-level `__getattr__` workaround): `quant_data._internal.shared.postgres` needs `OHLCV` from
+`quant_data.protocols`, and `create_postgres_provider` needs `PostgresDatabase` from
+`quant_data._internal.shared.postgres` in turn — a real two-way relationship between the public and
+private halves (`MarketData` itself doesn't have this problem — see "Contracts" below — only the
+Postgres-specific factory does). When `_internal` was a separate top-level package
+(`quant_data_internal`), eagerly importing at `quant_data/__init__.py`'s module scope turned this
+into an actual circular import whenever something touched `quant_data_internal` before `quant_data`
+itself (reproduced directly: `import quant_data_internal.shared.postgres` as the first import in a
+process raised `ImportError: cannot import name 'PostgresDatabase' from partially initialized
+module`). Nesting removes the failure mode structurally: importing a dotted path like
+`quant_data._internal.shared.postgres` requires Python to fully finish importing `quant_data` (i.e.
+run its whole `__init__.py`) *before it even attempts* the `._internal` segment — so by the time
+Python would try to import `quant_data._internal.shared.postgres` a second time (the self-reference
+that caused the crash), it's already been loaded as a side effect of finishing `quant_data`'s own
+`__init__.py`, not still mid-execution. Verified directly: re-ran the exact `import
+quant_data._internal.shared.postgres`-first reproduction against the nested layout with a plain,
+eager `__init__.py` — no crash. A second top-level package doesn't get this guarantee, since Python
+has no "finish importing the whole first package before touching the second" rule between two
+independent top-level packages.
 
 ## Modules
 
@@ -79,7 +81,7 @@ touched first or which re-exported name is added later.
 — set when the provider couldn't supply full data for that minute (see `docs/SCHEMA.md`'s
 `fact_market_data_1min.incomplete`). Re-exported at the `quant_data` top level.
 
-### `quant_data_internal.contracts`
+### `quant_data._internal.contracts`
 
 - `MarketDataProvider(Protocol)`: `fetch_bars(ticker, start_date, end_date) -> list[OHLCV]` plus
   `close() -> None`, read-only. The read-side contract `MarketData` depends on (not
@@ -90,7 +92,7 @@ touched first or which re-exported name is added later.
   session day. The ingest-side contract for external data sources — `ingest` depends on this
   abstraction, not concretely on whichever provider is plugged in.
 
-### `quant_data_internal.shared`
+### `quant_data._internal.shared`
 
 - `diagnostics.py`/`errors.py`/`settings.py` — standard `tpl-py` infra, unchanged in behavior from
   earlier layouts this was carried over from.
@@ -183,7 +185,7 @@ interface (verified directly: a write attempt through `quant_reader` gets a real
 
 ## Contracts
 
-`quant_data.protocols`'s `OHLCV` and `quant_data_internal.contracts`'s
+`quant_data.protocols`'s `OHLCV` and `quant_data._internal.contracts`'s
 `MarketDataProvider`/`IntraDayProvider` are the actual Python-level data contract now (see
 "Modules" above for their shapes). The database schema itself (four tables: `dim_ticker`,
 `dim_date`, `dim_time`, `fact_market_data_1min`) remains the underlying persisted contract — see

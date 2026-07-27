@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from quant_data_internal.contracts import MarketDataProvider
-from quant_data_internal.shared.postgres import PostgresDatabase
+from quant_data._internal.contracts import MarketDataProvider
+from quant_data._internal.shared.postgres import PostgresDatabase
 
 
 def create_postgres_provider(*, host: str, port: int, dbname: str, user: str = "quant_reader", password: str = "") -> MarketDataProvider:

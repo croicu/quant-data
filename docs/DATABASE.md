@@ -128,7 +128,7 @@ with MarketData(provider) as client:
 manually, without `with`, still works too.)
 
 `quant_writer` (password-protected, read/write) is for `ingest` only — see
-`quant_data_internal.shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly
+`quant_data._internal.shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly
 (e.g. writing your own ingest tooling), with connection details from
 `settings.json`/`settings.local.json`'s `postgres` section (see `docs/ARCHITECTURE.md` for the
 full shape).

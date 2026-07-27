@@ -15,7 +15,7 @@ from quant_data.protocols import OHLCV
 class MarketDataProvider(Protocol):
     def fetch_bars(self, ticker: str, start_date: date, end_date: date) -> list[OHLCV]:
         """Read bars from the warehouse for a ticker over an inclusive date range. Read-only —
-        no write methods on this contract; see quant_data_internal.shared.postgres.PostgresDatabase
+        no write methods on this contract; see quant_data._internal.shared.postgres.PostgresDatabase
         for the concrete implementation, which does expose a write path but only for the
         ingest-side caller."""
         ...

@@ -28,8 +28,8 @@ There is no generic `quant-data` command — `quant-ingest` (write side, package
 the `quant_data` namespace — no importable surface, console script only) and `quant_data.MarketData`
 (read side — a library, not a CLI) are the two consumer-facing entry points. `MarketData`,
 `OHLCV`, and `create_postgres_provider` are re-exported at the `quant_data` top level
-(`from quant_data import MarketData, OHLCV, create_postgres_provider`); `quant_data_internal.*` is
-a wholly separate, private package and should not be imported directly by external consumers.
+(`from quant_data import MarketData, OHLCV, create_postgres_provider`); `quant_data._internal.*` is
+private (nested, not a separate package) and should not be imported directly by external consumers.
 
 ## File formats
 
