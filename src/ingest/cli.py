@@ -23,24 +23,33 @@ class CliArguments:
     ticker: str | None = None
     start_date: date_type | None = None
     end_date: date_type | None = None
+    catch_up: bool = False
     debug: bool = False
 
 
 def parse_args(argv: list[str]) -> CliArguments:
     parser = argparse.ArgumentParser(
         prog="quant-ingest",
-        usage="quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD]] [--ticker TICKER] [--debug]",
+        usage="quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]",
         description=(
             "Fetch 1-minute OHLCV bars for one ticker (with --ticker) or every ticker in "
             "settings.tickers (without --ticker), over an inclusive date range (--start-date alone "
             "means a single day; add --end-date for a range; omit both to use "
-            "settings.startDate/settings.endDate), and store them in quant-data's warehouse."
+            "settings.startDate/settings.endDate), and store them in quant-data's warehouse. "
+            "--catch-up re-fetches the trailing settings.catchUpLookbackDays days instead, to fill "
+            "in days a prior run only partially ingested."
         ),
     )
 
     parser.add_argument("--ticker", default=None, help="single ticker to fetch, e.g. AAPL; omit to use settings.tickers")
     parser.add_argument("--start-date", default=None, help="first trading date to fetch, YYYY-MM-DD; omit to use settings.startDate")
     parser.add_argument("--end-date", default=None, help="last trading date to fetch (inclusive), YYYY-MM-DD; omit to default to --start-date (a single day)")
+    parser.add_argument(
+        "--catch-up",
+        action="store_true",
+        default=False,
+        help="re-fetch the trailing settings.catchUpLookbackDays days (excluding today) instead of a date range",
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -52,6 +61,9 @@ def parse_args(argv: list[str]) -> CliArguments:
 
     if args.end_date is not None and args.start_date is None:
         parser.error("--end-date requires --start-date.")
+
+    if args.catch_up and (args.start_date is not None or args.end_date is not None):
+        parser.error("--catch-up cannot be combined with --start-date/--end-date.")
 
     start_date: date_type | None = None
     end_date: date_type | None = None
@@ -72,7 +84,7 @@ def parse_args(argv: list[str]) -> CliArguments:
         if end_date < start_date:
             parser.error(f"--end-date ({end_date.isoformat()}) must not be before --start-date ({start_date.isoformat()}).")
 
-    return CliArguments(ticker=args.ticker, start_date=start_date, end_date=end_date, debug=args.debug)
+    return CliArguments(ticker=args.ticker, start_date=start_date, end_date=end_date, catch_up=args.catch_up, debug=args.debug)
 
 
 def _date_range(start_date: date_type, end_date: date_type) -> list[date_type]:
@@ -115,6 +127,7 @@ def main(
     settings_path: Path | None = None,
     provider: IntraDayProvider | None = None,
     database_factory: Callable[[PostgresSettings], PostgresDatabase] | None = None,
+    today: Callable[[], date_type] | None = None,
 ) -> int:
     arguments = parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -143,7 +156,15 @@ def main(
         if not tickers:
             raise AppError("No ticker given and settings.tickers is empty — pass --ticker or configure settings.tickers.")
 
-        if arguments.start_date is not None and arguments.end_date is not None:
+        if arguments.catch_up:
+            active_today = date_type.today() if today is None else today()
+            effective_end_date = active_today - timedelta(days=1)
+            effective_start_date = active_today - timedelta(days=settings.catch_up_lookback_days)
+            Logger.info(
+                f"quant-ingest: catch-up mode, re-fetching {effective_start_date.isoformat()} to {effective_end_date.isoformat()}.",
+                category=CATEGORY_INGEST,
+            )
+        elif arguments.start_date is not None and arguments.end_date is not None:
             effective_start_date = arguments.start_date
             effective_end_date = arguments.end_date
         elif settings.start_date is not None and settings.end_date is not None:
@@ -151,7 +172,8 @@ def main(
             effective_end_date = settings.end_date
         else:
             raise AppError(
-                "No date range given and settings.startDate/settings.endDate not configured — pass --start-date/--end-date or configure both in settings."
+                "No date range given and settings.startDate/settings.endDate not configured — "
+                "pass --start-date/--end-date, --catch-up, or configure both settings dates."
             )
 
         target_dates = _date_range(effective_start_date, effective_end_date)

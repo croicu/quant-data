@@ -58,3 +58,16 @@ need to be redone by hand on every future migration.
 ## Test results
 
 <!-- Added when advancing to Testing / Ready to Submit. -->
+
+## Update: first concrete job shipped, narrower than this brainstorm (2026-07-27)
+
+`quant-ingest --catch-up` (re-fetches the trailing `settings.catchUpLookbackDays` days,
+unconditionally, relying on `write_bars`'s upsert to make re-ingesting an already-complete day a
+no-op) shipped as an ad-hoc feature — see the CLI/architecture docs and its own issue (not this
+one). It deliberately took the narrowest possible slice of what's brainstormed here: no `jobs`
+table, no in-DB scheduling/dispatch mechanism, no `pg_cron` — just a CLI flag that something
+host-specific (cron/systemd, set up outside this repo) has to trigger. All of this brainstorm's
+actual open questions (jobs-table shape, `pg_cron` vs. custom poller, public/private repo split,
+role/permissions for a jobs table) remain genuinely unresolved — this update is here so a future
+reader doesn't mistake the catch-up flag for having answered them. Still postponed; revisit if a
+second recurring job (e.g. DB maintenance) makes the general mechanism worth building.

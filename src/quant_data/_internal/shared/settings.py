@@ -32,6 +32,7 @@ class Settings:
     tickers: list[str] = field(default_factory=list)
     start_date: date | None = None
     end_date: date | None = None
+    catch_up_lookback_days: int = 7
 
     _instance: ClassVar[Settings | None] = None
 
@@ -153,6 +154,10 @@ class Settings:
         if start_date_setting is not None and end_date_setting is not None and end_date_setting < start_date_setting:
             raise TaskError(f"'settings.endDate' ({end_date_setting.isoformat()}) must not be before 'settings.startDate' ({start_date_setting.isoformat()}).")
 
+        catch_up_lookback_days = int(settings_payload.get("catchUpLookbackDays", 7))
+        if catch_up_lookback_days < 1:
+            raise TaskError(f"'settings.catchUpLookbackDays' must be at least 1, got {catch_up_lookback_days}.")
+
         cls._instance = cls(
             debug=debug,
             logging=log_level,
@@ -162,6 +167,7 @@ class Settings:
             tickers=tickers,
             start_date=start_date_setting,
             end_date=end_date_setting,
+            catch_up_lookback_days=catch_up_lookback_days,
         )
 
         return cls._instance

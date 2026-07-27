@@ -63,6 +63,29 @@ def test_load_raises_on_malformed_start_date(tmp_path):
         Settings.load(path=settings_path)
 
 
+def test_load_defaults_catch_up_lookback_days_to_seven(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.catch_up_lookback_days == 7
+
+
+def test_load_parses_catch_up_lookback_days(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"catchUpLookbackDays": 14})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.catch_up_lookback_days == 14
+
+
+def test_load_raises_on_non_positive_catch_up_lookback_days(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"catchUpLookbackDays": 0})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
 def test_load_local_path_is_scoped_to_given_path_directory(tmp_path):
     # Regression guard: local_path used to default relative to the process's cwd regardless of
     # which `path` was passed, so loading a fixture elsewhere could silently pick up whatever

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -199,3 +200,47 @@ def test_main_exits_two_when_only_end_date_given():
         cli.main(["--ticker", "AAPL", "--end-date", "2026-01-02"])
 
     assert exc_info.value.code == 2
+
+
+def test_main_exits_two_when_catch_up_combined_with_start_date():
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--ticker", "AAPL", "--catch-up", "--start-date", "2026-01-02"])
+
+    assert exc_info.value.code == 2
+
+
+def test_main_catch_up_uses_settings_lookback_window(tmp_path):
+    # today=2026-01-03, catchUpLookbackDays=1 -> re-fetches exactly 2026-01-02, which has 2
+    # fixture bars for AAPL.
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], catchUpLookbackDays=1)
+    database = MockPostgresDatabase()
+
+    exit_code = cli.main(
+        ["--catch-up"],
+        settings_path=settings_path,
+        provider=MockIntraDayProvider(),
+        database_factory=_use_database(database),
+        today=lambda: date(2026, 1, 3),
+    )
+
+    assert exit_code == 0
+    assert len(database.written_bars) == 2
+
+
+def test_main_catch_up_excludes_today_and_tolerates_gaps(tmp_path):
+    # today=2026-01-06, default 7-day lookback -> 2025-12-30 through 2026-01-05 inclusive.
+    # Only 01-02 (2 bars) and 01-05 (1 bar) have fixture data; the rest fail per-day without
+    # aborting the run, same as a plain --start-date/--end-date range.
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"])
+    database = MockPostgresDatabase()
+
+    exit_code = cli.main(
+        ["--catch-up"],
+        settings_path=settings_path,
+        provider=MockIntraDayProvider(),
+        database_factory=_use_database(database),
+        today=lambda: date(2026, 1, 6),
+    )
+
+    assert exit_code == 1
+    assert len(database.written_bars) == 3  # 2 bars on 01-02 + 1 bar on 01-05

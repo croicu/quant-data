@@ -104,7 +104,8 @@ independent top-level packages.
   belongs in `settings.local.json` rather than the committed `settings.json`. `Settings.load(path,
   local_path)`'s `local_path` defaults relative to `path`'s own directory (not the process's cwd),
   so loading a test fixture's `settings.json` never accidentally picks up the real repo-root
-  `settings.local.json`.
+  `settings.local.json`. `Settings.catch_up_lookback_days` (`catchUpLookbackDays`, default `7`)
+  sizes `quant-ingest --catch-up`'s trailing re-fetch window.
 - `postgres.py` — `PostgresDatabase`: the concrete `MarketDataProvider` implementation, plus a
   `write_bars` method used only by `ingest` (not part of the `MarketDataProvider` Protocol itself —
   see "Contracts" below on why that's ergonomics, not the actual security boundary). Single
@@ -139,13 +140,25 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
 - `--end-date` is optional — omit it (with `--start-date` given) for a single day. `--end-date`
   without `--start-date` is rejected. Omitting both falls back to
   `settings.startDate`/`settings.endDate` (same single-day-if-only-startDate-given rule there too).
+- `--catch-up` is a third, mutually-exclusive way to pick the date range: instead of an explicit
+  range, it re-fetches the trailing `settings.catchUpLookbackDays` days (default 7), excluding
+  today (computed via an injectable `today: Callable[[], date]` parameter on `main`, defaulting to
+  `date.today`, per this repo's clock-injection convention). Deliberately does no gap
+  *detection* — it just re-runs the same per-day fetch+write for the whole window unconditionally.
+  Because `write_bars` upserts on `(ticker_id, date_id, time_id)`, re-ingesting an already-complete
+  day is a harmless no-op; a day a prior run only partially ingested (e.g. `quant-ingest` run
+  manually mid-session, or interrupted) gets filled in. This is the first concrete job to come out
+  of the scheduled-jobs brainstorm (`tasks/scheduled_jobs.md`, issue #3) — deliberately the
+  narrowest slice of it: no jobs table, no in-DB scheduling mechanism, just a CLI flag. Actually
+  running it nightly means wiring a cron/systemd timer on whatever host runs it, which stays
+  outside this public repo per that brainstorm's design lean (box-specific scheduling detail
+  shouldn't leak into committed source).
 - One connection is opened for the whole run and reused across every (ticker, date) pair.
 - One (ticker, date) pair failing (bad ticker, no data for that day — e.g. a weekend) logs a
   warning and continues rather than aborting the rest of the range/batch; the exit code is `1` if
   anything failed, `0` if everything succeeded.
-- No scheduling or IBKR integration yet — recurring/unattended runs and swapping Yahoo Finance for
-  IBKR as the real intraday source are unaddressed, to become their own tasks if/when
-  `quant-scratch` actually needs them.
+- No IBKR integration yet — swapping Yahoo Finance for IBKR as the real intraday source is
+  unaddressed, to become its own task if/when `quant-scratch` actually needs it.
 
 ### `quant_data.client`
 

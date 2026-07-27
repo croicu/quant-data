@@ -8,13 +8,19 @@ CLI signature and file format schemas for `quant-data`.
 
 ### `quant-ingest`
 
-- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD]] [--ticker TICKER] [--debug]`
+- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]`
 - Fetches 1-minute OHLCV bars from Yahoo Finance and writes them into the warehouse — see
   `docs/ARCHITECTURE.md` for the full design.
 - `--ticker` — single ticker (e.g. `AAPL`); omit to use every ticker in `settings.tickers` instead.
 - `--start-date` — first trading date, `YYYY-MM-DD`; omit to use `settings.startDate`.
 - `--end-date` — last trading date (inclusive); omit (with `--start-date` given) for a single day.
   Requires `--start-date` — rejected on its own.
+- `--catch-up` — re-fetches the trailing `settings.catchUpLookbackDays` days (default 7),
+  excluding today, instead of a `--start-date`/`--end-date` range. Rejected in combination with
+  `--start-date`/`--end-date`. Meant for an unattended nightly run (cron/systemd timer, set up
+  outside this repo — see `tasks/scheduled_jobs.md`) that catches up any day a prior run only
+  partially ingested (e.g. `quant-ingest` run manually mid-session); safe to run against
+  already-complete days too, since `write_bars` upserts are idempotent.
 - `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
   instead of printing a one-line error, for upfront failures (settings load, no ticker/date
   configured at all).
