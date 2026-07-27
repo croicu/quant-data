@@ -20,6 +20,17 @@ def _connect(mock_psycopg, fetchone_results: list) -> MagicMock:
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
+def test_connect_pins_session_timezone_to_utc(mock_psycopg):
+    # fact_market_data_1min.timestamp is TIMESTAMP WITHOUT TIME ZONE; without pinning the
+    # session, Postgres implicitly casts our tz-aware UTC values down using the connection's
+    # local TimeZone GUC, silently corrupting every stored timestamp (quant-data#9).
+    PostgresDatabase(host="localhost", port=5433, user="quant_writer", password="x", dbname="quant_data")
+
+    _, connect_kwargs = mock_psycopg.connect.call_args
+    assert connect_kwargs["options"] == "-c TimeZone=UTC"
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
 def test_write_bars_commits_on_success(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [(1,), (10,), (20,)])  # ticker_id, date_id, time_id
 

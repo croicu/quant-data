@@ -24,6 +24,12 @@ class PostgresDatabase:
                 user=user,
                 password=password,
                 dbname=dbname,
+                # fact_market_data_1min.timestamp is TIMESTAMP WITHOUT TIME ZONE, but every OHLCV
+                # we bind is tz-aware UTC. Without pinning the session, Postgres treats that as a
+                # timestamptz and implicitly casts it down using the connection's TimeZone GUC —
+                # which defaults to the server's local zone, not UTC — silently shifting the
+                # stored wall-clock value. See quant-data#9.
+                options="-c TimeZone=UTC",
             )
         except psycopg.Error as error:
             raise AppError(f"Failed to connect to Postgres at {host}:{port}/{dbname}: {error}") from error
