@@ -225,7 +225,9 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 _(none — see New Task above for the postponed scheduled-jobs brainstorm)_
 
 ## Completed Tasks
-- **Nest all packages under `quant_data.*`** — closed issue #7 (bug). `src/defs/`, `src/shared/`,
+- **Nest all packages under `quant_data.*`** — fix done for issue #7 (bug), reopened pending
+  verification from `quant-scratch`'s actual integration (croicu/quant-scratch#7) before closing.
+  `src/defs/`, `src/shared/`,
   `src/ingest/`, `src/client/` moved to `src/quant_data/{defs,shared,ingest,client}/`; every
   cross-package import, `pyproject.toml`'s console script, and `.vscode/launch.json` updated
   accordingly. Fixes a real collision: quant-data's and quant-scratch's flat top-level `defs`/
