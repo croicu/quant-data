@@ -1,0 +1,35 @@
+{
+  "AAPL": {
+    "2026-01-02": [
+      {
+        "timestamp": "2026-01-02T14:30:00+00:00",
+        "open": 100.0,
+        "high": 101.0,
+        "low": 99.5,
+        "close": 100.5,
+        "volume": 1000,
+        "incomplete": false
+      },
+      {
+        "timestamp": "2026-01-02T14:31:00+00:00",
+        "open": 100.5,
+        "high": 100.9,
+        "low": 100.0,
+        "close": 100.2,
+        "volume": 0,
+        "incomplete": true
+      }
+    ],
+    "2026-01-05": [
+      {
+        "timestamp": "2026-01-05T14:30:00+00:00",
+        "open": 101.0,
+        "high": 102.0,
+        "low": 100.5,
+        "close": 101.5,
+        "volume": 500,
+        "incomplete": false
+      }
+    ]
+  }
+}

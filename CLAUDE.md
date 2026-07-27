@@ -4,15 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Mission
 
-This repo owns the market-data warehouse: the PostgreSQL schema, migrations, and (in a follow-up
-task) the ingest/read infrastructure for 1-minute OHLCV bars. It's the shared data layer behind
+This repo owns the market-data warehouse: the PostgreSQL schema, migrations, and the ingest/read
+infrastructure for 1-minute OHLCV bars. It's the shared data layer behind
 [`quant-scratch`](https://github.com/croicu/quant-scratch) (experiments and CLI tools) and
 `quant-research` (published findings) — centralizing storage so experiments don't each re-fetch
 and re-store the same historical bars from their own data providers.
 
-This initial version is schema-first and deliberately incomplete: it ships the star-schema
-migration and documentation only. Ingest tooling and a read client are a follow-up once the schema
-itself is validated against real data — see `tasks/postgres_client_and_dimensions.md`.
+The star schema, migrations, and docs shipped first; a Python read client
+(`MarketDataProvider`/`PostgresDatabase`) and a first-cut `quant-ingest` CLI (pulling from Yahoo
+Finance) followed — see `docs/ARCHITECTURE.md`. Remaining open work (a dedicated read-only
+`quant_reader` DB role, swapping in IBKR as the real intraday source, batching/scheduling) is
+tracked in `tasks/postgres_client_and_dimensions.md`.
 
 ## Template Sync
 
@@ -165,11 +167,16 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   exact commands and `docs/DATABASE.md` for connection/tunnel setup.
 - **Schema**: a four-table star schema (`dim_ticker`, `dim_date`, `dim_time`,
   `fact_market_data_1min`) — see `docs/SCHEMA.md` for the full design and rationale.
+- **Roles**: `quant_data` (schema owner, used for migrations/admin) and `quant_writer` (ingest's
+  read/write role, password-protected). A dedicated read-only `quant_reader` role is deferred until
+  there's an actual read consumer — see `tasks/postgres_client_and_dimensions.md`. Single-writer,
+  many-reader is the intended end state; it isn't fully enforced at the DB-privilege level yet
+  since only `quant_writer` currently exists as a non-owner role.
 
 ## Architecture conventions
 
 1. Internal processing uses strongly typed dataclasses.
-2. **Package layout**: `src/` follows `quant-scratch`'s convention — one folder per app (e.g. `src/ingest/`), plus two repo-wide non-app packages: `src/shared/` (cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`) and `src/defs/` (`protocols.py` + `contracts.py`). `defs/` is kept separate from `shared/` on purpose: contracts are the specification, not owned by whichever package happens to implement them. There is no top-level `quant_data` package or generic `quant-data` console script — each app gets its own named script (e.g. `quant-ingest`), matching `quant-scratch` having no generic script either. Cross-package imports are absolute (`from shared.diagnostics import ...`, `from defs.contracts import ...`); same-package imports stay relative (`from .errors import ...`). setuptools' src-layout automatic discovery picks up every package under `src/` with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`.
+2. **Package layout**: `src/` follows `quant-scratch`'s convention — one folder per app (e.g. `src/ingest/`), plus two repo-wide non-app packages: `src/shared/` (cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`, `postgres.py`, `providers/`) and `src/defs/` (`protocols.py` + `contracts.py`). `defs/` is kept separate from `shared/` on purpose: contracts are the specification, not owned by whichever package happens to implement them. There is no top-level `quant_data` package or generic `quant-data` console script — each app gets its own named script (e.g. `quant-ingest`), matching `quant-scratch` having no generic script either. Cross-package imports are absolute (`from shared.diagnostics import ...`, `from defs.contracts import ...`); same-package imports stay relative (`from .errors import ...`). setuptools' src-layout automatic discovery picks up every package under `src/` with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`.
 3. `protocols.py` (in `src/defs/`) contains persisted/shared data contracts — pure data only, no behavior. Behavior that operates on protocol types belongs in a dedicated entity/service layer, not on the protocol classes themselves.
 4. `contracts.py` (in `src/defs/`) contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors), not data.
 5. Unit tests (`tests/unit/`) must run offline. Integration tests (`tests/integration/`), if the project has them, may hit real external services — that's a deliberate scope split, not a loophole in rule 4. Note `pytest.ini`'s `testpaths = tests` runs both by default, so adding an integration suite means accepting network calls in the default `pytest` invocation unless you also gate it behind a marker.
@@ -210,14 +217,29 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 
 ## Pending Tasks
 - **File**: [Postgres client](tasks/postgres_client_and_dimensions.md)
-- **Status**: Brainstorm
-- **Key Context**: This bootstrap task shipped schema + docs only, no code. The read client
-  (`MarketDataProvider(Protocol)` + `PostgresDatabase` implementation) is deliberately deferred to
-  this follow-up task.
+- **Status**: Brainstorm — first cut + batch/settings increment shipped (closed issues #4, #5),
+  remaining scope open
+- **Key Context**: The read client and a Yahoo-Finance-backed `quant-ingest` CLI are built, with
+  settings-driven ticker lists/date ranges and multi-ticker/multi-day batching (see
+  `docs/ARCHITECTURE.md`). Left open: a dedicated read-only `quant_reader` DB role, swapping in
+  IBKR as the real intraday source, and recurring/unattended scheduling.
 
 ## Completed Tasks
 - **Repository bootstrap** (schema, migrations, docs, Python scaffold) — seeded from
   `quant-scratch`'s `tasks/bootstrap_quant_data.md` and `tasks/database_layer.md`.
+- **Postgres read/write client + Yahoo Finance ingest CLI (first cut)** — closed issue #4.
+  `defs.protocols.OHLCV`/`contracts.MarketDataProvider`/`IntraDayProvider`,
+  `shared.postgres.PostgresDatabase`, `shared.providers.yf.YahooFinanceIntraDay`,
+  `ingest.cli`'s `quant-ingest` command, `quant_writer` DB role, and
+  `migrations/002_add_incomplete_flag.sql`. Verified against the real database (953 real AAPL bars
+  written and read back) plus 10 mocked unit tests.
+- **quant-ingest batch mode: settings-driven tickers + date ranges** — closed issue #5.
+  `Settings.tickers`/`Settings.start_date`/`Settings.end_date` (all optional CLI overrides,
+  `settings.local.json`-only for the personal watchlist/date default), multi-ticker/multi-day
+  batching tolerant of individual failures, a corrected `incomplete` heuristic (literal-zero
+  volume, not just `NaN`), and a real `Settings.load()` `local_path` isolation bug fix. Verified
+  against the real database (6 tickers ingested, fully settings-driven invocation with zero CLI
+  args). `pytest` grew to 28 passed.
 - **Provision PostgreSQL on CroicuWS1 + populate dimensions** — ad-hoc infra task, see the closed
   GitHub issue. PostgreSQL 16 installed (data directory on the `storage` zpool), `quant_data`
   role/database created, `001_init_schema` applied, `dim_time`/`dim_date` populated

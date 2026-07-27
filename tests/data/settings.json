@@ -3,6 +3,13 @@
     "debug": false,
     "logLevel": "error",
     "logCategories": [],
-    "excludedCategories": []
+    "excludedCategories": [],
+    "postgres": {
+      "host": "localhost",
+      "port": 5433,
+      "user": "test",
+      "password": "test",
+      "dbname": "test"
+    }
   }
 }

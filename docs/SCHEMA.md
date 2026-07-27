@@ -61,6 +61,7 @@ populated once, not per ticker/date.
 | `open`, `high`, `low`, `close` | `NUMERIC NOT NULL` | Unbounded-precision, not a fixed-scale numeric or float — preserves exact precision for backtests |
 | `volume` | `BIGINT NOT NULL` | `>= 0` |
 | `timestamp` | `TIMESTAMP NOT NULL` | UTC assumed; kept for reference/audit, redundant with the three dimension keys |
+| `incomplete` | `BOOLEAN NOT NULL DEFAULT FALSE` | Added in `002_add_incomplete_flag`. True when the provider couldn't supply full data for this bar (e.g. missing pre-market volume) — a signal to prioritize backfilling, not a data-quality gate on read. |
 
 Primary key: `(ticker_id, date_id, time_id)` — enforces exactly one bar per ticker per minute per
 date.

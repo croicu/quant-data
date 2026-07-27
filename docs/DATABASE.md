@@ -106,18 +106,42 @@ FROM generate_series('2020-01-01'::date, '2030-12-31'::date, '1 day'::interval) 
 ON CONFLICT (date) DO NOTHING;
 ```
 
-## Connection testing from Python (future)
-
-No Python database client ships with this bootstrap — see `tasks/postgres_client_and_dimensions.md`
-for the follow-up that adds `quant-data`'s `PostgresDatabase`/`MarketDataProvider`. Once that
-exists, a connection test will look roughly like:
+## Connection testing from Python
 
 ```python
-from shared.postgres import PostgresDatabase  # not implemented yet
+from datetime import date
+from shared.postgres import PostgresDatabase
 
-db = PostgresDatabase(host="localhost", port=5433, user="quant_reader", password=None, dbname="quant_data")
-bars = db.fetch_bars("AAPL", start_date="2026-01-15", end_date="2026-01-15")
+db = PostgresDatabase(host="localhost", port=5433, user="quant_writer", password="...", dbname="quant_data")
+bars = db.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
 print(len(bars))
+db.close()
 ```
 
-Until then, `psql` (above) is the only supported way to verify connectivity and query the schema.
+Connection details (including the password) come from `settings.json`/`settings.local.json`'s
+`postgres` section — see `docs/ARCHITECTURE.md` for the full shape. A dedicated read-only
+`quant_reader` role doesn't exist yet (deferred until there's an actual read consumer — see
+`tasks/postgres_client_and_dimensions.md`); `quant_writer` (created for ingest) can also read in
+the meantime, but should be treated as ingest-only in new code going forward.
+
+## Populating real data
+
+`quant-ingest` fetches bars from Yahoo Finance over an inclusive date range and writes them into
+the warehouse — the actual write path described above, run for real:
+
+```bash
+# Single ticker, single day (--end-date omitted defaults to --start-date)
+quant-ingest --ticker AAPL --start-date 2026-01-15
+
+# Single ticker, a date range
+quant-ingest --ticker AAPL --start-date 2026-01-12 --end-date 2026-01-16
+
+# Every ticker in settings.tickers (omit --ticker), one day
+quant-ingest --start-date 2026-01-15
+
+# Everything from settings (tickers + startDate/endDate) -- no flags at all
+quant-ingest
+```
+
+`psql` (above) remains useful for direct verification/debugging, but isn't the only way to
+interact with the schema anymore.

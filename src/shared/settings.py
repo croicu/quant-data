@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import ClassVar
 
@@ -9,7 +10,16 @@ from .diagnostics import CATEGORY_GENERAL, TelemetryLevel
 from .errors import TaskError
 
 _SETTINGS_PATH = Path("./settings.json")
-_LOCAL_PATH = Path("./settings.local.json")
+_LOCAL_PATH_NAME = "settings.local.json"
+
+
+@dataclass
+class PostgresSettings:
+    host: str
+    port: int
+    user: str
+    password: str
+    dbname: str
 
 
 @dataclass
@@ -18,11 +28,20 @@ class Settings:
     logging: TelemetryLevel = TelemetryLevel.ERROR
     log_categories: list[str] = field(default_factory=list)
     excluded_categories: list[str] = field(default_factory=list)
+    postgres: PostgresSettings | None = None
+    tickers: list[str] = field(default_factory=list)
+    start_date: date | None = None
+    end_date: date | None = None
 
     _instance: ClassVar[Settings | None] = None
 
     @classmethod
-    def load(cls, path: Path = _SETTINGS_PATH, local_path: Path = _LOCAL_PATH) -> Settings:
+    def load(cls, path: Path = _SETTINGS_PATH, local_path: Path | None = None) -> Settings:
+        # local_path defaults relative to path's own directory, not the process's cwd -- so a
+        # test loading a fixture path doesn't silently pick up the real repo-root
+        # settings.local.json just because pytest happens to run from the repo root.
+        resolved_local_path = local_path if local_path is not None else path.parent / _LOCAL_PATH_NAME
+
         debug = False
         log_level = TelemetryLevel.ERROR
         log_categories: list[str] = []
@@ -40,8 +59,8 @@ class Settings:
                 raise TaskError("'settings' in settings.json must be a JSON object.")
             settings_payload = dict(base_settings)
 
-        if local_path.exists():
-            with local_path.open("r", encoding="utf-8") as f:
+        if resolved_local_path.exists():
+            with resolved_local_path.open("r", encoding="utf-8") as f:
                 local_payload = json.load(f)
             if isinstance(local_payload, dict):
                 local_settings = local_payload.get("settings", {})
@@ -83,11 +102,66 @@ class Settings:
             # debug=true shows everything, same as an empty filter always has.
             log_categories = [] if debug else [CATEGORY_GENERAL]
 
+        postgres_settings: PostgresSettings | None = None
+        postgres_payload = settings_payload.get("postgres")
+        if postgres_payload is not None:
+            if not isinstance(postgres_payload, dict):
+                raise TaskError("'settings.postgres' must be a JSON object.")
+            required_keys = ["host", "port", "user", "password", "dbname"]
+            missing_keys = []
+            for key in required_keys:
+                if key not in postgres_payload:
+                    missing_keys.append(key)
+            if missing_keys:
+                raise TaskError(f"'settings.postgres' is missing required key(s): {', '.join(missing_keys)}")
+            postgres_settings = PostgresSettings(
+                host=str(postgres_payload["host"]),
+                port=int(postgres_payload["port"]),
+                user=str(postgres_payload["user"]),
+                password=str(postgres_payload["password"]),
+                dbname=str(postgres_payload["dbname"]),
+            )
+
+        tickers_payload = settings_payload.get("tickers", [])
+        if not isinstance(tickers_payload, list):
+            raise TaskError("'settings.tickers' must be an array of strings.")
+        tickers: list[str] = []
+        for ticker_name in tickers_payload:
+            tickers.append(str(ticker_name).upper())
+
+        start_date_setting: date | None = None
+        start_date_payload = settings_payload.get("startDate")
+        if start_date_payload is not None:
+            try:
+                start_date_setting = date.fromisoformat(str(start_date_payload))
+            except ValueError as error:
+                raise TaskError(f"'settings.startDate' must be YYYY-MM-DD: {error}")
+
+        end_date_setting: date | None = None
+        end_date_payload = settings_payload.get("endDate")
+        if end_date_payload is not None:
+            if start_date_setting is None:
+                raise TaskError("'settings.endDate' requires 'settings.startDate' to also be set.")
+            try:
+                end_date_setting = date.fromisoformat(str(end_date_payload))
+            except ValueError as error:
+                raise TaskError(f"'settings.endDate' must be YYYY-MM-DD: {error}")
+        elif start_date_setting is not None:
+            # endDate omitted: a single day, same as startDate.
+            end_date_setting = start_date_setting
+
+        if start_date_setting is not None and end_date_setting is not None and end_date_setting < start_date_setting:
+            raise TaskError(f"'settings.endDate' ({end_date_setting.isoformat()}) must not be before 'settings.startDate' ({start_date_setting.isoformat()}).")
+
         cls._instance = cls(
             debug=debug,
             logging=log_level,
             log_categories=log_categories,
             excluded_categories=excluded_categories,
+            postgres=postgres_settings,
+            tickers=tickers,
+            start_date=start_date_setting,
+            end_date=end_date_setting,
         )
 
         return cls._instance

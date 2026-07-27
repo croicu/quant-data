@@ -8,9 +8,10 @@ a remote Postgres instance, built to be the centralized data source for
 `quant-research`'s published analysis — so historical bars get fetched and stored once, not
 re-pulled by every experiment from its own live data provider.
 
-This initial version is schema-only: migrations and documentation, no ingest or read code yet.
-See [`docs/SCHEMA.md`](docs/SCHEMA.md) for the table design and [`docs/SETUP.md`](docs/SETUP.md)
-to stand up the schema on a fresh Postgres instance.
+See [`docs/SCHEMA.md`](docs/SCHEMA.md) for the table design, [`docs/SETUP.md`](docs/SETUP.md) to
+stand up the schema on a fresh Postgres instance, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+for the Python read client (`MarketDataProvider`/`PostgresDatabase`) and the `quant-ingest` CLI
+that pulls bars from Yahoo Finance.
 
 ---
 

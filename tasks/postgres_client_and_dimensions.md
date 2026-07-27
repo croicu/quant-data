@@ -1,6 +1,6 @@
 # Postgres Client + Ingest
 
-## Status: Brainstorm
+## Status: Brainstorm (first cut + batch/settings increment shipped — see closed [issue #4](https://github.com/croicu/quant-data/issues/4) and [issue #5](https://github.com/croicu/quant-data/issues/5); remaining scope below)
 
 ## Problem statement
 
@@ -81,28 +81,80 @@ Carried over from `database_layer.md`, adapted to this repo's actual package lay
 
 ## Open questions
 
-- **Ingest tool shape**: decided that ingest lives in this repo (`quant-data`, as `src/ingest/` —
-  see the reorg in `docs/ARCHITECTURE.md`), as a second CLI alongside the read client — not in
-  `quant-scratch`. Still open: exact CLI shape, and how it
-  pulls from IBKR (see `quant-scratch`'s `tasks/ibkr_tws_extended_hours.md` — IBKR is the chosen
-  intraday source); revisit the IBKR integration specifics once that task has moved past
-  Brainstorm.
-- **Connection pooling**: fine to skip for a single-CLI-invocation read pattern (matches
-  `quant-scratch`'s own precedent of "single connection per CLI invocation, no pooling"). Revisit
-  only if a long-running ingest process makes single-connection-per-call wasteful.
-- **Driver choice**: `psycopg` (v3) vs `psycopg2` — not decided; check current recommended practice
-  at implementation time rather than assuming either is still the better default.
-- **Testing**: unit tests must mock `PostgresDatabase` per this repo's own coding-style rule
-  (constructor/parameter injection over monkeypatching own internals) — straightforward, since
-  `MarketDataProvider` is already structured as a swappable interface. Integration tests against a
-  real database are optional for the MVP per `database_layer.md`'s original testing strategy; if
-  added, they'd need a real (or disposable/test) Postgres instance, which raises its own
-  provisioning question not yet addressed here.
+- **`quant_reader` role**: still not created — only `quant_writer` (read/write, used by ingest)
+  exists as a non-owner role so far, per the earlier decision to defer `quant_reader` until there's
+  an actual read consumer. When `quant-scratch` (or another consumer) actually starts reading,
+  create it then (trust-authenticated for `127.0.0.1`, per the Design decisions above).
+- **IBKR as the real intraday source**: `YahooFinanceIntraDay` (`shared/providers/yf.py`)
+  is today's provider, used to validate the end-to-end pipeline with real data — not necessarily
+  the long-term one. `quant-scratch`'s IBKR work (`tasks/ibkr_tws_extended_hours.md`) is the
+  eventually-intended intraday source. Swapping providers means writing a new `IntraDayProvider`
+  implementation; `ingest/cli.py` itself shouldn't need to change, since it already depends on the
+  `IntraDayProvider` Protocol, not concretely on Yahoo Finance.
+- **Recurring/unattended scheduling**: `quant-ingest` now handles multi-ticker (`settings.tickers`,
+  used when `--ticker` is omitted) and multi-day (`--start-date`/`--end-date`) batches in one
+  invocation, tolerating individual (ticker, date) failures without aborting the rest. Still run
+  manually, though — nothing triggers it on a schedule yet. That likely intersects with
+  `tasks/scheduled_jobs.md` (currently postponed) once ingest needs to run unattended rather than
+  by hand.
+
+Resolved during implementation (moved here from earlier open questions, for history): driver is
+`psycopg` (v3, with the `[binary]` extra to avoid needing a local `pg_config`/build toolchain);
+connection pooling stays skipped (single connection per CLI invocation, matching the original
+lean); unit tests mock `PostgresDatabase` and the Yahoo Finance provider (`tests/mocks/`) rather
+than hitting a real database or network. `tests/integration/test_yf.py` (mirroring
+`quant-scratch`'s own `tests/integration/test_yahoo_finance_intraday.py`) does hit the real
+`yfinance` network API for a known ticker — no `PostgresDatabase` integration test against a real
+database yet, matching `database_layer.md`'s original "optional for MVP" scope for that specific
+piece. Per this repo's own convention (`pytest.ini`'s `testpaths = tests`, no marker gating), the
+default `pytest` run now makes one live network call.
 
 ## Implementation plan
 
-<!-- Added when advancing to Implementation. -->
+Implemented (see `docs/ARCHITECTURE.md` for the full module layout):
+
+- `defs.protocols.OHLCV`, `defs.contracts.MarketDataProvider`/`IntraDayProvider`
+- `shared.settings.PostgresSettings` + `Settings.postgres`
+- `shared.postgres.PostgresDatabase` (`fetch_bars` read path, `write_bars` upsert write path)
+- `shared.providers.yf.YahooFinanceIntraDay`
+- `ingest.cli` wired to fetch + write a single ticker/day, both dependencies constructor-injected
+- `quant_writer` DB role created and granted read/write (see the closed provisioning issue)
+- `migrations/002_add_incomplete_flag.sql` — `fact_market_data_1min.incomplete` for bars where the
+  provider couldn't supply full data (e.g. missing pre-market volume)
+
+Second increment, on top of the above (see closed issue for this batch of work):
+
+- `Settings.tickers` (a personal watchlist default, `settings.local.json`-only) and
+  `Settings.start_date`/`Settings.end_date` (`settings.startDate`/`settings.endDate`) — both
+  optional CLI overrides (`--ticker`, `--start-date`/`--end-date`) fall back to these when omitted.
+- `quant-ingest` batches over every (ticker, date) pair in one invocation using a single shared
+  connection; one pair failing logs a warning and continues rather than aborting the run.
+- `--end-date` (and `settings.endDate`) made optional — a lone `--start-date`/`settings.startDate`
+  means a single day.
+- Fixed a real bug in `Settings.load()`: `local_path` used to default relative to the process's
+  cwd regardless of the given `path`, so any test loading a custom fixture path was silently
+  merging in the real repo-root `settings.local.json` (harmless while it only held Postgres creds
+  a mocked factory ignored, but became an actual test-correctness bug once `tickers` started
+  driving branching logic). Now `local_path` defaults relative to `path`'s own directory.
+- Ingested 6 real tickers (`SPY`, `SH`, `QQQ`, `PSQ`, `DIA`, `DOG`) for `2026-07-24` via the new
+  batch mode, confirming the whole settings-driven, multi-ticker/multi-day path end-to-end.
 
 ## Test results
 
-<!-- Added when advancing to Testing / Ready to Submit. -->
+- `ruff format`/`ruff check` clean.
+- `pytest`: 11 passed — `tests/unit/test_ingest_cli.py`, `test_postgres.py`, `test_yf.py`,
+  all using mocks (`tests/mocks/postgres.py`, `tests/mocks/yf.py`), no real network/DB in the
+  default run.
+- Manually verified against the real database: `quant-ingest --ticker AAPL --start-date 2026-07-24 --end-date 2026-07-24`
+  (CLI syntax at the time was `--date`, since replaced by `--start-date`/`--end-date`)
+  fetched and wrote 953 bars; read back via `PostgresDatabase.fetch_bars` returned the same 953
+  rows. `incomplete` heuristic originally only checked for `NaN`; real AAPL/2026-07-24 data had no
+  NaNs but 562 literal-zero-volume bars (extended-hours minutes with no trades), which exposed that
+  a real tick can't have zero volume either — the heuristic was corrected to flag literal-zero
+  volume too, re-verified via a new mocked test case, and the same 953 rows were re-ingested
+  (idempotent upsert, no duplicates) to pick up the corrected flag: 562 of 953 now correctly show
+  `incomplete=True`.
+- Second increment: `pytest` grew to 28 passed (`test_settings.py` added, `test_ingest_cli.py`
+  extended for batch/range/settings-default behavior). Manually verified `quant-ingest` with no
+  arguments at all (fully settings-driven: 6 tickers × 1 day) against the real database, plus the
+  `--start-date`-only single-day default and CLI-overrides-settings precedence.
