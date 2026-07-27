@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from quant_data.shared.errors import TaskError
-from quant_data.shared.settings import Settings
+from quant_data_internal.shared.errors import TaskError
+from quant_data_internal.shared.settings import Settings
 
 
 def _write_settings(path: Path, payload: dict) -> Path:

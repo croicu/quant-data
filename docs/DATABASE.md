@@ -108,22 +108,27 @@ ON CONFLICT (date) DO NOTHING;
 
 ## Connection testing from Python
 
-Consumers (e.g. `quant-scratch`) should use `MarketData`, not `PostgresDatabase` directly — it
-connects as `quant_reader` by default (`SELECT`-only, trust-authenticated, no password needed
-over the tunnel) and doesn't expose a write method at all:
+Consumers (e.g. `quant-scratch`) should use `MarketData`, not `PostgresDatabase` directly.
+`MarketData` is agnostic of the concrete backend — it takes a provider (built via a factory, e.g.
+`create_postgres_provider`) rather than connection details directly. `create_postgres_provider`
+connects as `quant_reader` by default (`SELECT`-only, trust-authenticated, no password needed over
+the tunnel):
 
 ```python
 from datetime import date
-from quant_data.client.market_data import MarketData
+from quant_data import MarketData, create_postgres_provider
 
-client = MarketData(host="localhost", port=5433, dbname="quant_data")
-bars = client.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
-print(len(bars))
-client.close()
+provider = create_postgres_provider(host="localhost", port=5433, dbname="quant_data")
+with MarketData(provider) as client:
+    bars = client.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
+    print(len(bars))
 ```
 
+(`MarketData` is context-manageable — `close()` runs automatically on exit. Calling `close()`
+manually, without `with`, still works too.)
+
 `quant_writer` (password-protected, read/write) is for `ingest` only — see
-`quant_data.shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly
+`quant_data_internal.shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly
 (e.g. writing your own ingest tooling), with connection details from
 `settings.json`/`settings.local.json`'s `postgres` section (see `docs/ARCHITECTURE.md` for the
 full shape).

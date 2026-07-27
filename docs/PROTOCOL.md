@@ -24,9 +24,12 @@ CLI signature and file format schemas for `quant-data`.
   not necessarily "nothing happened"); `2` argument parsing error (argparse's default behavior on
   missing/bad args, e.g. malformed dates or `--end-date` without `--start-date`).
 
-There is no generic `quant-data` command — `quant-ingest` (write side, `quant_data.ingest`) and
-`quant_data.client.market_data.MarketData` (read side — a library, not a CLI) are the two
-consumer-facing entry points.
+There is no generic `quant-data` command — `quant-ingest` (write side, package `ingest`, outside
+the `quant_data` namespace — no importable surface, console script only) and `quant_data.MarketData`
+(read side — a library, not a CLI) are the two consumer-facing entry points. `MarketData`,
+`OHLCV`, and `create_postgres_provider` are re-exported at the `quant_data` top level
+(`from quant_data import MarketData, OHLCV, create_postgres_provider`); `quant_data_internal.*` is
+a wholly separate, private package and should not be imported directly by external consumers.
 
 ## File formats
 

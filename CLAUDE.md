@@ -11,8 +11,11 @@ infrastructure for 1-minute OHLCV bars. It's the shared data layer behind
 and re-store the same historical bars from their own data providers.
 
 The star schema, migrations, and docs shipped first; a Python read client
-(`quant_data.client.market_data.MarketData`,
-`quant_data.defs.contracts.MarketDataProvider`/`quant_data.shared.postgres.PostgresDatabase`)
+(`quant_data.MarketData`, re-exported at the package top level from
+`quant_data.client.market_data.MarketData`; agnostic of the concrete backend, depending only on
+`quant_data_internal.contracts.MarketDataProvider` — built today via
+`quant_data.create_postgres_provider`, backed by
+`quant_data_internal.shared.postgres.PostgresDatabase`)
 and a `quant-ingest` CLI (pulling from Yahoo Finance) followed, along with the `quant_writer`/
 `quant_reader` DB roles enforcing single-writer/many-reader at the privilege level — see
 `docs/ARCHITECTURE.md`. Swapping in IBKR as the real intraday source and recurring/unattended
@@ -64,6 +67,23 @@ necessarily where the need originated:
 - **quant-scratch needs something from quant-data** (new ticker/column support, a schema change, a
   bug in returned data) → open an issue in **quant-data** requesting it, since that's where the
   building work happens.
+
+**Does this change need a cross-repo issue at all?** The `src/quant_data/` vs.
+`src/quant_data_internal/`/`src/ingest/` split (see "Architecture conventions" below) exists
+specifically to make this cheap to answer by touched-folder alone, not by re-deriving it from
+scratch each time:
+- Touched only `src/quant_data_internal/` or `src/ingest/`? No consumer import path or constructor
+  signature could have changed — no cross-repo issue needed, *unless* the change alters externally
+  observable behavior through the public surface anyway (e.g. a bug fix in
+  `quant_data_internal.shared.postgres.PostgresDatabase.fetch_bars` that changes what
+  `MarketData.fetch_bars` returns — still "a bug in returned data" per the rule above, so still
+  announce it).
+- Touched `src/quant_data/`? Default to assuming a cross-repo issue is needed, then confirm:
+  anything reachable via `from quant_data import ...` is the actual contract, so a change to
+  `__init__.py`'s re-exports, `protocols.py`'s `OHLCV`, or a public class's constructor/method
+  signature (`MarketData`, `create_postgres_provider`) needs one; a change confined to
+  `quant_data.client`'s internals that doesn't touch what's re-exported (e.g. a private helper
+  method) doesn't.
 
 **Conventions**:
 - Label every cross-repo issue `cross-repo` (alongside the normal `status:*` label) so these
@@ -175,22 +195,33 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   no DB password; the SSH tunnel/key is the actual gate for `127.0.0.1`/`::1` connections).
   Single-writer, many-reader is fully enforced at the DB-privilege level now — verified directly:
   a write attempt through `quant_reader` gets a real Postgres `permission denied`, not just a
-  missing Python method. External consumers should use `client.market_data.MarketData` (defaults
-  to `quant_reader`), not `PostgresDatabase` directly.
+  missing Python method. External consumers should use `quant_data.MarketData` with a provider
+  from `quant_data.create_postgres_provider` (defaults to `quant_reader`), not `PostgresDatabase`
+  directly.
 
 ## Architecture conventions
 
 1. Internal processing uses strongly typed dataclasses.
-2. **Package layout**: everything lives under one top-level package, `src/quant_data/`, with a subpackage per app (`quant_data.ingest` for the write-side CLI, `quant_data.client` for the read-side library external consumers import) plus two repo-wide non-app subpackages: `quant_data.shared` (cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`, `postgres.py`, `providers/`) and `quant_data.defs` (`protocols.py` + `contracts.py`). `defs` is kept separate from `shared` on purpose: contracts are the specification, not owned by whichever package happens to implement them. **This deliberately does not mirror `quant-scratch`'s own flat top-level-package convention** (`defs`, `shared`, `day_chart`, ... with no common prefix) — that flat layout is fine for a repo that's never installed alongside anything else, but broke the moment `quant-data` was installed as a pip dependency *next to* `quant-scratch` in the same environment: both repos' top-level `defs`/`shared` packages share the same import name, so whichever installs last silently shadows the other's entirely (see croicu/quant-data#7, reproduced both installation orders). Since `quant-data` is specifically meant to be installed as a dependency of other projects, its packages need a distribution-specific namespace — `quant-scratch` doesn't have this requirement, so its own flat layout stays correct for it. There is no generic `quant-data` console script — each app gets its own named script where it has one (e.g. `quant-ingest`; `quant_data.client` is a plain importable library with no script). Cross-package imports are absolute with the full `quant_data.` prefix (`from quant_data.shared.diagnostics import ...`, `from quant_data.defs.contracts import ...`); same-package imports stay relative (`from .errors import ...`). setuptools' src-layout automatic discovery picks up `quant_data` and every subpackage beneath it with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`.
-3. `protocols.py` (in `quant_data.defs`) contains persisted/shared data contracts — pure data only, no behavior. Behavior that operates on protocol types belongs in a dedicated entity/service layer, not on the protocol classes themselves.
-4. `contracts.py` (in `quant_data.defs`) contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors), not data.
+2. **Package layout**: three top-level packages under `src/`, split by who's allowed to depend on them (full rationale and history in `docs/ARCHITECTURE.md`'s Layout section):
+   - `src/quant_data/` — the **public** surface: `__init__.py` (lazily re-exports `MarketData`, `OHLCV`, `create_postgres_provider` — see the circular-import note below), `protocols.py` (`OHLCV`), `client/market_data.py` (`MarketData`, agnostic of the concrete backend — it only depends on `MarketDataProvider`), `client/postgres_provider.py` (`create_postgres_provider`, today's factory). Consumers (`quant-scratch`) should only ever write `from quant_data import MarketData, OHLCV, create_postgres_provider`.
+   - `src/quant_data_internal/` — **private** implementation: `contracts.py` (behavioral `Protocol`s: `MarketDataProvider`, `IntraDayProvider`) and `shared/` (cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`, `postgres.py`, `providers/`). Nothing here is exported by `quant_data`, and none of it should be imported directly by external consumers, even though Python doesn't stop you.
+   - `src/ingest/` — the write-side CLI. Console script only (`quant-ingest`), no importable surface at all.
+
+   Both `quant_data` and `quant_data_internal` need their own distribution-specific namespace for the same reason: **this deliberately does not mirror `quant-scratch`'s own flat top-level-package convention** (`defs`, `shared`, `day_chart`, ... with no common prefix) — that flat layout is fine for a repo that's never installed alongside anything else, but broke the moment `quant-data` was installed as a pip dependency *next to* `quant-scratch` in the same environment: both repos' top-level `defs`/`shared` packages shared the same import name, so whichever installed last silently shadowed the other's entirely (see croicu/quant-data#7, reproduced both installation orders). `ingest` has no known collision and no importable surface, so it doesn't need a prefix either way — it's a separate top-level package purely for the public/private folder split, not for collision safety.
+
+   Cross-package imports are absolute with the full package prefix (`from quant_data_internal.shared.diagnostics import ...`, `from quant_data.protocols import ...`); same-package imports stay relative (`from .errors import ...`). setuptools' src-layout automatic discovery picks up every top-level package under `src/` (`quant_data`, `quant_data_internal`, `ingest`) with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`.
+
+   **Circular-import gotcha**: `quant_data_internal.shared.postgres` needs `OHLCV` from `quant_data.protocols`, and `create_postgres_provider` needs `PostgresDatabase` from `quant_data_internal.shared.postgres` in turn — a two-way relationship between the two packages that used to be a real crash (see rule 8 below on keeping the dependency graph acyclic — this is the one case here where a `Protocol` alone couldn't fully remove the relationship, since `create_postgres_provider`'s whole job is bridging to the concrete `PostgresDatabase`). `quant_data/__init__.py` re-exports `MarketData`/`OHLCV`/`create_postgres_provider` lazily via a module-level `__getattr__` (PEP 562) specifically so `quant_data`'s own top-level import stays edge-free; don't change any of them back to a plain top-level import without re-testing `import quant_data_internal.shared.postgres` as the very first import in a fresh process (this reproduced the crash directly before the fix, back when `MarketData` still imported `PostgresDatabase` directly, before it depended on `MarketDataProvider` instead).
+3. `protocols.py` (in `quant_data`, the public package) contains persisted/shared data contracts — pure data only, no behavior. Behavior that operates on protocol types belongs in a dedicated entity/service layer, not on the protocol classes themselves.
+4. `contracts.py` (in `quant_data_internal`, the private package) contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors), not data.
 5. Unit tests (`tests/unit/`) must run offline. Integration tests (`tests/integration/`), if the project has them, may hit real external services — that's a deliberate scope split, not a loophole in rule 4. Note `pytest.ini`'s `testpaths = tests` runs both by default, so adding an integration suite means accepting network calls in the default `pytest` invocation unless you also gate it behind a marker.
 6. Prefer explicit, readable Python over clever abstractions.
 7. Prefer constructor/parameter injection over monkeypatching this project's own module internals in tests — e.g. a component that talks to the outside world (network, filesystem, clock, database) should take that dependency as an argument, defaulting to the real implementation, so tests can pass a fake object instead of patching a function inside the module under test. Monkeypatching is still the right tool for faking a *third-party* library's own internals (e.g. a DB driver class you don't own) — the distinction is whether the thing being faked is your code or someone else's.
+8. **The internal dependency graph must stay acyclic — break cycles with an abstract `Protocol`, not a runtime workaround.** If two concrete modules would otherwise need each other, introduce a `Protocol` in `quant_data_internal.contracts` (or `quant_data.protocols` if the public side needs to reference it) that one side depends on instead of the other's concrete type — see `MarketDataProvider`: `MarketData` depends on the protocol, not on `PostgresDatabase` concretely, which is exactly what keeps `quant_data.client.market_data` from ever needing anything from `quant_data_internal.shared.postgres` back. Check this mechanically, not by feel: list every module's static top-level `from quant_data...`/`from .` imports (`grep -E "^from (quant_data|\.)" -r src/`) and confirm no module is reachable from itself. As of the `quant_data`/`quant_data_internal` split, this holds: `quant_data.protocols` is a genuine leaf (zero outgoing edges), so nothing depending on it — directly or transitively — can cycle back through it. A lazy import (`__getattr__`, deferred `import` inside a function) can *mask* a cycle by moving it from import-time to call-time, which is what `quant_data/__init__.py` does for `MarketData`/`OHLCV`/`create_postgres_provider` — but treat that as a fallback for cases a `Protocol` genuinely can't reach (e.g. a package needing to re-export a name without owning the dependency direction), not as the default fix. Reach for the `Protocol` first.
 
 ## Logging
 
-- **Use `Logger`** (`from quant_data.shared.diagnostics import Logger`) — not bare `print()`.
+- **Use `Logger`** (`from quant_data_internal.shared.diagnostics import Logger`) — not bare `print()`.
 - **All features log success and errors** — no silent success, no swallowed errors.
 - **Message length by severity**:
   - **Success (info)** — short: feature started, feature ended.

@@ -4,8 +4,8 @@ import json
 from datetime import date, datetime
 from pathlib import Path
 
-from quant_data.defs.protocols import OHLCV
-from quant_data.shared.errors import AppError
+from quant_data.protocols import OHLCV
+from quant_data_internal.shared.errors import AppError
 
 DEFAULT_DATA_PATH = Path(__file__).parent.parent / "data" / "ohlcv_bars.json"
 

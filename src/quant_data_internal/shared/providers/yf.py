@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 import pandas
 import yfinance
 
-from quant_data.defs.protocols import OHLCV
+from quant_data.protocols import OHLCV
 
 from ..diagnostics import Logger
 from ..errors import AppError
