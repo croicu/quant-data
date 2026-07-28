@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from quant_data._internal.shared.providers.yf import YahooFinanceIntraDay
+from quant_data._internal.shared.providers.yfinance import YahooFinanceIntraDay
 from quant_data.protocols import OHLCV
 
 

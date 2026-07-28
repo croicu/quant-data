@@ -23,7 +23,8 @@ code from an actual bad ticker or fetch problem.
   Warnings (including expected misses like weekends/holidays) get logged but must not affect the
   overall success/exit code.
 - **Interim step already shipped**: Yahoo-Finance-sourced fetch failures are now tagged with a
-  dedicated `yf` log category (`quant_data._internal.shared.providers.yf.CATEGORY_YF`), separate
+  dedicated `yfinance` log category
+  (`quant_data._internal.shared.providers.yfinance.CATEGORY_YFINANCE`), separate
   from Postgres write failures (still `ingest`) — see `ingest/cli.py`'s `_ingest_one`. This makes
   the two failure sources at least filterable/attributable by source today via
   `settings.logCategories`/`excludedCategories`, without yet solving the actual

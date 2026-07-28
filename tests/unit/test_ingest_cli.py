@@ -8,7 +8,7 @@ import pytest
 
 from ingest import cli
 from tests.mocks.postgres import MockPostgresDatabase
-from tests.mocks.yf import MockIntraDayProvider
+from tests.mocks.yfinance import MockIntraDayProvider
 
 SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
 
@@ -30,6 +30,28 @@ def _custom_settings(tmp_path: Path, **overrides) -> Path:
     payload.update(overrides)
     settings_path.write_text(json.dumps({"settings": payload}), encoding="utf-8")
     return settings_path
+
+
+def test_main_logs_verbose_start_message_per_chunk(tmp_path, capsys):
+    # Regression guard: with only a start-of-run and an end-of-chunk log line, a long-running
+    # write (write_bars does several round trips per bar) looked indistinguishable from a hang --
+    # this per-chunk "starting" line at VERBOSE gives a heartbeat.
+    # debug=True is required here, not just logLevel="verbose" -- with logCategories left
+    # unset, debug=False resolves the category allow-list to ["general"] only (see
+    # CLAUDE.md's Logging section), which would silently filter out this "ingest"-category
+    # line regardless of level.
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], logLevel="verbose", debug=True)
+    database = MockPostgresDatabase()
+
+    cli.main(
+        ["--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=settings_path,
+        provider=MockIntraDayProvider(),
+        database_factory=_use_database(database),
+    )
+
+    captured = capsys.readouterr()
+    assert "[VERBOSE][ingest] quant-ingest: starting AAPL on 2026-01-02." in captured.out
 
 
 def test_main_fetches_and_writes_bars_and_returns_zero():

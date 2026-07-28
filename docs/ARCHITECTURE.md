@@ -20,7 +20,7 @@ Two top-level packages under `src/`:
     - `contracts.py` — behavioral `Protocol`s (`MarketDataProvider`, `IntraDayProvider`).
     - `shared/` — cross-app infra: `diagnostics.py` (`Logger`), `errors.py`
       (`AppError`/`TaskError`/`DateOutOfRangeError`), `settings.py` (`Settings`), `postgres.py`
-      (`PostgresDatabase`), `providers/` (external data-source clients, e.g. `yf.py`).
+      (`PostgresDatabase`), `providers/` (external data-source clients, e.g. `yfinance.py`).
 - `src/ingest/` — the ingest CLI. Console script: `quant-ingest`, no importable surface at all.
 
 **Public surface**: external consumers (`quant-scratch`) should only depend on the `quant_data`
@@ -115,7 +115,7 @@ independent top-level packages.
   embeds assumptions about *how* the host is reached (no SSH-tunnel logic, no hardcoded endpoint),
   so a future move to AWS/Azure/elsewhere is a settings + `docs/DATABASE.md` change only, never a
   code change here.
-- `providers/yf.py` — `YahooFinanceIntraDay`, an `IntraDayProvider` implementation wrapping
+- `providers/yfinance.py` — `YahooFinanceIntraDay`, an `IntraDayProvider` implementation wrapping
   `yfinance`. Ported from `quant-scratch`'s `shared/providers/yahoo_finance.py`, adapted to
   produce `OHLCV` (which carries its own `ticker`, unlike `quant-scratch`'s `DayBar`) and to set
   `incomplete=True` (with the value coerced to `0`/`0.0`) whenever `yfinance` returns `NaN` for
@@ -126,14 +126,30 @@ independent top-level packages.
   is the eventually-intended intraday source; `ingest` depends on `IntraDayProvider`, not on
   `YahooFinanceIntraDay` concretely, so swapping providers later doesn't touch `ingest/cli.py`'s
   logic.
+- `providers/yfinance_logging.py` — redirects `yfinance`'s own diagnostics (it logs through the
+  stdlib `logging` module, e.g. `logging.getLogger('yfinance')`, rather than raising or going
+  through our `Logger`) into `Logger` instead of letting them print straight to stderr.
+  `YFinanceLoggingAdapter.classify(message)` matches yfinance's message text against a small,
+  explicitly-extensible list of `YFinanceLogRule`s (regex pattern -> `TelemetryLevel`; only one
+  rule exists today, `"possibly delisted"` -> `INFO`) and falls back to `WARNING` for anything
+  unrecognized. `_YFinanceLogHandler` is a thin `logging.Handler` that forwards each
+  `logging.LogRecord`'s message to the adapter — the adapter itself takes its `log` function as a
+  constructor parameter (defaulting to `Logger.log`), so classification is unit-testable without
+  touching Python's global `logging` state at all. `install_log_capture()` (called once, at
+  `providers/yfinance.py` module import time) lowers `logging.getLogger('yfinance')`'s level so no
+  message is dropped before reaching the adapter, sets `propagate = False` so nothing double-
+  prints via the root logger's `lastResort` handler, and is idempotent (guards against attaching a
+  second handler if the module is imported more than once). All of this is additive — it doesn't
+  change `_ingest_one`'s own existing fetch/write failure logging (see the `ingest` section below);
+  see `tasks/ingest_error_classification.md` for whether the two should eventually be related.
 
 ### `ingest`
 
-`cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD]] [--ticker TICKER]`:
+`cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER]`:
 fetches bars over an inclusive date range via an injected `IntraDayProvider` (defaults to
 `YahooFinanceIntraDay`) and writes them via an injected `PostgresDatabase` factory (defaults to
 constructing one from `settings.postgres`). Both dependencies are constructor-injectable per this
-repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mocks/yf.py`,
+repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mocks/yfinance.py`,
 `tests/mocks/postgres.py`) instead of patching `ingest`'s own internals.
 
 - `--ticker` is optional — omit it to fetch every ticker in `settings.tickers` instead of one.
@@ -154,9 +170,14 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
   outside this public repo per that brainstorm's design lean (box-specific scheduling detail
   shouldn't leak into committed source).
 - One connection is opened for the whole run and reused across every (ticker, date) pair.
-- One (ticker, date) pair failing (bad ticker, no data for that day — e.g. a weekend) logs a
-  warning and continues rather than aborting the rest of the range/batch; the exit code is `1` if
-  anything failed, `0` if everything succeeded.
+- One (ticker, date) pair failing (bad ticker, no data for that day — e.g. a weekend) continues
+  rather than aborting the rest of the range/batch; the exit code is `1` if anything failed, `0`
+  if everything succeeded. `_ingest_one` logs the fetch step and the write step separately —
+  a `yfinance`-sourced fetch failure logs under category `yfinance`
+  (`quant_data._internal.shared.providers.yfinance.CATEGORY_YFINANCE`), a Postgres write failure
+  under `ingest` — so the two are attributable/filterable independently, even though both still
+  count the same toward the exit code today (see `tasks/ingest_error_classification.md` for the
+  postponed work on making that distinction affect the exit code itself).
 - No IBKR integration yet — swapping Yahoo Finance for IBKR as the real intraday source is
   unaddressed, to become its own task if/when `quant-scratch` actually needs it.
 

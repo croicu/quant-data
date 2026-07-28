@@ -12,7 +12,7 @@ from quant_data._internal.contracts import IntraDayProvider
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
-from quant_data._internal.shared.providers.yf import CATEGORY_YF, YahooFinanceIntraDay
+from quant_data._internal.shared.providers.yfinance import CATEGORY_YFINANCE, YahooFinanceIntraDay
 from quant_data._internal.shared.settings import PostgresSettings, Settings
 
 CATEGORY_INGEST = "ingest"
@@ -112,12 +112,17 @@ def _ingest_one(provider: IntraDayProvider, database: PostgresDatabase, ticker: 
     # same AppError type, so a single shared catch couldn't tell a Yahoo Finance fetch problem
     # (e.g. a weekend, or a bad ticker -- indistinguishable from each other today) apart from a
     # Postgres write problem (e.g. a date outside the populated dim_date range).
+    Logger.diagnostic(
+        f"quant-ingest: starting {ticker.upper()} on {target_date.isoformat()}.",
+        category=CATEGORY_INGEST,
+    )
+
     try:
         bars = provider.fetch_bars(ticker, target_date)
     except AppError as error:
         Logger.warning(
             f"quant-ingest: failed to fetch '{ticker.upper()}' on {target_date.isoformat()}: {error}",
-            category=CATEGORY_YF,
+            category=CATEGORY_YFINANCE,
         )
         return None
 

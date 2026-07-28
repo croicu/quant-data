@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 from typing import ClassVar
 
-from .diagnostics import CATEGORY_GENERAL, TelemetryLevel
+from .diagnostics import CATEGORY_GENERAL, LEVEL_RANK, TelemetryLevel
 from .errors import TaskError
 
 _SETTINGS_PATH = Path("./settings.json")
@@ -47,6 +47,7 @@ class Settings:
         log_level = TelemetryLevel.ERROR
         log_categories: list[str] = []
         excluded_categories: list[str] = []
+        expand_categories = False
 
         settings_payload: dict = {}
 
@@ -78,6 +79,17 @@ class Settings:
                     valid_levels.append(level.value)
                 raise TaskError(f"'settings.logLevel' in settings.json must be one of: {', '.join(valid_levels)}")
 
+            if "logLevel" in settings_payload:
+                # An explicit logLevel is more specific than the blanket debug flag, so it wins
+                # outright whenever the two would otherwise disagree about how much to show:
+                # setting a permissive level (e.g. "verbose") shouldn't be silently muted by
+                # debug's own separate category default, and setting a restrictive level (e.g.
+                # "critical") shouldn't be forced open just because debug=true. debug only falls
+                # back into play here when logLevel was left at its implicit default.
+                expand_categories = LEVEL_RANK[log_level] < LEVEL_RANK[TelemetryLevel.ERROR]
+            else:
+                expand_categories = debug
+
             log_categories_payload = settings_payload.get("logCategories", [])
             if not isinstance(log_categories_payload, list):
                 raise TaskError("'settings.logCategories' in settings.json must be an array of strings.")
@@ -85,10 +97,11 @@ class Settings:
             for category_name in log_categories_payload:
                 log_categories.append(str(category_name))
 
-            if log_categories and debug and CATEGORY_GENERAL not in log_categories:
-                # debug=true always keeps CATEGORY_GENERAL alongside an explicit narrower list —
-                # debug mode's baseline info should stay visible even while zoomed into one
-                # category, not be silently dropped by naming a single other category.
+            if log_categories and expand_categories and CATEGORY_GENERAL not in log_categories:
+                # Expanded-logging intent (see expand_categories above) always keeps
+                # CATEGORY_GENERAL alongside an explicit narrower list — its baseline info should
+                # stay visible even while zoomed into one category, not be silently dropped by
+                # naming a single other category.
                 log_categories = [CATEGORY_GENERAL] + log_categories
 
             excluded_categories_payload = settings_payload.get("excludedCategories", [])
@@ -99,9 +112,11 @@ class Settings:
                 excluded_categories.append(str(category_name))
 
         if not log_categories:
-            # No explicit override: debug=false restricts console noise to CATEGORY_GENERAL;
-            # debug=true shows everything, same as an empty filter always has.
-            log_categories = [] if debug else [CATEGORY_GENERAL]
+            # No explicit override: restricts console noise to CATEGORY_GENERAL unless expanded
+            # logging was signaled (via an explicit permissive logLevel, or debug=true when
+            # logLevel was left at its default — see expand_categories above), in which case
+            # everything shows, same as an empty filter always has.
+            log_categories = [] if expand_categories else [CATEGORY_GENERAL]
 
         postgres_settings: PostgresSettings | None = None
         postgres_payload = settings_payload.get("postgres")

@@ -9,8 +9,9 @@ from quant_data.protocols import OHLCV
 
 from ..diagnostics import Logger
 from ..errors import AppError
+from .yfinance_logging import CATEGORY_YFINANCE, install_log_capture
 
-CATEGORY_YF = "yf"
+install_log_capture()
 
 
 def _safe_float(value: float) -> tuple[float, bool]:
@@ -70,6 +71,6 @@ class YahooFinanceIntraDay:
 
         Logger.info(
             f"quant-ingest: fetched {len(bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()}.",
-            category=CATEGORY_YF,
+            category=CATEGORY_YFINANCE,
         )
         return bars

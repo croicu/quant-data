@@ -79,7 +79,7 @@ class DiagnosticsLogSink:
         self.log(TelemetryLevel.CRITICAL, message, category)
 
 
-_LEVEL_RANK: dict[TelemetryLevel, int] = {
+LEVEL_RANK: dict[TelemetryLevel, int] = {
     TelemetryLevel.VERBOSE: 0,
     TelemetryLevel.INFO: 1,
     TelemetryLevel.WARNING: 2,
@@ -104,7 +104,7 @@ class ConsoleLogSink(DiagnosticsLogSink):
 
     def log(self, level: TelemetryLevel, message: str, category: str = CATEGORY_GENERAL) -> TelemetryRecord:
         record = super().log(level, message, category)
-        level_passes = _LEVEL_RANK[level] >= _LEVEL_RANK[self._min_level]
+        level_passes = LEVEL_RANK[level] >= LEVEL_RANK[self._min_level]
         if self._categories:
             # Explicit (or debug-widened) allow-list: excluded_categories is inert here — a
             # category named in both would just be a no-op omission the user could've made

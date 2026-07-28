@@ -86,6 +86,75 @@ def test_load_raises_on_non_positive_catch_up_lookback_days(tmp_path):
         Settings.load(path=settings_path)
 
 
+def test_load_default_debug_false_no_log_level_restricts_to_general(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.log_categories == ["general"]
+
+
+def test_load_default_debug_true_no_log_level_is_unfiltered(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": True})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.log_categories == []
+
+
+def test_load_explicit_verbose_log_level_unfilters_categories_even_with_debug_false(tmp_path):
+    # Regression guard: an explicit permissive logLevel is more specific than the blanket debug
+    # flag and must win outright -- setting logLevel="verbose" alone (without also flipping
+    # debug=true) must not be silently muted by debug's own separate category default.
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False, "logLevel": "verbose"})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.log_categories == []
+
+
+def test_load_explicit_critical_log_level_restricts_categories_even_with_debug_true(tmp_path):
+    # The same precedence in the other direction: an explicit restrictive logLevel wins even
+    # when debug=true would otherwise have unfiltered everything.
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": True, "logLevel": "critical"})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.log_categories == ["general"]
+
+
+def test_load_explicit_error_log_level_restricts_categories_same_as_default(tmp_path):
+    # An explicit logLevel matching the implicit default ("error") behaves the same as today's
+    # default, even though it's technically "explicit".
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False, "logLevel": "error"})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.log_categories == ["general"]
+
+
+def test_load_explicit_log_categories_always_wins_regardless_of_log_level(tmp_path):
+    settings_path = _write_settings(
+        tmp_path / "settings.json",
+        {"debug": False, "logLevel": "critical", "logCategories": ["ingest"]},
+    )
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.log_categories == ["ingest"]
+
+
+def test_load_verbose_log_level_widens_explicit_narrow_categories_to_include_general(tmp_path):
+    settings_path = _write_settings(
+        tmp_path / "settings.json",
+        {"debug": False, "logLevel": "verbose", "logCategories": ["ingest"]},
+    )
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.log_categories == ["general", "ingest"]
+
+
 def test_load_local_path_is_scoped_to_given_path_directory(tmp_path):
     # Regression guard: local_path used to default relative to the process's cwd regardless of
     # which `path` was passed, so loading a fixture elsewhere could silently pick up whatever

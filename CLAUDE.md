@@ -232,10 +232,11 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   - **Recoverable issues (warning)** — medium: enough context to understand what went wrong and why it was non-fatal.
   - **Errors (error/fatal)** — detailed: full context needed to reproduce and diagnose.
 - **Level guide**:
+  - `Logger.diagnostic` (`VERBOSE`) — one message per chunk of work, so a run's progress is visible and a hang is distinguishable from silence (e.g. `quant-ingest`'s `_ingest_one` logs one `VERBOSE` line per (ticker, date) pair it starts)
   - `Logger.info` — normal notable events (start, end, success, counts)
   - `Logger.warning` — recoverable problems (retries, skipped items)
   - `Logger.error` / `Logger.fatal` — unrecoverable failures
-- **Categories** — every `Logger` method takes an optional `category: str = "general"`, filterable via `settings.json`'s `logCategories` (an open string, not a closed enum — `diagnostics.py` only defines `CATEGORY_GENERAL` as a starting constant). Console output is `[LEVEL][category] message`. **Effective default depends on `debug`**: if `settings.json`'s `logCategories` is left empty/absent, `debug: false` resolves it to `["general"]` (only `general` shown), `debug: true` resolves it to `[]` (unfiltered, show everything); an explicit non-empty `logCategories` always overrides this regardless of `debug`. **`excludedCategories`** is a complementary deny-list, only in effect when the resolved `logCategories` is `[]` (the true unfiltered `debug: true` state) — inert against an explicit non-empty `logCategories` or the plain `debug: false` default.
+- **Categories** — every `Logger` method takes an optional `category: str = "general"`, filterable via `settings.json`'s `logCategories` (an open string, not a closed enum — `diagnostics.py` only defines `CATEGORY_GENERAL` as a starting constant). Console output is `[LEVEL][category] message`. **Effective default depends on whether `logLevel` is explicit** (see "Specific settings override generic ones on scope overlap" under Coding Style — this is that rule's origin case): if `settings.json`'s `logCategories` is left empty/absent, an explicit `logLevel` decides it outright — permissive (`verbose`/`info`/`warning`) resolves to `[]` (unfiltered), restrictive (`error`/`critical`) resolves to `["general"]` — regardless of `debug`. Only when `logLevel` is left at its implicit default does `debug` get consulted as the fallback (`debug: false` -> `["general"]`, `debug: true` -> `[]`), exactly as before. An explicit non-empty `logCategories` always overrides all of this outright. **`excludedCategories`** is a complementary deny-list, only in effect when the resolved `logCategories` is `[]` (the true unfiltered state) — inert against an explicit non-empty `logCategories` or the restrictive `["general"]` default.
 
 ## Coding Style
 
@@ -246,6 +247,7 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Import count as SRP signal** — more than 5–10 imports in a file is a hint that the file may be doing too much. Not a hard rule, but worth pausing to consider whether responsibilities should be split.
 - **Don't build a DI factory/composition-root prematurely** — the same wait-for-evidence judgment as the import-count signal applies to DI wiring. A function picking up its second or third injectable parameter (e.g. `main(argv, provider=None, settings_path=None)`) is not yet a smell; extracting a shared factory/helper from a single data point risks guessing at the wrong abstraction shape. Wait for real duplication — a second call site needing the same wiring, or a parameter list that's genuinely grown unwieldy — before extracting one.
 - **Ticker normalization**: always store and compare tickers uppercased (matching `quant-scratch`'s convention). The schema enforces this with a `CHECK` constraint on `dim_ticker.ticker` — Python code should still uppercase at the boundary rather than relying on the database to catch it.
+- **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
 - **File**: [Scheduled jobs](tasks/scheduled_jobs.md)
@@ -262,7 +264,7 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Key Context**: `quant-ingest`'s exit code can't currently distinguish an expected miss
   (weekend/holiday, surfaced by a real `--catch-up` run) from a genuine problem (bad ticker,
   fetch/write failure), which blocks eventually wiring it up to alerting. Interim step already
-  shipped: Yahoo-Finance-sourced fetch failures are tagged with their own `yf` log category,
+  shipped: Yahoo-Finance-sourced fetch failures are tagged with their own `yfinance` log category,
   separate from Postgres write failures — but the exit code itself is deliberately unchanged
   until the expected-vs-unexpected design converges.
 
