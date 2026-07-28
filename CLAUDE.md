@@ -18,9 +18,12 @@ The star schema, migrations, and docs shipped first; a Python read client
 `quant_data._internal.shared.postgres.PostgresDatabase`)
 and a `quant-ingest` CLI (pulling from Yahoo Finance) followed, along with the `quant_writer`/
 `quant_reader` DB roles enforcing single-writer/many-reader at the privilege level — see
-`docs/ARCHITECTURE.md`. Swapping in IBKR as the real intraday source and recurring/unattended
-scheduling remain open; they'll become their own tasks if/when `quant-scratch` actually needs
-them.
+`docs/ARCHITECTURE.md`. `quant-ingest --catch-up` covers the narrowest slice of recurring
+ingest (re-fetching a trailing window so a partial day gets caught up), but actually triggering it
+on a schedule (cron/systemd) is still a manual, box-specific setup step outside this repo, and the
+broader scheduled-jobs mechanism (issue #3) remains postponed. Swapping in IBKR as the real
+intraday source remains open too; both become their own tasks if/when `quant-scratch` actually
+needs them.
 
 ## Template Sync
 
@@ -312,3 +315,45 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   GitHub issue. PostgreSQL 16 installed (data directory on the `storage` zpool), `quant_data`
   role/database created, `001_init_schema` applied, `dim_time`/`dim_date` populated
   (2000-01-01–2030-12-31).
+- **Fix `fact_market_data_1min.timestamp` corruption from an unpinned session TimeZone** — closed
+  issue #9 (raised by `quant-scratch`, see `docs/SCHEMA.md`'s `timestamp` row). Root cause:
+  `PostgresDatabase` bound tz-aware UTC `datetime`s without pinning the connection's session
+  `TimeZone`, so Postgres implicitly cast them `timestamptz -> timestamp` using the session's
+  local zone (`America/Los_Angeles` on CroicuWS1), silently shifting every stored raw `timestamp`
+  by that offset — 100% of rows across every ticker/date ingested to date, confirmed against the
+  real database, not just the handful of anomalous-volume bars that surfaced it. Fixed by passing
+  `options="-c TimeZone=UTC"` on connect; verified against a live `--catch-up`-style ingest
+  (0/4,264 new rows mismatched). All 13,212 pre-existing historical rows backfilled from their
+  independently-correct `dim_date`/`dim_time` keys and re-verified — 0/13,212 mismatched.
+  Announced fixed to `quant-scratch` via
+  [croicu/quant-scratch#9](https://github.com/croicu/quant-scratch/issues/9).
+- **`quant-ingest --catch-up`** — closed issue #12. Re-fetches the trailing
+  `settings.catchUpLookbackDays` days (default 7, excluding today) for every `settings.tickers`
+  watchlist entry, relying on `write_bars`'s upsert to make re-ingesting an already-complete day a
+  no-op — no gap-*detection* heuristic, since a session-close cutoff would bake US-equities
+  market-hours assumptions into a schema that deliberately has no session concept. First concrete
+  job out of the postponed scheduled-jobs brainstorm (issue #3) — deliberately the narrowest
+  slice: no jobs table, no in-DB scheduling mechanism, just a CLI flag. Verified against a real
+  multi-day, multi-ticker CroicuWS1 run (25,378 total rows, zero timestamp mismatches, weekend
+  dates correctly absent).
+- **Rename `yf` → `yfinance`; capture yfinance's own console noise; verbose per-chunk heartbeat**
+  — closed issue #14. `providers/yf.py` → `providers/yfinance.py`, `CATEGORY_YF`/`"yf"` →
+  `CATEGORY_YFINANCE`/`"yfinance"` throughout, to match the actual library's name. New
+  `YFinanceLoggingAdapter` (`providers/yfinance_logging.py`) redirects yfinance's own
+  `logging.getLogger('yfinance')` output (previously printing straight to stderr, e.g.
+  `"possibly delisted"`, unfiltered and inconsistent with the rest of `quant-ingest`'s logging)
+  into `Logger`, classified by regex pattern with a `WARNING` default for anything unrecognized —
+  deliberately extensible, since only one yfinance message has actually been observed so far.
+  Separately, `_ingest_one` now logs one `VERBOSE` "starting TICKER on DATE" line per (ticker,
+  date) chunk, so a long `write_bars` run (many round trips per bar) is distinguishable from a
+  hang. Follow-up opened for remaining yfinance noise beyond this one logger name: issue #15
+  (brainstorm, not yet investigated).
+- **Settings: explicit `logLevel` overrides `debug` for the log-category default** — closed issue
+  #16. `Settings.load` used to resolve the console log-category default from `debug` alone,
+  completely independent of `logLevel` — so setting `logLevel: "verbose"` without also flipping
+  `debug: true` did nothing, silently muted. Now an explicit `logLevel` wins outright over `debug`
+  in either direction whenever they'd disagree; `debug` only applies as a fallback when `logLevel`
+  was left at its implicit default. New general convention recorded under Coding Style: "Specific
+  settings override generic ones on scope overlap." Backported into
+  [croicu/tpl-py](https://github.com/croicu/tpl-py) (the template this repo was generated from)
+  via its addendum protocol, since the same bug exists in every repo generated from that template.
