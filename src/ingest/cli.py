@@ -12,7 +12,7 @@ from quant_data._internal.contracts import IntraDayProvider
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
-from quant_data._internal.shared.providers.yf import YahooFinanceIntraDay
+from quant_data._internal.shared.providers.yf import CATEGORY_YF, YahooFinanceIntraDay
 from quant_data._internal.shared.settings import PostgresSettings, Settings
 
 CATEGORY_INGEST = "ingest"
@@ -106,9 +106,29 @@ def _default_database_factory(postgres_settings: PostgresSettings) -> PostgresDa
     )
 
 
-def _ingest_one(provider: IntraDayProvider, database: PostgresDatabase, ticker: str, target_date: date_type) -> int:
-    bars = provider.fetch_bars(ticker, target_date)
-    written = database.write_bars(bars)
+def _ingest_one(provider: IntraDayProvider, database: PostgresDatabase, ticker: str, target_date: date_type) -> int | None:
+    # Fetch and write failures are logged separately (rather than one catch-all at the call
+    # site) so the log category actually reflects where the failure came from -- both raise the
+    # same AppError type, so a single shared catch couldn't tell a Yahoo Finance fetch problem
+    # (e.g. a weekend, or a bad ticker -- indistinguishable from each other today) apart from a
+    # Postgres write problem (e.g. a date outside the populated dim_date range).
+    try:
+        bars = provider.fetch_bars(ticker, target_date)
+    except AppError as error:
+        Logger.warning(
+            f"quant-ingest: failed to fetch '{ticker.upper()}' on {target_date.isoformat()}: {error}",
+            category=CATEGORY_YF,
+        )
+        return None
+
+    try:
+        written = database.write_bars(bars)
+    except AppError as error:
+        Logger.warning(
+            f"quant-ingest: failed to write '{ticker.upper()}' on {target_date.isoformat()}: {error}",
+            category=CATEGORY_INGEST,
+        )
+        return None
 
     incomplete_count = 0
     for bar in bars:
@@ -187,15 +207,11 @@ def main(
         try:
             for target_date in target_dates:
                 for ticker in tickers:
-                    try:
-                        _ingest_one(active_provider, database, ticker, target_date)
-                        succeeded.append((ticker, target_date))
-                    except AppError as error:
-                        Logger.warning(
-                            f"quant-ingest: failed to ingest '{ticker.upper()}' on {target_date.isoformat()}: {error}",
-                            category=CATEGORY_INGEST,
-                        )
+                    written = _ingest_one(active_provider, database, ticker, target_date)
+                    if written is None:
                         failed.append((ticker, target_date))
+                    else:
+                        succeeded.append((ticker, target_date))
         finally:
             database.close()
 

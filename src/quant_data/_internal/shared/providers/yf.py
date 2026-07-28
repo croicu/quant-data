@@ -10,7 +10,7 @@ from quant_data.protocols import OHLCV
 from ..diagnostics import Logger
 from ..errors import AppError
 
-CATEGORY_INTRADAY_FETCH = "intraday_fetch"
+CATEGORY_YF = "yf"
 
 
 def _safe_float(value: float) -> tuple[float, bool]:
@@ -70,6 +70,6 @@ class YahooFinanceIntraDay:
 
         Logger.info(
             f"quant-ingest: fetched {len(bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()}.",
-            category=CATEGORY_INTRADAY_FETCH,
+            category=CATEGORY_YF,
         )
         return bars

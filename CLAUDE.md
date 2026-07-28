@@ -153,6 +153,11 @@ ruff check src/ tests/
 pytest
 ```
 
+Then stop and let the user review the diff themselves (e.g. in VS Code's source control view) —
+don't run `git commit` until they've explicitly confirmed, even if the change is already
+implemented, tested, and the underlying issue looks done. Reviewing in git log after the fact
+doesn't substitute for this.
+
 ## Documentation rule
 
 After any change that affects the public interface, CLI, database schema, or file formats, update
@@ -252,7 +257,14 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 
 ## Pending Tasks
 
-_(none — see New Task above for the postponed scheduled-jobs brainstorm)_
+- **File**: [Ingest error classification](tasks/ingest_error_classification.md)
+- **Status**: Brainstorm, postponed (see issue #13) — deprioritized, not actively worked
+- **Key Context**: `quant-ingest`'s exit code can't currently distinguish an expected miss
+  (weekend/holiday, surfaced by a real `--catch-up` run) from a genuine problem (bad ticker,
+  fetch/write failure), which blocks eventually wiring it up to alerting. Interim step already
+  shipped: Yahoo-Finance-sourced fetch failures are tagged with their own `yf` log category,
+  separate from Postgres write failures — but the exit code itself is deliberately unchanged
+  until the expected-vs-unexpected design converges.
 
 ## Completed Tasks
 - **Nest all packages under `quant_data.*`** — fix done for issue #7 (bug), reopened pending

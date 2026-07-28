@@ -2,11 +2,20 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: Run (CLI)",
+      "name": "Python: Run (ingest)",
       "type": "debugpy",
       "request": "launch",
       "module": "ingest.cli",
       "args": [],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Run (catch-up)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ingest.cli",
+      "args": ["--catch-up"],
       "console": "integratedTerminal",
       "justMyCode": true
     },
