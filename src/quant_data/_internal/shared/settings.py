@@ -20,6 +20,8 @@ class PostgresSettings:
     user: str
     password: str
     dbname: str
+    ssh_user: str | None = None
+    ssh_key_path: str | None = None
 
 
 @dataclass
@@ -130,12 +132,20 @@ class Settings:
                     missing_keys.append(key)
             if missing_keys:
                 raise TaskError(f"'settings.postgres' is missing required key(s): {', '.join(missing_keys)}")
+
+            ssh_user_payload = postgres_payload.get("sshUser")
+            ssh_key_path_payload = postgres_payload.get("sshKeyPath")
+            if (ssh_user_payload is None) != (ssh_key_path_payload is None):
+                raise TaskError("'settings.postgres.sshUser' and 'settings.postgres.sshKeyPath' must be set together (or both omitted).")
+
             postgres_settings = PostgresSettings(
                 host=str(postgres_payload["host"]),
                 port=int(postgres_payload["port"]),
                 user=str(postgres_payload["user"]),
                 password=str(postgres_payload["password"]),
                 dbname=str(postgres_payload["dbname"]),
+                ssh_user=str(ssh_user_payload) if ssh_user_payload is not None else None,
+                ssh_key_path=str(ssh_key_path_payload) if ssh_key_path_payload is not None else None,
             )
 
         tickers_payload = settings_payload.get("tickers", [])

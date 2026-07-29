@@ -31,3 +31,17 @@ class IntraDayProvider(Protocol):
         Raises AppError if the ticker is invalid, the network call fails, or no bars are
         available for that date."""
         ...
+
+
+class ConnectionTransport(Protocol):
+    def open(self) -> tuple[str, int]:
+        """Establish whatever's needed to reach Postgres (e.g. an SSH tunnel), returning the
+        (host, port) that psycopg should connect to. Hosting-specific — see
+        quant_data._internal.shared.transports for the concrete implementations (direct connect
+        vs. SSH tunnel), which is what keeps PostgresDatabase itself agnostic of the concrete
+        hosting/transport choice."""
+        ...
+
+    def close(self) -> None:
+        """Release any resources (e.g. a tunnel process) opened by open()."""
+        ...

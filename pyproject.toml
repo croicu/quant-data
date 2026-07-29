@@ -12,6 +12,7 @@ requires-python = ">=3.12"
 dependencies = [
     "psycopg[binary]>=3.1",
     "yfinance>=0.2.28",
+    "sshtunnel>=0.4",
 ]
 
 [project.scripts]

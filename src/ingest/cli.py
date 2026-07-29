@@ -14,6 +14,7 @@ from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
 from quant_data._internal.shared.providers.yfinance import CATEGORY_YFINANCE, YahooFinanceIntraDay
 from quant_data._internal.shared.settings import PostgresSettings, Settings
+from quant_data._internal.shared.transports import resolve_transport
 
 CATEGORY_INGEST = "ingest"
 
@@ -97,9 +98,14 @@ def _date_range(start_date: date_type, end_date: date_type) -> list[date_type]:
 
 
 def _default_database_factory(postgres_settings: PostgresSettings) -> PostgresDatabase:
-    return PostgresDatabase(
+    transport = resolve_transport(
         host=postgres_settings.host,
         port=postgres_settings.port,
+        ssh_user=postgres_settings.ssh_user,
+        ssh_key_path=postgres_settings.ssh_key_path,
+    )
+    return PostgresDatabase(
+        transport=transport,
         user=postgres_settings.user,
         password=postgres_settings.password,
         dbname=postgres_settings.dbname,

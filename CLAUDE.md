@@ -253,14 +253,26 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
+- **File**: [Auto-manage the SSH tunnel](tasks/auto_manage_ssh_tunnel.md) (now just a pointer —
+  issue #17 is the source of truth)
+- **Status**: Implementation done, pending your review of the diff before commit (see issue #17)
+- **Key Context**: `psycopg`/libpq has no SSH transport of its own, so on-prem hosting structurally
+  needs a tunnel — but that's specific to *today's* Ubuntu-box hosting choice, not an architectural
+  requirement (a cloud-hosted Postgres needs no tunnel at all). Shipped a new `ConnectionTransport`
+  protocol (`quant_data._internal.contracts`) with `DirectTransport` and `SshTunnelTransport`
+  (`sshtunnel`-backed) implementations under a new `shared/transports/` package, keeping
+  `PostgresDatabase` itself transport-agnostic — same pattern as `MarketDataProvider`. Additive to
+  `PostgresSettings`/`create_postgres_provider` (optional `ssh_user`/`ssh_key_path`), not breaking.
+  `ruff` + `pytest` (70 passed) both clean; not yet committed.
+
+## Pending Tasks
+
 - **File**: [Scheduled jobs](tasks/scheduled_jobs.md)
 - **Status**: Brainstorm, postponed (see issue #3) — deprioritized, not actively worked
 - **Key Context**: How recurring background/maintenance work (DB maintenance now, ingest scheduling
   later) gets tracked without baking `CroicuWS1`-specific detail into this public repo — leaning
   toward a `jobs` table living in the database itself (data, not committed code), still in
   investigation.
-
-## Pending Tasks
 
 - **File**: [Ingest error classification](tasks/ingest_error_classification.md)
 - **Status**: Brainstorm, postponed (see issue #13) — deprioritized, not actively worked

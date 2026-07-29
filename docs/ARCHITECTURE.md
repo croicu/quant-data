@@ -17,10 +17,13 @@ Two top-level packages under `src/`:
   - `_internal/` — **private** implementation detail, nested so its privacy is a folder-level
     fact, not just an `__init__.py` allow-list. Nothing here is exported by `quant_data`, and none
     of it should be imported directly by external consumers, even though Python doesn't stop you.
-    - `contracts.py` — behavioral `Protocol`s (`MarketDataProvider`, `IntraDayProvider`).
+    - `contracts.py` — behavioral `Protocol`s (`MarketDataProvider`, `IntraDayProvider`,
+      `ConnectionTransport`).
     - `shared/` — cross-app infra: `diagnostics.py` (`Logger`), `errors.py`
       (`AppError`/`TaskError`/`DateOutOfRangeError`), `settings.py` (`Settings`), `postgres.py`
-      (`PostgresDatabase`), `providers/` (external data-source clients, e.g. `yfinance.py`).
+      (`PostgresDatabase`), `providers/` (external data-source clients, e.g. `yfinance.py`),
+      `transports/` (`ConnectionTransport` implementations, e.g. `DirectTransport`,
+      `SshTunnelTransport`).
 - `src/ingest/` — the ingest CLI. Console script: `quant-ingest`, no importable surface at all.
 
 **Public surface**: external consumers (`quant-scratch`) should only depend on the `quant_data`
@@ -91,14 +94,24 @@ independent top-level packages.
 - `IntraDayProvider(Protocol)`: `fetch_bars(ticker, target_date) -> list[OHLCV]` for a single
   session day. The ingest-side contract for external data sources — `ingest` depends on this
   abstraction, not concretely on whichever provider is plugged in.
+- `ConnectionTransport(Protocol)`: `open() -> tuple[str, int]` (establish whatever's needed to
+  reach Postgres, returning the `(host, port)` to connect to) plus `close() -> None`. Introduced so
+  `PostgresDatabase` never needs to know *how* Postgres is actually reached (direct TCP vs. an SSH
+  tunnel) — see `postgres.py`/`transports/` below. `create_postgres_provider` and `ingest/cli.py`'s
+  database factory both build a concrete transport and hand it to `PostgresDatabase`, rather than
+  `PostgresDatabase` depending on either concrete transport itself.
 
 ### `quant_data._internal.shared`
 
 - `diagnostics.py`/`errors.py`/`settings.py` — standard `tpl-py` infra, unchanged in behavior from
   earlier layouts this was carried over from.
 - `settings.py` additionally defines `PostgresSettings` (`host`, `port`, `user`, `password`,
-  `dbname`) and a `Settings.postgres` field, parsed from a `postgres` object under `settings.json`/
-  `settings.local.json`'s `settings` key. The password belongs only in `settings.local.json`
+  `dbname`, plus optional `ssh_user`/`ssh_key_path` — parsed from `sshUser`/`sshKeyPath`, must be
+  set together or both omitted) and a `Settings.postgres` field, parsed from a `postgres` object
+  under `settings.json`/`settings.local.json`'s `settings` key. `ssh_user`/`ssh_key_path` select an
+  `SshTunnelTransport` (see below) instead of the default `DirectTransport` — omitting them
+  reproduces the exact behavior from before `ConnectionTransport` existed, so this is additive, not
+  breaking, for any existing `settings.json`. The password belongs only in `settings.local.json`
   (gitignored). A `Settings.tickers` field (a plain array of strings, uppercased on load) is
   parsed the same way — a personal watchlist default for `quant-ingest`'s batch mode, so it also
   belongs in `settings.local.json` rather than the committed `settings.json`. `Settings.load(path,
@@ -111,10 +124,32 @@ independent top-level packages.
   see "Contracts" below on why that's ergonomics, not the actual security boundary). Single
   connection per invocation (no pooling); wraps `psycopg` errors as `AppError`, or
   `DateOutOfRangeError` (a specific `AppError` subclass) when a bar's date falls outside the
-  populated `dim_date` range. Takes connection details purely as constructor parameters — never
-  embeds assumptions about *how* the host is reached (no SSH-tunnel logic, no hardcoded endpoint),
-  so a future move to AWS/Azure/elsewhere is a settings + `docs/DATABASE.md` change only, never a
-  code change here.
+  populated `dim_date` range. Takes a `ConnectionTransport` (see `contracts.py` above) instead of
+  `host`/`port` directly — it calls `transport.open()` for the effective host/port to connect
+  `psycopg` to, and `close()` tears down the connection then the transport. This is what keeps it
+  free of any assumption about *how* the host is reached (no SSH-tunnel logic, no hardcoded
+  endpoint) — a future move to AWS/Azure/elsewhere, or dropping the SSH tunnel entirely, is a
+  settings + `docs/DATABASE.md` change only, never a code change here. Logs an `info`-level
+  message before attempting the connection and another once it succeeds, under category
+  `postgres` (`CATEGORY_POSTGRES`) — so a hang during connect (e.g. a stalled SSH handshake) is
+  distinguishable from one during query execution.
+- `transports/` — `ConnectionTransport` implementations, resolved via
+  `transports.resolve_transport(host, port, ssh_user, ssh_key_path)` (picks `SshTunnelTransport`
+  when both are set, else `DirectTransport`) — used by both `create_postgres_provider` and
+  `ingest/cli.py`'s database factory, the two real call sites needing this wiring.
+  - `direct.py` — `DirectTransport(host, port)`: `open()` returns `(host, port)` unchanged,
+    `close()` is a no-op. What a cloud-hosted Postgres (or an already-running manual tunnel) uses —
+    behaviorally identical to what `PostgresDatabase` did before `ConnectionTransport` existed.
+  - `ssh_tunnel.py` — `SshTunnelTransport(host, port, ssh_user, ssh_key_path)`: opens an
+    `sshtunnel.SSHTunnelForwarder` on `open()` (an OS-assigned local port, not a fixed one) and
+    returns `("localhost", tunnel.local_bind_port)`; `close()` stops it. Key-based auth only, no
+    passphrase/agent support. One tunnel per `PostgresDatabase` instance, matching its existing
+    single-connection-per-invocation lifecycle. Tunnel-start failures (bad host, bad key, auth,
+    network) wrap into `AppError`, mirroring the existing psycopg-error wrapping. What CroicuWS1's
+    on-prem hosting uses today — this is what replaced the old requirement of a human-run
+    `ssh -N -L ...`/systemd unit before the Python client could connect at all (see
+    `docs/DATABASE.md`; direct `psql` access still needs that manual tunnel, since `psql` never
+    goes through this transport abstraction).
 - `providers/yfinance.py` — `YahooFinanceIntraDay`, an `IntraDayProvider` implementation wrapping
   `yfinance`. Ported from `quant-scratch`'s `shared/providers/yahoo_finance.py`, adapted to
   produce `OHLCV` (which carries its own `ticker`, unlike `quant-scratch`'s `DayBar`) and to set
@@ -192,10 +227,14 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
   not this class's shape, but a narrower surface is still better ergonomics regardless of backend.
   Re-exported at `quant_data` top level (`from quant_data import MarketData`).
 - `postgres_provider.py` — `create_postgres_provider(host, port, dbname, user="quant_reader",
-  password="")`: today's factory, builds a `PostgresDatabase` (connecting as `quant_reader` by
-  default) and returns it as a `MarketDataProvider`. Also re-exported at `quant_data` top level.
-  A future backend (e.g. a cloud store) gets its own sibling factory here rather than a change to
-  `MarketData` or to this one function's signature.
+  password="", ssh_user=None, ssh_key_path=None)`: today's factory, resolves a
+  `ConnectionTransport` from the `ssh_user`/`ssh_key_path` kwargs (`transports.resolve_transport`)
+  and builds a `PostgresDatabase` (connecting as `quant_reader` by default) with it, returned as a
+  `MarketDataProvider`. Also re-exported at `quant_data` top level. Omitting `ssh_user`/
+  `ssh_key_path` reproduces the exact pre-`ConnectionTransport` behavior (a direct connect to
+  `host:port`), so this is additive to the function's signature, not breaking. A future backend
+  (e.g. a cloud store) gets its own sibling factory here rather than a change to `MarketData` or to
+  this one function's signature.
 
 ## Data flow
 

@@ -155,6 +155,47 @@ def test_load_verbose_log_level_widens_explicit_narrow_categories_to_include_gen
     assert settings.log_categories == ["general", "ingest"]
 
 
+def _postgres_payload(**overrides) -> dict:
+    payload = {"host": "localhost", "port": 5433, "user": "quant_reader", "password": "", "dbname": "quant_data"}
+    payload.update(overrides)
+    return payload
+
+
+def test_load_postgres_settings_default_ssh_fields_to_none(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload()})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.postgres.ssh_user is None
+    assert settings.postgres.ssh_key_path is None
+
+
+def test_load_postgres_settings_parses_ssh_fields_when_both_given(tmp_path):
+    settings_path = _write_settings(
+        tmp_path / "settings.json",
+        {"postgres": _postgres_payload(sshUser="alex", sshKeyPath="/home/alex/.ssh/id_ed25519")},
+    )
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.postgres.ssh_user == "alex"
+    assert settings.postgres.ssh_key_path == "/home/alex/.ssh/id_ed25519"
+
+
+def test_load_postgres_settings_raises_when_only_ssh_user_given(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload(sshUser="alex")})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_postgres_settings_raises_when_only_ssh_key_path_given(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload(sshKeyPath="/home/alex/.ssh/id_ed25519")})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
 def test_load_local_path_is_scoped_to_given_path_directory(tmp_path):
     # Regression guard: local_path used to default relative to the process's cwd regardless of
     # which `path` was passed, so loading a fixture elsewhere could silently pick up whatever

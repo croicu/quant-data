@@ -26,7 +26,14 @@ connections. For remote access over SSH (recommended over opening the Postgres p
 the internet), leave `postgresql.conf`'s `listen_addresses` at `localhost` and connect via an SSH
 tunnel instead (see below) rather than editing `pg_hba.conf` to accept remote passwords.
 
-## Connecting over an SSH tunnel
+## Connecting over an SSH tunnel (for `psql` / direct admin access)
+
+**This section is for `psql` only** — the commands below (applying migrations, populating
+dimension tables, ad-hoc verification) talk to Postgres directly, not through any `quant_data`
+Python code, so they still need a tunnel you start and keep running yourself. The Python client
+(`MarketData`/`create_postgres_provider`, and `quant-ingest`) does **not** need this anymore — see
+"Connection testing from Python" below for how it opens its own tunnel automatically when
+configured to.
 
 One-off tunnel, using your existing `~/.ssh` key-based auth to the box:
 
@@ -111,21 +118,44 @@ ON CONFLICT (date) DO NOTHING;
 Consumers (e.g. `quant-scratch`) should use `MarketData`, not `PostgresDatabase` directly.
 `MarketData` is agnostic of the concrete backend — it takes a provider (built via a factory, e.g.
 `create_postgres_provider`) rather than connection details directly. `create_postgres_provider`
-connects as `quant_reader` by default (`SELECT`-only, trust-authenticated, no password needed over
-the tunnel):
+connects as `quant_reader` by default (`SELECT`-only, trust-authenticated, no password required).
 
-```python
-from datetime import date
-from quant_data import MarketData, create_postgres_provider
+**No manual tunnel needed for this path.** `create_postgres_provider`/`PostgresDatabase` resolve
+their own `ConnectionTransport` (see `docs/ARCHITECTURE.md`) from the `ssh_user`/`ssh_key_path`
+arguments (or `settings.postgres.sshUser`/`sshKeyPath`, both optional and must be set together):
 
-provider = create_postgres_provider(host="localhost", port=5433, dbname="quant_data")
-with MarketData(provider) as client:
-    bars = client.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
-    print(len(bars))
-```
+- **Cloud-hosted Postgres, or an already-running manual tunnel** — omit `ssh_user`/`ssh_key_path`;
+  `host`/`port` are connected to directly, exactly as before this existed:
 
-(`MarketData` is context-manageable — `close()` runs automatically on exit. Calling `close()`
-manually, without `with`, still works too.)
+  ```python
+  from datetime import date
+  from quant_data import MarketData, create_postgres_provider
+
+  provider = create_postgres_provider(host="localhost", port=5433, dbname="quant_data")
+  with MarketData(provider) as client:
+      bars = client.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
+      print(len(bars))
+  ```
+
+- **CroicuWS1's on-prem hosting** — pass `ssh_user`/`ssh_key_path`; `host`/`port` now mean the
+  remote box's SSH host and its Postgres port (typically `5432`, not a local forwarded port), since
+  the local forwarded port is chosen automatically:
+
+  ```python
+  provider = create_postgres_provider(
+      host="<ubuntu_host>", port=5432, dbname="quant_data",
+      ssh_user="<ssh_user>", ssh_key_path="/home/<you>/.ssh/id_ed25519",
+  )
+  with MarketData(provider) as client:
+      bars = client.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
+  ```
+
+  No pre-existing `ssh -N -L ...`/systemd tunnel needed — `PostgresDatabase` opens and tears down
+  its own tunnel for the lifetime of that instance. Key-based auth only (no passphrase/agent
+  support).
+
+(`MarketData` is context-manageable — `close()` runs automatically on exit, which also tears down
+the tunnel if one was opened. Calling `close()` manually, without `with`, still works too.)
 
 `quant_writer` (password-protected, read/write) is for `ingest` only — see
 `quant_data._internal.shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly

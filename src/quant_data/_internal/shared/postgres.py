@@ -4,9 +4,13 @@ from datetime import date
 
 import psycopg
 
+from quant_data._internal.contracts import ConnectionTransport
 from quant_data.protocols import OHLCV
 
+from .diagnostics import Logger
 from .errors import AppError, DateOutOfRangeError
+
+CATEGORY_POSTGRES = "postgres"
 
 
 class PostgresDatabase:
@@ -14,13 +18,22 @@ class PostgresDatabase:
 
     Single connection per invocation (no pooling) — one instance is created per CLI run and
     reused for every query/write during that run, then closed when the process exits.
+
+    Agnostic of how Postgres is actually reached: `transport` resolves that (direct connect vs.
+    an SSH tunnel) so this class never needs to know or care about the concrete hosting choice —
+    see quant_data._internal.shared.transports.
     """
 
-    def __init__(self, host: str, port: int, user: str, password: str, dbname: str) -> None:
+    def __init__(self, transport: ConnectionTransport, user: str, password: str, dbname: str) -> None:
+        self._transport = transport
+        effective_host, effective_port = transport.open()
+
+        Logger.info(f"Connecting to Postgres at {effective_host}:{effective_port}/{dbname} as '{user}'...", category=CATEGORY_POSTGRES)
+
         try:
             self._connection = psycopg.connect(
-                host=host,
-                port=port,
+                host=effective_host,
+                port=effective_port,
                 user=user,
                 password=password,
                 dbname=dbname,
@@ -32,10 +45,14 @@ class PostgresDatabase:
                 options="-c TimeZone=UTC",
             )
         except psycopg.Error as error:
-            raise AppError(f"Failed to connect to Postgres at {host}:{port}/{dbname}: {error}") from error
+            transport.close()
+            raise AppError(f"Failed to connect to Postgres at {effective_host}:{effective_port}/{dbname}: {error}") from error
+
+        Logger.info(f"Connected to Postgres at {effective_host}:{effective_port}/{dbname}.", category=CATEGORY_POSTGRES)
 
     def close(self) -> None:
         self._connection.close()
+        self._transport.close()
 
     def fetch_bars(self, ticker: str, start_date: date, end_date: date) -> list[OHLCV]:
         normalized_ticker = ticker.upper()

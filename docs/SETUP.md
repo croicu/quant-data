@@ -17,8 +17,11 @@ behind each step.
    sudo -u postgres createdb -O <role> quant_data
    ```
 
-2. **Open an SSH tunnel** from your machine (see `docs/DATABASE.md` for a systemd-service version
-   if you want it to persist):
+2. **Open an SSH tunnel** from your machine, for the `psql` steps below (see `docs/DATABASE.md`
+   for a systemd-service version if you want it to persist). The Python client
+   (`MarketData`/`create_postgres_provider`, `quant-ingest`) doesn't need this — it opens its own
+   tunnel automatically when given `ssh_user`/`ssh_key_path`, see `docs/DATABASE.md`'s "Connection
+   testing from Python":
    ```bash
    ssh -N -L 5433:localhost:5432 <ssh_user>@<ubuntu_host>
    ```
