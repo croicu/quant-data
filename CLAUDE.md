@@ -253,17 +253,16 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
-- **File**: [Auto-manage the SSH tunnel](tasks/auto_manage_ssh_tunnel.md) (now just a pointer —
-  issue #17 is the source of truth)
-- **Status**: Implementation done, pending your review of the diff before commit (see issue #17)
-- **Key Context**: `psycopg`/libpq has no SSH transport of its own, so on-prem hosting structurally
-  needs a tunnel — but that's specific to *today's* Ubuntu-box hosting choice, not an architectural
-  requirement (a cloud-hosted Postgres needs no tunnel at all). Shipped a new `ConnectionTransport`
-  protocol (`quant_data._internal.contracts`) with `DirectTransport` and `SshTunnelTransport`
-  (`sshtunnel`-backed) implementations under a new `shared/transports/` package, keeping
-  `PostgresDatabase` itself transport-agnostic — same pattern as `MarketDataProvider`. Additive to
-  `PostgresSettings`/`create_postgres_provider` (optional `ssh_user`/`ssh_key_path`), not breaking.
-  `ruff` + `pytest` (70 passed) both clean; not yet committed.
+- **File**: [IBKR provider reconciliation](tasks/ibkr-provider-reconciliation.md)
+- **Status**: Brainstorm overall (design converged on `dim_provider`/staging/reconciliation
+  approach, several pieces still open — tolerance config, manual resolution UI, reputation
+  schema); its schema-only first slice is `status:implementation` as issue #18, migration drafted
+  (`migrations/003_add_dim_provider_and_staging.sql`), not yet applied to the real database
+- **Key Context**: Goal is running IBKR alongside Yahoo Finance and reconciling the two (not
+  swapping one for the other) — they won't necessarily agree bar-for-bar. IBKR's real and paper
+  accounts share a single `dim_provider` row (`'ibkr'`), since they return identical data for
+  research purposes. `fact_market_data_1min` stays untouched by design (no cross-repo impact);
+  `staging_market_data_1min` is where each provider writes independently before reconciliation.
 
 ## Pending Tasks
 
@@ -284,6 +283,20 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   until the expected-vs-unexpected design converges.
 
 ## Completed Tasks
+- **Auto-manage the SSH tunnel via a `ConnectionTransport` abstraction** — closed issue #17.
+  `psycopg`/libpq has no SSH transport of its own, so on-prem hosting structurally needs a tunnel —
+  but that's specific to *today's* Ubuntu-box hosting choice, not an architectural requirement (a
+  cloud-hosted Postgres needs no tunnel at all). New `ConnectionTransport` protocol
+  (`quant_data._internal.contracts`) with `DirectTransport` and `SshTunnelTransport`
+  (`sshtunnel`-backed) implementations under a new `shared/transports/` package keeps
+  `PostgresDatabase` itself transport-agnostic — same pattern as `MarketDataProvider`. Additive to
+  `PostgresSettings`/`create_postgres_provider` (optional `ssh_user`/`ssh_key_path`), not breaking.
+  Along the way, fixed a real `sshtunnel`/`paramiko` incompatibility (`sshtunnel` 0.4.0
+  unconditionally references the `paramiko.DSSKey` attribute a newer `paramiko` removed) via a
+  small compatibility shim, rather than downgrading paramiko to an EOL version with since-patched
+  CVEs. Verified live against CroicuWS1 (real tunnel, real fetch via `quant_reader`). Announced to
+  `quant-scratch` via [croicu/quant-scratch#10](https://github.com/croicu/quant-scratch/issues/10)
+  (additive, so informational/opt-in rather than a forced migration).
 - **Nest all packages under `quant_data.*`** — fix done for issue #7 (bug), reopened pending
   verification from `quant-scratch`'s actual integration (croicu/quant-scratch#7) before closing.
   `src/defs/`, `src/shared/`,

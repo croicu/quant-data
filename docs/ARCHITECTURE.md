@@ -213,8 +213,12 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
   under `ingest` — so the two are attributable/filterable independently, even though both still
   count the same toward the exit code today (see `tasks/ingest_error_classification.md` for the
   postponed work on making that distinction affect the exit code itself).
-- No IBKR integration yet — swapping Yahoo Finance for IBKR as the real intraday source is
-  unaddressed, to become its own task if/when `quant-scratch` actually needs it.
+- No IBKR `IntraDayProvider` yet — the actual goal (see `tasks/ibkr-provider-reconciliation.md`)
+  is running IBKR alongside Yahoo Finance and reconciling the two, not swapping one for the other,
+  since they won't necessarily agree bar-for-bar. `003_add_dim_provider_and_staging` laid the
+  schema groundwork for this (`dim_provider`, `staging_market_data_1min` — see `docs/SCHEMA.md`),
+  but no Python code consumes either table yet; the `IntraDayProvider` implementation and
+  reconciliation logic itself remain unaddressed, tracked in that task file.
 
 ### `quant_data.client`
 

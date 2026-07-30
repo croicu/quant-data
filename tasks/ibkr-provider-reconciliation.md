@@ -1,6 +1,6 @@
 # IBKR Provider Reconciliation
 
-## Status: Brainstorm
+## Status: Brainstorm (schema-only slice done — see issue #18, ready-to-submit)
 
 ## Problem statement
 
@@ -18,9 +18,22 @@ data to know how reliable either provider actually is.
 
 ## Design decisions
 
+- **IBKR's real and paper accounts are the same `dim_provider` row.** Both return identical market
+  data for research purposes — the account used is an execution-environment detail (which
+  credentials/endpoint `IntraDayProvider` connects with), not a distinct data identity. A single
+  `'ibkr'` row covers both; `'yfinance'` is the other row today.
+- **Schema-only first slice, split out from the rest of this brainstorm**: `dim_provider` +
+  `staging_market_data_1min` are being migrated now, as a precursor to writing the IBKR
+  `IntraDayProvider` itself — tracked as its own narrower issue (see "Implementation plan" below),
+  the same way `quant-ingest --catch-up` was split out of the broader scheduled-jobs brainstorm.
+  Everything else here (tolerance config, manual resolution UI, reputation table, the actual
+  reconciliation logic) stays Brainstorm/deferred; this migration doesn't implement any of it, only
+  the two tables it'll eventually need.
 - **`dim_provider`** is a new dimension table (alongside `dim_ticker`/`dim_date`/`dim_time`),
   deliberately not hardcoded to exactly two rows — more providers may be added later, and the
-  design shouldn't need revisiting when that happens.
+  design shouldn't need revisiting when that happens. Shape mirrors `dim_ticker` exactly:
+  `provider_id SERIAL PRIMARY KEY`, `name TEXT NOT NULL UNIQUE` (lowercase, `'yfinance'`/`'ibkr'`
+  seeded directly in the migration), `created_at TIMESTAMP DEFAULT now()`.
 - **A new staging table**, `staging_market_data_1min`, holds each provider's raw, as-ingested bars
   — same bar columns as `fact_market_data_1min` (open/high/low/close/volume/timestamp/incomplete)
   plus `provider_id`. Primary key `(provider_id, ticker_id, date_id, time_id)`. Each provider's
@@ -72,6 +85,24 @@ data to know how reliable either provider actually is.
 
 ## Open questions
 
+Resolved for the schema-only slice (see "Implementation plan" below):
+
+- ~~Staging table indexing~~ — primary key stays `(provider_id, ticker_id, date_id, time_id)`
+  (matches how each `IntraDayProvider` writes its own rows independently), plus a new secondary
+  index on `(ticker_id, date_id, time_id)` to support reconciliation's actual access pattern:
+  gathering every provider's row for one bar, which is the opposite leading-column order from the
+  primary key.
+- ~~Migration numbering~~ — `003_add_dim_provider_and_staging.sql`, covering both new tables
+  together (they're introduced as a pair; nothing consumes `dim_provider` without
+  `staging_market_data_1min` existing too). A reputation-table migration, if that design converges
+  later, gets its own later number.
+- ~~Cross-repo impact confirmation~~ — confirmed no `quant-scratch`-facing issue needed for this
+  migration specifically: `fact_market_data_1min`'s schema/grain, `MarketData.fetch_bars`, and
+  `create_postgres_provider` are all untouched. A provenance column on the fact table (discussed,
+  not committed to) would reopen this question if it's ever actually added.
+
+Still open — belong to the reconciliation-logic implementation, a later task, not this migration:
+
 - **Tolerance configuration shape**: where do per-field tolerances live — `settings.json` (like
   `catchUpLookbackDays`), a new small config file, or a DB table (so they're adjustable without a
   restart)? Given they're explicitly meant to be tuned as real disagreement data comes in, a DB
@@ -85,23 +116,33 @@ data to know how reliable either provider actually is.
 - **"Currently configured providers" scope**: is the provider list global (one list applies to
   every ticker), or could it vary per ticker (e.g. IBKR covers a ticker Yahoo doesn't, or vice
   versa)? Affects how reconciliation decides "all expected providers have reported" for a given bar.
-- **Staging table indexing**: `fact_market_data_1min` has indexes tuned for point lookups and
-  ticker/date range scans (see `docs/SCHEMA.md`); staging's access pattern (write-heavy, short-
-  lived, scanned by the reconciliation job rather than by external readers) may not need the same
-  indexes — not yet worked out.
-- **Migration numbering**: this needs at least one new migration (`003_...`) for `dim_provider` +
-  `staging_market_data_1min`, and a second for whatever reputation ends up being — not yet split
-  out or drafted.
-- **Cross-repo impact confirmation**: current design intentionally leaves `fact_market_data_1min`'s
-  schema/grain/contract untouched, so per `CLAUDE.md`'s placement rule this shouldn't need a
-  `quant-scratch`-facing issue — worth explicitly re-confirming once the migration is drafted, in
-  case something (e.g. a new nullable `resolved_from_provider_id` provenance column on the fact
-  table, discussed but not committed to) ends up touching the public surface after all.
 
 ## Implementation plan
 
-<!-- Added when advancing to Implementation. -->
+**Schema-only slice** (this pass — no Python code, since nothing consumes these tables yet; the
+IBKR `IntraDayProvider` and reconciliation logic are separate, later work):
+
+1. `migrations/003_add_dim_provider_and_staging.sql`: `CREATE TABLE dim_provider` (seeded with
+   `'yfinance'`, `'ibkr'`), `CREATE TABLE staging_market_data_1min`, plus the secondary index noted
+   above. Wrapped in `BEGIN`/`COMMIT`, records itself in `schema_migrations`, matching
+   `001`/`002`'s existing style.
+2. `docs/SCHEMA.md`: document both new tables, their columns, and the new index, alongside the
+   existing three-dimension/one-fact description.
+3. Apply the migration against the real CroicuWS1 database via `psql` — **requires explicit
+   go-ahead first**, per this repo's rule to confirm before running a migration against the real
+   database.
+4. Open a GitHub issue scoped to just this slice (schema only), labeled `status:implementation`,
+   cross-linking back to this task file for the broader reconciliation context — same pattern as
+   issue #12 (`--catch-up`) was split out of `tasks/scheduled_jobs.md`.
 
 ## Test results
 
-<!-- Added when advancing to Testing / Ready to Submit. -->
+**Schema-only slice (issue #18): done.** Applied to the real CroicuWS1 database via `psql` as
+`quant_data`; verified independently, read-only, via `quant_reader` — 7 tables present
+(`dim_provider`, `staging_market_data_1min` alongside the original five), `dim_provider` seeded
+with `yfinance`/`ibkr`, `staging_market_data_1min`'s columns/PK/index/FKs all match the design. No
+automated tests (no Python code changed).
+
+Rest of this brainstorm (tolerance config, manual resolution mechanism, reputation table, the
+IBKR `IntraDayProvider` itself) remains open — this file stays as the working document for that,
+not deleted, the same way `tasks/scheduled_jobs.md` survived `--catch-up` (#12) closing.
