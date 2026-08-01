@@ -296,7 +296,7 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 
 - **Fix ~130s SSH-tunnel connect stall; add `Logger.perf()` timing markers** — issue #19, opened by
   the repo owner from `quant-scratch`-side testing. `status:ready-to-submit`, fix pushed to `main`
-  as `<pending — updated after push>` — **left open**, per this file's "Who closes an issue" rule:
+  as `cd424a0` — **left open**, per this file's "Who closes an issue" rule:
   the opener verifies (once `quant-scratch` syncs to the new `quant-data` and confirms `day-chart`
   is actually fast) and closes it themselves, not automatically on merge.
   `SshTunnelTransport.open()` returned the bare hostname `"localhost"`, which `psycopg`/libpq
@@ -315,7 +315,7 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 
 - **Injectable `LoggingSink` so a host application can see quant-data's internal logging** —
   issue #20 (split from #19), opened by the repo owner. `status:ready-to-submit`, fix pushed to
-  `main` as `<pending — updated after push>` — **left open**, same reason as #19 above:
+  `main` as `cd424a0` — **left open**, same reason as #19 above:
   `quant-scratch` needs to actually wire up its own `Logger` via the new `logger=` param before the
   opener can confirm the unified stream works end-to-end. quant-data's `Logger` was entirely
   private, so its own internal log calls (e.g. the `Logger.perf()` markers #19 just added) were
