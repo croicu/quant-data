@@ -157,6 +157,11 @@ arguments (or `settings.postgres.sshUser`/`sshKeyPath`, both optional and must b
 (`MarketData` is context-manageable — `close()` runs automatically on exit, which also tears down
 the tunnel if one was opened. Calling `close()` manually, without `with`, still works too.)
 
+Both `create_postgres_provider` and `MarketData` also accept an optional `logger=` matching the
+`quant_data.LoggingSink` `Protocol` — pass your own application's logger to route quant-data's
+internal connect/query timing and status messages into your own log stream instead of quant-data's
+private one (see `docs/ARCHITECTURE.md`'s `LoggingSink` section).
+
 `quant_writer` (password-protected, read/write) is for `ingest` only — see
 `quant_data._internal.shared.postgres.PostgresDatabase` if you need the concrete read/write implementation directly
 (e.g. writing your own ingest tooling), with connection details from

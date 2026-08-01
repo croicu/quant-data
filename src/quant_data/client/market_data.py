@@ -4,7 +4,8 @@ from datetime import date
 from types import TracebackType
 
 from quant_data._internal.contracts import MarketDataProvider
-from quant_data.protocols import OHLCV
+from quant_data._internal.shared.diagnostics import Logger
+from quant_data.protocols import OHLCV, LoggingSink
 
 
 class MarketData:
@@ -19,10 +20,16 @@ class MarketData:
     of "no client can write" is the quant_reader role's database privileges, not this class's
     shape (see docs/ARCHITECTURE.md) -- but a narrower surface is still better ergonomics than
     handing consumers the full read/write PostgresDatabase ingest itself uses.
+
+    `logger` accepts an injected LoggingSink (see quant_data#20) for consistency with
+    create_postgres_provider's own injection point -- MarketData itself doesn't log anything yet,
+    so this is currently unused, but the parameter is added now so the injection point is visible
+    at the layer consumers instantiate directly.
     """
 
-    def __init__(self, provider: MarketDataProvider) -> None:
+    def __init__(self, provider: MarketDataProvider, logger: LoggingSink = Logger) -> None:
         self._provider = provider
+        self._logger = logger
 
     def fetch_bars(self, ticker: str, start_date: date, end_date: date) -> list[OHLCV]:
         return self._provider.fetch_bars(ticker, start_date, end_date)

@@ -142,9 +142,29 @@ For any non-trivial feature or change, follow these stages:
 
 1. **Brainstorm** (planned tasks only) — copy `tasks/new_task.md` to `tasks/<task-name>.md` with the problem statement; update it with conclusions as the design discussion progresses. This is scratch space for live back-and-forth — an issue isn't required at this stage, but a lightweight tracking issue labeled `status:brainstorm` can be opened for backlog visibility if wanted; either way, `tasks/<task-name>.md` (not the issue) stays the working document until the design converges.
 2. **Implementation** — open a GitHub issue (`gh issue create`) with the converged problem statement + conclusions as the body, labeled `status:implementation`. Write the code. For a planned task, `tasks/<task-name>.md` is no longer the source of truth once the issue exists — trim it to a one-line pointer at the issue (or delete it) rather than maintaining both. For an ad-hoc task, there's no file to trim — the issue was the first artifact.
-3. **Testing** — relabel the issue `status:testing`. Verify correctness; post test results and any open issues as an issue comment.
-4. **Ready to Submit** — relabel `status:ready-to-submit`. Run lint + tests; confirm docs are up to date; post a closing summary comment.
+3. **Testing** — relabel the issue `status:testing`. Verify correctness; post test results and any open issues as an issue comment. **For a `cross-repo` issue that originated from a consumer repo's own testing/diagnosis** (e.g. a bug first noticed running `quant-scratch`'s `day-chart`), quant-data's own verification — even a live check against the real database — confirms the fix works in isolation, but isn't the same as confirming the originally reported symptom is actually resolved: that requires the consumer to pull the updated `quant-data` code and re-test in its own context. Say so explicitly in the comment rather than implying it's fully confirmed.
+4. **Ready to Submit** — relabel `status:ready-to-submit`. Run lint + tests; confirm docs are up to date; post a summary comment. This is as far as *this* repo's own work can confirm the issue — it does not mean the issue is closed (see "Who closes an issue" below).
 5. **Done** — close the issue after merge. For a planned task, delete `tasks/<task-name>.md` once the issue is closed — the issue (body + comments) is the sole source of truth from that point on, so there's no reason to keep a stale duplicate on disk. (Only applies when a real issue holds the full history; a Done task with no issue keeps its local file.) Ad-hoc tasks have nothing to delete.
+
+**Who closes an issue**: applies to issues opened "in the family" — by the repo owner themselves
+(directly, or via a cross-repo issue from one of their own other repos like `quant-scratch`) —
+which is the normal case today, since there are no external contributors yet. In that case,
+whoever opened it is the one who closes it, not automatically whoever did the implementation work:
+leave it open at `status:ready-to-submit` once the fix is pushed and say so; don't close it, and
+don't use GitHub's auto-closing commit-message keywords (`Closes #N`, `Fixes #N`, `Resolves #N`)
+for it, since those close on push regardless of who's supposed to have that call — use a
+non-closing reference instead (`Ref #N`, `Part of #N`, `Addresses #N`). This matters most for
+`cross-repo` issues diagnosed from a consumer's own testing: the opener is the one positioned to
+actually verify the fix in that original context, so closing is their call, not a mechanical side
+effect of merging. The one exception even within the family: an issue Claude opened itself mid-task
+(e.g. a `status:implementation` issue opened while executing a planned/ad-hoc task in this same
+session) can be closed directly, since Claude is the opener there.
+
+**If an issue ever comes from a genuine external contributor** (not the repo owner or one of their
+own other repos), this whole rule doesn't apply — follow normal GitHub OSS etiquette instead
+(auto-close via a merged PR's `Closes #N` is fine, maintainer discretion applies). Revisit this
+section if/when that actually happens; it's not a case worth designing for speculatively before a
+real external contributor shows up.
 
 ## Before committing
 
@@ -211,7 +231,7 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 
 1. Internal processing uses strongly typed dataclasses.
 2. **Package layout**: two top-level packages under `src/` (full rationale and history in `docs/ARCHITECTURE.md`'s Layout section):
-   - `src/quant_data/` — the distribution's namespaced package: `__init__.py` (plain re-exports of `MarketData`, `OHLCV`, `create_postgres_provider` — no laziness needed, see the circular-import note below), `protocols.py` (`OHLCV`, **public**), `client/market_data.py` (`MarketData`, **public**, agnostic of the concrete backend — it only depends on `MarketDataProvider`), `client/postgres_provider.py` (`create_postgres_provider`, **public**, today's factory), and `_internal/` (**private**: `contracts.py` — behavioral `Protocol`s `MarketDataProvider`/`IntraDayProvider` — and `shared/` — cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`, `postgres.py`, `providers/`). Nothing under `_internal/` is exported by `quant_data`, and none of it should be imported directly by external consumers, even though Python doesn't stop you. Consumers (`quant-scratch`) should only ever write `from quant_data import MarketData, OHLCV, create_postgres_provider`.
+   - `src/quant_data/` — the distribution's namespaced package: `__init__.py` (plain re-exports of `MarketData`, `OHLCV`, `LoggingSink`, `create_postgres_provider` — no laziness needed, see the circular-import note below), `protocols.py` (`OHLCV` plus the behavioral `LoggingSink` `Protocol`, **public**), `client/market_data.py` (`MarketData`, **public**, agnostic of the concrete backend — it only depends on `MarketDataProvider`), `client/postgres_provider.py` (`create_postgres_provider`, **public**, today's factory), and `_internal/` (**private**: `contracts.py` — behavioral `Protocol`s `MarketDataProvider`/`IntraDayProvider`/`ConnectionTransport` — and `shared/` — cross-app infra: `diagnostics.py`, `errors.py`, `settings.py`, `postgres.py`, `providers/`, `transports/`). Nothing under `_internal/` is exported by `quant_data`, and none of it should be imported directly by external consumers, even though Python doesn't stop you. Consumers (`quant-scratch`) should only ever write `from quant_data import MarketData, OHLCV, LoggingSink, create_postgres_provider`.
    - `src/ingest/` — the write-side CLI. Console script only (`quant-ingest`), no importable surface at all.
 
    `quant_data` needs its own distribution-specific namespace: **this deliberately does not mirror `quant-scratch`'s own flat top-level-package convention** (`defs`, `shared`, `day_chart`, ... with no common prefix) — that flat layout is fine for a repo that's never installed alongside anything else, but broke the moment `quant-data` was installed as a pip dependency *next to* `quant-scratch` in the same environment: both repos' top-level `defs`/`shared` packages shared the same import name, so whichever installed last silently shadowed the other's entirely (see croicu/quant-data#7, reproduced both installation orders). `_internal/` is *nested* under `quant_data`, not a second top-level package — nesting under `quant_data.` was already sufficient for collision safety (the private half never needed its own distribution-specific name; it just needed to not be bare/flat), and nesting also avoids a real circular-import failure mode a sibling top-level package doesn't (see the gotcha below). `ingest` has no known collision and no importable surface, so it doesn't need a prefix either way — it's a separate top-level package purely for the public/private split, not for collision safety.
@@ -219,8 +239,8 @@ pytest tests/unit/test_foo.py::test_bar   # single test
    Cross-package imports are absolute with the full package prefix (`from quant_data._internal.shared.diagnostics import ...`, `from quant_data.protocols import ...`); same-package imports stay relative (`from .errors import ...`). setuptools' src-layout automatic discovery picks up every top-level package under `src/` (`quant_data`, `ingest`) with no extra `[tool.setuptools]` config needed, as long as each has `__init__.py`.
 
    **Circular-import gotcha (historical, resolved by nesting)**: `quant_data._internal.shared.postgres` needs `OHLCV` from `quant_data.protocols`, and `create_postgres_provider` needs `PostgresDatabase` from `quant_data._internal.shared.postgres` in turn — a two-way relationship between the public and private halves (see rule 8 below on keeping the dependency graph acyclic — this is the one case here where a `Protocol` alone couldn't fully remove the relationship, since `create_postgres_provider`'s whole job is bridging to the concrete `PostgresDatabase`). This used to be a real crash when `_internal` was a *separate top-level package* (`quant_data_internal`): eagerly importing at `quant_data/__init__.py`'s module scope meant `import quant_data_internal.shared.postgres` as the first import in a fresh process raised `ImportError: cannot import name 'PostgresDatabase' from partially initialized module`. Nesting `_internal` under `quant_data` fixed this *structurally*, not just by deferring it: importing a dotted path forces Python to fully finish the parent (`quant_data`) before even attempting the child segment, so the self-reference that caused the crash can't occur — verified directly by re-running the exact reproduction against the nested layout with a plain, eager `__init__.py`. No `__getattr__`/lazy-import workaround needed anymore; don't reintroduce one without a concrete reason, since it would be unnecessary cleverness at that point (rule 6).
-3. `protocols.py` (in `quant_data`, the public half) contains persisted/shared data contracts — pure data only, no behavior. Behavior that operates on protocol types belongs in a dedicated entity/service layer, not on the protocol classes themselves.
-4. `contracts.py` (in `quant_data._internal`, the private half) contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors), not data.
+3. `protocols.py` (in `quant_data`, the public half) contains public contracts: persisted/shared data (dataclasses, e.g. `OHLCV`) *and* behavioral `Protocol`s meant for a consumer to actually implement/inject (e.g. `LoggingSink` — see quant-data#20). The distinction from `contracts.py` isn't data-vs-behavior, it's public-vs-private: a behavioral `Protocol` belongs in `protocols.py` specifically when an external consumer is expected to supply their own implementation of it, not just when quant_data has some internal data type to describe. Behavior that merely *operates on* a data contract (as opposed to a `Protocol` a consumer implements) still belongs in a dedicated entity/service layer, not on the dataclass itself. Keep any behavioral `Protocol` placed here leaf-safe (rule 8) — default parameter values like a category string should be literals, not imports from `_internal`, even where `_internal` already defines the same constant.
+4. `contracts.py` (in `quant_data._internal`, the private half) contains runtime behavioral interfaces (`Protocol` classes for things like workers/executors) that wire quant_data's *own* internals together — never imported by external consumers, unlike `protocols.py`'s behavioral `Protocol`s above.
 5. Unit tests (`tests/unit/`) must run offline. Integration tests (`tests/integration/`), if the project has them, may hit real external services — that's a deliberate scope split, not a loophole in rule 4. Note `pytest.ini`'s `testpaths = tests` runs both by default, so adding an integration suite means accepting network calls in the default `pytest` invocation unless you also gate it behind a marker.
 6. Prefer explicit, readable Python over clever abstractions.
 7. Prefer constructor/parameter injection over monkeypatching this project's own module internals in tests — e.g. a component that talks to the outside world (network, filesystem, clock, database) should take that dependency as an argument, defaulting to the real implementation, so tests can pass a fake object instead of patching a function inside the module under test. Monkeypatching is still the right tool for faking a *third-party* library's own internals (e.g. a DB driver class you don't own) — the distinction is whether the thing being faked is your code or someone else's.
@@ -239,11 +259,19 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   - `Logger.info` — normal notable events (start, end, success, counts)
   - `Logger.warning` — recoverable problems (retries, skipped items)
   - `Logger.error` / `Logger.fatal` — unrecoverable failures
+  - `Logger.perf(description, elapsed_seconds)` — duration markers for timing-sensitive spans
+    (connection setup, query execution), always logged at `INFO` under a fixed category `perf`
+    (`CATEGORY_PERF`, not the caller's choice — unlike every other `Logger` method). Message shape
+    is `"duration: {elapsed:.3f}s - {description}"`, matching `quant-scratch`'s own `Logger.perf`
+    convention so timing output reads the same across both repos. Added per
+    [quant-data#19](https://github.com/croicu/quant-data/issues/19), where a ~130s stall on
+    `PostgresDatabase.__init__`'s connect step was only diagnosable because `quant-scratch` had
+    this instrumentation on its own side and quant-data didn't yet.
 - **Categories** — every `Logger` method takes an optional `category: str = "general"`, filterable via `settings.json`'s `logCategories` (an open string, not a closed enum — `diagnostics.py` only defines `CATEGORY_GENERAL` as a starting constant). Console output is `[LEVEL][category] message`. **Effective default depends on whether `logLevel` is explicit** (see "Specific settings override generic ones on scope overlap" under Coding Style — this is that rule's origin case): if `settings.json`'s `logCategories` is left empty/absent, an explicit `logLevel` decides it outright — permissive (`verbose`/`info`/`warning`) resolves to `[]` (unfiltered), restrictive (`error`/`critical`) resolves to `["general"]` — regardless of `debug`. Only when `logLevel` is left at its implicit default does `debug` get consulted as the fallback (`debug: false` -> `["general"]`, `debug: true` -> `[]`), exactly as before. An explicit non-empty `logCategories` always overrides all of this outright. **`excludedCategories`** is a complementary deny-list, only in effect when the resolved `logCategories` is `[]` (the true unfiltered state) — inert against an explicit non-empty `logCategories` or the restrictive `["general"]` default.
 
 ## Coding Style
 
-- **Protocols are pure data** — `protocols.py` holds dataclasses only. No methods, no logic. Behavior lives in a separate entity/service layer.
+- **`protocols.py` holds public contracts, not implementations** — data (dataclasses, no methods) plus behavioral `Protocol`s meant for a consumer to implement/inject (e.g. `LoggingSink`). Either way, no concrete logic lives here — a dataclass has no behavior of its own (that lives in a separate entity/service layer), and a `Protocol`'s methods are signatures only (`...` bodies), never an implementation.
 - **Explicit over brief** — if two implementations are equivalent, choose the one that is easier to read and debug, even if it is longer.
 - **No list/dict/set comprehensions** — use explicit `for` loops. Comprehensions obscure control flow and make multi-step logic harder to follow.
 - **No lambdas** — use named functions or plain `for` loops. Lambdas hide intent and cannot be stepped through in a debugger.
@@ -265,6 +293,44 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   `staging_market_data_1min` is where each provider writes independently before reconciliation.
 
 ## Pending Tasks
+
+- **Fix ~130s SSH-tunnel connect stall; add `Logger.perf()` timing markers** — issue #19, opened by
+  the repo owner from `quant-scratch`-side testing. `status:ready-to-submit`, fix pushed to `main`
+  as `<pending — updated after push>` — **left open**, per this file's "Who closes an issue" rule:
+  the opener verifies (once `quant-scratch` syncs to the new `quant-data` and confirms `day-chart`
+  is actually fast) and closes it themselves, not automatically on merge.
+  `SshTunnelTransport.open()` returned the bare hostname `"localhost"`, which `psycopg`/libpq
+  resolves as dual-stack — with `SSHTunnelForwarder` bound to `0.0.0.0`, this fell back from an
+  unreachable IPv6 loopback to IPv4 with a ~130s internal timeout instead of connecting immediately
+  (diagnosed on the `quant-scratch` side via ad-hoc probe scripts, isolated to specifically the
+  `psycopg.connect()` call — not the tunnel handshake, not a raw socket connect). Fixed by binding
+  `local_bind_address=("127.0.0.1", 0)` explicitly and returning that literal address; also
+  normalized any effective host of `"localhost"` to `"127.0.0.1"` in `PostgresDatabase.__init__`
+  itself as defense-in-depth, since `DirectTransport`/any caller could hand back the same ambiguous
+  hostname (`docs/DATABASE.md`'s own documented example did). Added `Logger.perf(description,
+  elapsed_seconds)` (fixed `perf` category, same message shape as `quant-scratch`'s own
+  `Logger.perf`) around `transport.open()`, `psycopg.connect()`, and each `fetch_bars`/`write_bars`
+  call — this instrumentation is exactly what made the stall diagnosable in the first place.
+  Verified live against CroicuWS1 (quant-data's own side only): 130s -> 1.4s for tunnel + connect.
+
+- **Injectable `LoggingSink` so a host application can see quant-data's internal logging** —
+  issue #20 (split from #19), opened by the repo owner. `status:ready-to-submit`, fix pushed to
+  `main` as `<pending — updated after push>` — **left open**, same reason as #19 above:
+  `quant-scratch` needs to actually wire up its own `Logger` via the new `logger=` param before the
+  opener can confirm the unified stream works end-to-end. quant-data's `Logger` was entirely
+  private, so its own internal log calls (e.g. the `Logger.perf()` markers #19 just added) were
+  invisible to any consumer regardless of the consumer's own `settings.json` — flipping on `perf`
+  category in `quant-scratch` showed only `quant-scratch`'s own markers. New public `Protocol`,
+  `quant_data.protocols.LoggingSink` (mirrors the private `DiagnosticsLogSink`'s method surface
+  exactly, so any `tpl-py`-descended repo's own existing `Logger` already satisfies it structurally
+  with zero host-side changes). `create_postgres_provider`/`PostgresDatabase`/`MarketData` all
+  gained an optional `logger: LoggingSink` parameter, defaulting to quant-data's own private
+  `Logger` *class* itself (its methods are all `@staticmethod`s, so this behaves identically to the
+  direct static calls it replaced internally) — additive, not breaking. This also redefines
+  `protocols.py`'s scope: public contracts generally (data *or* behavioral-for-injection), not
+  "dataclasses only" — see Architecture conventions rules 3/4 above. Verified live against
+  CroicuWS1 with a custom logger object (not quant-data's own `Logger`), confirming every internal
+  log call landed there instead.
 
 - **File**: [Scheduled jobs](tasks/scheduled_jobs.md)
 - **Status**: Brainstorm, postponed (see issue #3) — deprioritized, not actively worked

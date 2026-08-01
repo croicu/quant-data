@@ -8,6 +8,7 @@ from enum import Enum
 # Not a closed enum: category is an open string so callers can introduce new categories
 # without editing this file. CATEGORY_GENERAL is the only one every log call defaults to.
 CATEGORY_GENERAL = "general"
+CATEGORY_PERF = "perf"
 
 
 class TelemetryLevel(Enum):
@@ -77,6 +78,9 @@ class DiagnosticsLogSink:
 
     def fatal(self, message: str, category: str = CATEGORY_GENERAL) -> None:
         self.log(TelemetryLevel.CRITICAL, message, category)
+
+    def perf(self, description: str, elapsed_seconds: float) -> None:
+        self.log(TelemetryLevel.INFO, f"duration: {elapsed_seconds:.3f}s - {description}", CATEGORY_PERF)
 
 
 LEVEL_RANK: dict[TelemetryLevel, int] = {
@@ -170,6 +174,10 @@ class Logger:
     @staticmethod
     def fatal(message: str, category: str = CATEGORY_GENERAL) -> None:
         Logger._sink().fatal(message, category)
+
+    @staticmethod
+    def perf(description: str, elapsed_seconds: float) -> None:
+        Logger._sink().perf(description, elapsed_seconds)
 
     @staticmethod
     def _reset() -> None:

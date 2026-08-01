@@ -27,7 +27,7 @@ Two top-level packages under `src/`:
 - `src/ingest/` — the ingest CLI. Console script: `quant-ingest`, no importable surface at all.
 
 **Public surface**: external consumers (`quant-scratch`) should only depend on the `quant_data`
-top level — `from quant_data import MarketData, OHLCV, create_postgres_provider`. Since
+top level — `from quant_data import MarketData, OHLCV, LoggingSink, create_postgres_provider`. Since
 `client`/`protocols.py` hold only genuinely public content and `_internal/` holds none, the folder
 split itself signals what's safe to depend on, instead of relying solely on an `__init__.py`
 allow-list (see croicu/quant-data#10).
@@ -80,9 +80,30 @@ independent top-level packages.
 
 ### `quant_data.protocols`
 
-`OHLCV`: ticker, timestamp (UTC), open/high/low/close, volume, and `incomplete` (defaults `False`)
-— set when the provider couldn't supply full data for that minute (see `docs/SCHEMA.md`'s
-`fact_market_data_1min.incomplete`). Re-exported at the `quant_data` top level.
+- `OHLCV`: ticker, timestamp (UTC), open/high/low/close, volume, and `incomplete` (defaults
+  `False`) — set when the provider couldn't supply full data for that minute (see
+  `docs/SCHEMA.md`'s `fact_market_data_1min.incomplete`). Re-exported at the `quant_data` top
+  level.
+- `LoggingSink(Protocol)`: `diagnostic`/`info`/`warning`/`error`/`fatal(message, category="general")`
+  plus `perf(description, elapsed_seconds)` — the injectable logging contract (quant-data#20).
+  Mirrors `_internal.shared.diagnostics.DiagnosticsLogSink`'s method surface exactly, so a host
+  application's own `Logger` (any `tpl-py`-descended repo already has one structurally identical)
+  satisfies it with zero changes on the host side. `category` defaults to the literal string
+  `"general"` here rather than importing `CATEGORY_GENERAL` from `_internal`, specifically so this
+  module stays a dependency-graph leaf (rule 8) — this is the one behavioral `Protocol` in the
+  public half of the split (see "Contracts" below for how it differs from `_internal.contracts`'s
+  behavioral `Protocol`s). Re-exported at the `quant_data` top level alongside `MarketData`/
+  `OHLCV`/`create_postgres_provider`.
+  - `create_postgres_provider` and `PostgresDatabase` both take an optional `logger: LoggingSink`
+    parameter, defaulting to quant-data's own private `Logger` class itself (not an instance — its
+    methods are all `@staticmethod`s, so using the class as the default value behaves identically
+    to the direct static calls it replaced internally). `MarketData` also accepts the parameter
+    for consistency/discoverability at the layer consumers instantiate directly, though it doesn't
+    log anything of its own yet.
+  - Additive to all three signatures (new optional kwarg, default preserves today's exact
+    behavior) — a host application (e.g. `quant-scratch`) can pass its own `Logger` in and get
+    quant-data's internal logging routed into its own log stream, with no shared type/adapter
+    needed beyond structurally matching this `Protocol`.
 
 ### `quant_data._internal.contracts`
 
@@ -132,7 +153,19 @@ independent top-level packages.
   settings + `docs/DATABASE.md` change only, never a code change here. Logs an `info`-level
   message before attempting the connection and another once it succeeds, under category
   `postgres` (`CATEGORY_POSTGRES`) — so a hang during connect (e.g. a stalled SSH handshake) is
-  distinguishable from one during query execution.
+  distinguishable from one during query execution. Normalizes an effective host of the literal
+  string `"localhost"` to `"127.0.0.1"` right before calling `psycopg.connect` — `psycopg`/libpq
+  resolves the bare hostname as dual-stack and can fall back from an unreachable IPv6 loopback
+  with a ~130s internal timeout instead of connecting immediately, isolated in
+  [quant-data#19](https://github.com/croicu/quant-data/issues/19) (a ~660x slowdown vs. the
+  literal IPv4 address, on the same tunnel). `SshTunnelTransport` (below) also binds its own local
+  end to `127.0.0.1` directly so it never hands back the ambiguous hostname in the first place;
+  the normalization here is a second line of defense for any other caller. Also emits
+  `Logger.perf()` duration markers (`quant_data._internal.shared.diagnostics`, category `perf`)
+  around `transport.open()`, `psycopg.connect()`, and each `fetch_bars`/`write_bars` call — added
+  alongside the fix since that's exactly what made the stall diagnosable in the first place
+  (traced from the `quant-scratch` consumer side with ad-hoc probe scripts before this existed
+  natively).
 - `transports/` — `ConnectionTransport` implementations, resolved via
   `transports.resolve_transport(host, port, ssh_user, ssh_key_path)` (picks `SshTunnelTransport`
   when both are set, else `DirectTransport`) — used by both `create_postgres_provider` and
@@ -141,8 +174,13 @@ independent top-level packages.
     `close()` is a no-op. What a cloud-hosted Postgres (or an already-running manual tunnel) uses —
     behaviorally identical to what `PostgresDatabase` did before `ConnectionTransport` existed.
   - `ssh_tunnel.py` — `SshTunnelTransport(host, port, ssh_user, ssh_key_path)`: opens an
-    `sshtunnel.SSHTunnelForwarder` on `open()` (an OS-assigned local port, not a fixed one) and
-    returns `("localhost", tunnel.local_bind_port)`; `close()` stops it. Key-based auth only, no
+    `sshtunnel.SSHTunnelForwarder` on `open()`, binding its local end explicitly to
+    `("127.0.0.1", 0)` (an OS-assigned port, not a fixed one — and a concrete address, not
+    sshtunnel's own `0.0.0.0` default) and returns `("127.0.0.1", tunnel.local_bind_port)`;
+    `close()` stops it. Returning the literal address rather than the bare hostname `"localhost"`
+    is a deliberate fix (quant-data#19) — `psycopg`/libpq resolves `"localhost"` as dual-stack and
+    can fall back from an unreachable IPv6 loopback with a ~130s internal timeout instead of
+    connecting immediately. Key-based auth only, no
     passphrase/agent support. One tunnel per `PostgresDatabase` instance, matching its existing
     single-connection-per-invocation lifecycle. Tunnel-start failures (bad host, bad key, auth,
     network) wrap into `AppError`, mirroring the existing psycopg-error wrapping. What CroicuWS1's
@@ -262,8 +300,13 @@ interface (verified directly: a write attempt through `quant_reader` gets a real
 
 ## Contracts
 
-`quant_data.protocols`'s `OHLCV` and `quant_data._internal.contracts`'s
-`MarketDataProvider`/`IntraDayProvider` are the actual Python-level data contract now (see
-"Modules" above for their shapes). The database schema itself (four tables: `dim_ticker`,
-`dim_date`, `dim_time`, `fact_market_data_1min`) remains the underlying persisted contract — see
-`docs/SCHEMA.md`.
+`quant_data.protocols`'s `OHLCV` and `LoggingSink`, and `quant_data._internal.contracts`'s
+`MarketDataProvider`/`IntraDayProvider`/`ConnectionTransport`, are the actual Python-level
+contracts now (see "Modules" above for their shapes). The split between the two isn't data-vs-
+behavior — `LoggingSink` is behavioral too — it's public-vs-private: `protocols.py` holds
+`Protocol`s a consumer is meant to actually implement/inject (`LoggingSink`), while
+`_internal.contracts` holds `Protocol`s that only wire quant_data's own internals together
+(`MarketDataProvider`, `IntraDayProvider`, `ConnectionTransport`) and are never imported by
+external consumers. The database schema itself (four dimension tables plus
+`fact_market_data_1min`/`staging_market_data_1min`) remains the underlying persisted contract —
+see `docs/SCHEMA.md`.

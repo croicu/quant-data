@@ -39,13 +39,19 @@ class SshTunnelTransport:
                 ssh_username=self._ssh_user,
                 ssh_pkey=self._ssh_key_path,
                 remote_bind_address=("localhost", self._port),
+                # Bind the local end to a concrete IPv4 address rather than sshtunnel's own
+                # 0.0.0.0 default. Returning the bare hostname "localhost" below (instead of this
+                # address) made psycopg/libpq resolve it as dual-stack and fall back from an
+                # unreachable IPv6 loopback to IPv4 with a ~130s internal timeout, observed and
+                # isolated in quant-data#19 -- the literal address never has that ambiguity.
+                local_bind_address=("127.0.0.1", 0),
             )
             tunnel.start()
         except Exception as error:
             raise AppError(f"Failed to open SSH tunnel to {self._host} as {self._ssh_user} (key: {self._ssh_key_path}): {error}") from error
 
         self._tunnel = tunnel
-        return "localhost", tunnel.local_bind_port
+        return "127.0.0.1", tunnel.local_bind_port
 
     def close(self) -> None:
         if self._tunnel is not None:

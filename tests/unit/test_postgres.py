@@ -26,6 +26,32 @@ class _FakeTransport:
         self.closed = True
 
 
+class _FakeLogger:
+    """Constructor-injected fake standing in for a host's own LoggingSink (quant-data#20)."""
+
+    def __init__(self) -> None:
+        self.info_calls: list[tuple[str, str]] = []
+        self.perf_calls: list[tuple[str, float]] = []
+
+    def diagnostic(self, message: str, category: str = "general") -> None:
+        pass
+
+    def info(self, message: str, category: str = "general") -> None:
+        self.info_calls.append((message, category))
+
+    def warning(self, message: str, category: str = "general") -> None:
+        pass
+
+    def error(self, message: str, category: str = "general") -> None:
+        pass
+
+    def fatal(self, message: str, category: str = "general") -> None:
+        pass
+
+    def perf(self, description: str, elapsed_seconds: float) -> None:
+        self.perf_calls.append((description, elapsed_seconds))
+
+
 def _connect(mock_psycopg, fetchone_results: list) -> MagicMock:
     mock_connection = MagicMock()
     mock_cursor = MagicMock()
@@ -58,6 +84,32 @@ def test_connect_uses_transports_resolved_host_and_port(mock_psycopg):
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
+def test_connect_normalizes_localhost_to_literal_ipv4(mock_psycopg):
+    # psycopg/libpq resolves the bare hostname "localhost" as dual-stack and can fall back from
+    # an unreachable IPv6 loopback to IPv4 with a very long internal timeout (~130s observed in
+    # practice) instead of connecting immediately -- see quant-data#19.
+    PostgresDatabase(transport=_FakeTransport(host="localhost", port=5433), user="quant_writer", password="x", dbname="quant_data")
+
+    _, connect_kwargs = mock_psycopg.connect.call_args
+    assert connect_kwargs["host"] == "127.0.0.1"
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_injected_logger_receives_connect_info_and_perf_calls(mock_psycopg):
+    # A host application can inject its own LoggingSink (quant-data#20) so quant-data's internal
+    # logging lands in the host's own log stream instead of quant-data's private static Logger.
+    logger = _FakeLogger()
+
+    PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data", logger=logger)
+
+    assert any("Connecting to Postgres" in message for message, _ in logger.info_calls)
+    assert any("Connected to Postgres" in message for message, _ in logger.info_calls)
+    perf_descriptions = [description for description, _ in logger.perf_calls]
+    assert "transport.open()" in perf_descriptions
+    assert "psycopg.connect()" in perf_descriptions
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
 def test_connect_failure_closes_transport(mock_psycopg):
     mock_psycopg.Error = Exception
     mock_psycopg.connect.side_effect = mock_psycopg.Error("boom")
@@ -79,6 +131,20 @@ def test_close_closes_connection_and_transport(mock_psycopg):
 
     mock_connection.close.assert_called_once()
     assert transport.closed is True
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_write_bars_reports_perf_to_injected_logger(mock_psycopg):
+    _connect(mock_psycopg, [(1,), (10,), (20,)])  # ticker_id, date_id, time_id
+    logger = _FakeLogger()
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data", logger=logger)
+    bar = OHLCV(ticker="AAPL", timestamp=datetime(2026, 7, 24, 13, 30), open=1.0, high=2.0, low=0.5, close=1.5, volume=100)
+
+    database.write_bars([bar])
+
+    write_bars_calls = [description for description, _ in logger.perf_calls if description.startswith("write_bars")]
+    assert write_bars_calls == ["write_bars(1 bars)"]
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")

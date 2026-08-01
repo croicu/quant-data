@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import time
 from datetime import date
 
 import psycopg
 
 from quant_data._internal.contracts import ConnectionTransport
-from quant_data.protocols import OHLCV
+from quant_data.protocols import OHLCV, LoggingSink
 
 from .diagnostics import Logger
 from .errors import AppError, DateOutOfRangeError
@@ -22,14 +23,33 @@ class PostgresDatabase:
     Agnostic of how Postgres is actually reached: `transport` resolves that (direct connect vs.
     an SSH tunnel) so this class never needs to know or care about the concrete hosting choice —
     see quant_data._internal.shared.transports.
+
+    `logger` defaults to quant_data's own private `Logger` class (its methods are all
+    `@staticmethod`s, so using the class itself as the default value behaves identically to the
+    direct static calls this replaced). A host application can inject its own `LoggingSink`
+    instead, so quant_data's internal logging lands in the host's own log stream — see
+    quant_data#20.
     """
 
-    def __init__(self, transport: ConnectionTransport, user: str, password: str, dbname: str) -> None:
+    def __init__(self, transport: ConnectionTransport, user: str, password: str, dbname: str, logger: LoggingSink = Logger) -> None:
         self._transport = transport
+        self._logger = logger
+
+        open_started = time.perf_counter()
         effective_host, effective_port = transport.open()
+        self._logger.perf("transport.open()", time.perf_counter() - open_started)
 
-        Logger.info(f"Connecting to Postgres at {effective_host}:{effective_port}/{dbname} as '{user}'...", category=CATEGORY_POSTGRES)
+        if effective_host == "localhost":
+            # psycopg/libpq resolves the bare hostname "localhost" as dual-stack and can fall
+            # back from an unreachable IPv6 loopback to IPv4 with a very long internal timeout
+            # (~130s observed) instead of connecting immediately -- the literal address doesn't
+            # have this ambiguity. Normalized here (not just in SshTunnelTransport) since any
+            # transport/caller could hand back this same problem hostname. See quant-data#19.
+            effective_host = "127.0.0.1"
 
+        self._logger.info(f"Connecting to Postgres at {effective_host}:{effective_port}/{dbname} as '{user}'...", category=CATEGORY_POSTGRES)
+
+        connect_started = time.perf_counter()
         try:
             self._connection = psycopg.connect(
                 host=effective_host,
@@ -47,8 +67,9 @@ class PostgresDatabase:
         except psycopg.Error as error:
             transport.close()
             raise AppError(f"Failed to connect to Postgres at {effective_host}:{effective_port}/{dbname}: {error}") from error
+        self._logger.perf("psycopg.connect()", time.perf_counter() - connect_started)
 
-        Logger.info(f"Connected to Postgres at {effective_host}:{effective_port}/{dbname}.", category=CATEGORY_POSTGRES)
+        self._logger.info(f"Connected to Postgres at {effective_host}:{effective_port}/{dbname}.", category=CATEGORY_POSTGRES)
 
     def close(self) -> None:
         self._connection.close()
@@ -66,12 +87,14 @@ class PostgresDatabase:
             ORDER BY f.timestamp
         """
 
+        started = time.perf_counter()
         try:
             with self._connection.cursor() as cursor:
                 cursor.execute(query, (normalized_ticker, start_date, end_date))
                 rows = cursor.fetchall()
         except psycopg.Error as error:
             raise AppError(f"Failed to fetch bars for '{normalized_ticker}' from {start_date} to {end_date}: {error}") from error
+        self._logger.perf(f"fetch_bars({normalized_ticker}, {start_date.isoformat()}..{end_date.isoformat()})", time.perf_counter() - started)
 
         bars: list[OHLCV] = []
         for row in rows:
@@ -92,6 +115,7 @@ class PostgresDatabase:
 
     def write_bars(self, bars: list[OHLCV]) -> int:
         written = 0
+        started = time.perf_counter()
 
         try:
             with self._connection.cursor() as cursor:
@@ -159,4 +183,5 @@ class PostgresDatabase:
             self._connection.rollback()
             raise AppError(f"Failed to write bars: {error}") from error
 
+        self._logger.perf(f"write_bars({written} bars)", time.perf_counter() - started)
         return written

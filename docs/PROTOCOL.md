@@ -33,9 +33,12 @@ CLI signature and file format schemas for `quant-data`.
 There is no generic `quant-data` command — `quant-ingest` (write side, package `ingest`, outside
 the `quant_data` namespace — no importable surface, console script only) and `quant_data.MarketData`
 (read side — a library, not a CLI) are the two consumer-facing entry points. `MarketData`,
-`OHLCV`, and `create_postgres_provider` are re-exported at the `quant_data` top level
-(`from quant_data import MarketData, OHLCV, create_postgres_provider`); `quant_data._internal.*` is
-private (nested, not a separate package) and should not be imported directly by external consumers.
+`OHLCV`, `LoggingSink`, and `create_postgres_provider` are re-exported at the `quant_data` top level
+(`from quant_data import MarketData, OHLCV, LoggingSink, create_postgres_provider`);
+`quant_data._internal.*` is private (nested, not a separate package) and should not be imported
+directly by external consumers. `LoggingSink` is the injectable logging contract — pass an
+optional `logger=` matching its shape to `create_postgres_provider`/`MarketData` to route
+quant-data's internal logging into your own log stream (see `docs/ARCHITECTURE.md`).
 
 ## File formats
 

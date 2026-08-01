@@ -47,9 +47,13 @@ def test_ssh_tunnel_transport_open_returns_local_forwarded_port(mock_forwarder_c
         ssh_username="alex",
         ssh_pkey="/home/alex/.ssh/id_ed25519",
         remote_bind_address=("localhost", 5432),
+        local_bind_address=("127.0.0.1", 0),
     )
     mock_tunnel.start.assert_called_once()
-    assert (host, port) == ("localhost", 54321)
+    # Must be the literal IPv4 address, not "localhost" -- psycopg/libpq resolves the bare
+    # hostname as dual-stack and can fall back from an unreachable IPv6 loopback with a ~130s
+    # internal timeout instead of connecting immediately (quant-data#19).
+    assert (host, port) == ("127.0.0.1", 54321)
 
 
 @patch("quant_data._internal.shared.transports.ssh_tunnel.SSHTunnelForwarder")

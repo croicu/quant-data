@@ -40,3 +40,33 @@ def test_context_manager_closes_provider_on_exit():
         assert not provider.closed
 
     assert provider.closed
+
+
+def test_accepts_an_injected_logger():
+    # LoggingSink injection (quant-data#20) -- MarketData doesn't log anything of its own yet,
+    # but must accept the parameter without error, matching create_postgres_provider's own
+    # injection point.
+    class _FakeLogger:
+        def diagnostic(self, message: str, category: str = "general") -> None:
+            pass
+
+        def info(self, message: str, category: str = "general") -> None:
+            pass
+
+        def warning(self, message: str, category: str = "general") -> None:
+            pass
+
+        def error(self, message: str, category: str = "general") -> None:
+            pass
+
+        def fatal(self, message: str, category: str = "general") -> None:
+            pass
+
+        def perf(self, description: str, elapsed_seconds: float) -> None:
+            pass
+
+    provider = MockPostgresDatabase()
+
+    client = MarketData(provider, logger=_FakeLogger())
+
+    assert client is not None
