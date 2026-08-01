@@ -124,9 +124,9 @@ consumer repo actually arrives, extend the convention above with:
 ### Task workflow
 
 Tasks are tracked as GitHub issues in this repo, status via labels: `status:brainstorm`,
-`status:implementation`, `status:testing`, `status:ready-to-submit`. There is no `status:done`
-label — reaching Done means closing the issue. (These labels don't exist on a freshly-created
-repo — create them with `gh label create` before the first task needs one.)
+`status:implementation`, `status:testing`, `status:ready-to-submit`, `status:ready-for-integration`.
+There is no `status:done` label — reaching Done means closing the issue. (These labels don't exist
+on a freshly-created repo — create them with `gh label create` before the first task needs one.)
 
 Tasks come in two flavors, which affects whether step 1 below applies:
 
@@ -143,19 +143,29 @@ For any non-trivial feature or change, follow these stages:
 1. **Brainstorm** (planned tasks only) — copy `tasks/new_task.md` to `tasks/<task-name>.md` with the problem statement; update it with conclusions as the design discussion progresses. This is scratch space for live back-and-forth — an issue isn't required at this stage, but a lightweight tracking issue labeled `status:brainstorm` can be opened for backlog visibility if wanted; either way, `tasks/<task-name>.md` (not the issue) stays the working document until the design converges.
 2. **Implementation** — open a GitHub issue (`gh issue create`) with the converged problem statement + conclusions as the body, labeled `status:implementation`. Write the code. For a planned task, `tasks/<task-name>.md` is no longer the source of truth once the issue exists — trim it to a one-line pointer at the issue (or delete it) rather than maintaining both. For an ad-hoc task, there's no file to trim — the issue was the first artifact.
 3. **Testing** — relabel the issue `status:testing`. Verify correctness; post test results and any open issues as an issue comment. **For a `cross-repo` issue that originated from a consumer repo's own testing/diagnosis** (e.g. a bug first noticed running `quant-scratch`'s `day-chart`), quant-data's own verification — even a live check against the real database — confirms the fix works in isolation, but isn't the same as confirming the originally reported symptom is actually resolved: that requires the consumer to pull the updated `quant-data` code and re-test in its own context. Say so explicitly in the comment rather than implying it's fully confirmed.
-4. **Ready to Submit** — relabel `status:ready-to-submit`. Run lint + tests; confirm docs are up to date; post a summary comment. This is as far as *this* repo's own work can confirm the issue — it does not mean the issue is closed (see "Who closes an issue" below).
-5. **Done** — close the issue after merge. For a planned task, delete `tasks/<task-name>.md` once the issue is closed — the issue (body + comments) is the sole source of truth from that point on, so there's no reason to keep a stale duplicate on disk. (Only applies when a real issue holds the full history; a Done task with no issue keeps its local file.) Ad-hoc tasks have nothing to delete.
+4. **Ready to Submit** — relabel `status:ready-to-submit`. Run lint + tests; confirm docs are up to date; post a summary comment. This is as far as *this* repo's own work can confirm the issue.
+5. **Ready for Integration** (`cross-repo` issues that need consumer-side verification only —
+   see "Who closes an issue" below for which issues that is) — once the fix is actually merged/
+   pushed to `main`, relabel `status:ready-for-integration` instead of leaving it at
+   `status:ready-to-submit`. This is the label that actually names the gap: quant-data's own
+   checks (lint/tests/docs, even a live check against the real database) can confirm the fix works
+   in isolation, but not that the originally reported symptom is resolved — that needs the
+   consumer (e.g. `quant-scratch`) to pull the updated `quant-data` and re-test in its own context.
+   An issue with no such downstream dependency (a same-repo bug, nothing cross-repo) skips this
+   stage entirely — `status:ready-to-submit` is already its terminal pre-close state.
+6. **Done** — close the issue after merge. For a planned task, delete `tasks/<task-name>.md` once the issue is closed — the issue (body + comments) is the sole source of truth from that point on, so there's no reason to keep a stale duplicate on disk. (Only applies when a real issue holds the full history; a Done task with no issue keeps its local file.) Ad-hoc tasks have nothing to delete.
 
 **Who closes an issue**: applies to issues opened "in the family" — by the repo owner themselves
 (directly, or via a cross-repo issue from one of their own other repos like `quant-scratch`) —
 which is the normal case today, since there are no external contributors yet. In that case,
 whoever opened it is the one who closes it, not automatically whoever did the implementation work:
-leave it open at `status:ready-to-submit` once the fix is pushed and say so; don't close it, and
-don't use GitHub's auto-closing commit-message keywords (`Closes #N`, `Fixes #N`, `Resolves #N`)
-for it, since those close on push regardless of who's supposed to have that call — use a
-non-closing reference instead (`Ref #N`, `Part of #N`, `Addresses #N`). This matters most for
-`cross-repo` issues diagnosed from a consumer's own testing: the opener is the one positioned to
-actually verify the fix in that original context, so closing is their call, not a mechanical side
+leave it open (at `status:ready-for-integration` once pushed, if it needed that stage; otherwise
+`status:ready-to-submit`) and say so; don't close it, and don't use GitHub's auto-closing
+commit-message keywords (`Closes #N`, `Fixes #N`, `Resolves #N`) for it, since those close on push
+regardless of who's supposed to have that call — use a non-closing reference instead (`Ref #N`,
+`Part of #N`, `Addresses #N`). This matters most for `cross-repo` issues diagnosed from a
+consumer's own testing: the opener is the one positioned to actually verify the fix in that
+original context, so closing is their call, not a mechanical side
 effect of merging. The one exception even within the family: an issue Claude opened itself mid-task
 (e.g. a `status:implementation` issue opened while executing a planned/ad-hoc task in this same
 session) can be closed directly, since Claude is the opener there.
@@ -295,8 +305,8 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 ## Pending Tasks
 
 - **Fix ~130s SSH-tunnel connect stall; add `Logger.perf()` timing markers** — issue #19, opened by
-  the repo owner from `quant-scratch`-side testing. `status:ready-to-submit`, fix pushed to `main`
-  as `cd424a0` — **left open**, per this file's "Who closes an issue" rule:
+  the repo owner from `quant-scratch`-side testing. `status:ready-for-integration`, fix pushed to
+  `main` as `cd424a0` — **left open**, per this file's "Who closes an issue" rule:
   the opener verifies (once `quant-scratch` syncs to the new `quant-data` and confirms `day-chart`
   is actually fast) and closes it themselves, not automatically on merge.
   `SshTunnelTransport.open()` returned the bare hostname `"localhost"`, which `psycopg`/libpq
@@ -314,8 +324,8 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   Verified live against CroicuWS1 (quant-data's own side only): 130s -> 1.4s for tunnel + connect.
 
 - **Injectable `LoggingSink` so a host application can see quant-data's internal logging** —
-  issue #20 (split from #19), opened by the repo owner. `status:ready-to-submit`, fix pushed to
-  `main` as `cd424a0` — **left open**, same reason as #19 above:
+  issue #20 (split from #19), opened by the repo owner. `status:ready-for-integration`, fix pushed
+  to `main` as `cd424a0` — **left open**, same reason as #19 above:
   `quant-scratch` needs to actually wire up its own `Logger` via the new `logger=` param before the
   opener can confirm the unified stream works end-to-end. quant-data's `Logger` was entirely
   private, so its own internal log calls (e.g. the `Logger.perf()` markers #19 just added) were
