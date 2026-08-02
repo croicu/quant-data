@@ -294,13 +294,23 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **File**: [IBKR provider reconciliation](tasks/ibkr-provider-reconciliation.md)
 - **Status**: Brainstorm overall (design converged on `dim_provider`/staging/reconciliation
   approach, several pieces still open — tolerance config, manual resolution UI, reputation
-  schema); its schema-only first slice is `status:implementation` as issue #18, migration drafted
-  (`migrations/003_add_dim_provider_and_staging.sql`), not yet applied to the real database
+  schema, "currently configured providers" scope). Schema-only slice closed (issue #18, migration
+  `003_add_dim_provider_and_staging.sql` applied to the real database). Fetch-only `IBKRIntraDay`
+  provider built and tested (`status:implementation` as issue #21, not closed) — deliberately held
+  there rather than `status:ready-to-submit`: it's not wired into `ingest` yet, so on its own it
+  doesn't unblock `quant-scratch`'s integration. **Issue #21 is blocked on issue #22** (wiring
+  `IBKRIntraDay` + `YahooFinanceIntraDay` into `ingest`, writing to `staging_market_data_1min`),
+  which is `status:brainstorm` — several open questions (settings shape for IBKR
+  host/port/client_id, "currently configured providers" scope, new staging-write DB method, where
+  in the CLI this plugs in) need resolving before implementation starts.
 - **Key Context**: Goal is running IBKR alongside Yahoo Finance and reconciling the two (not
   swapping one for the other) — they won't necessarily agree bar-for-bar. IBKR's real and paper
   accounts share a single `dim_provider` row (`'ibkr'`), since they return identical data for
   research purposes. `fact_market_data_1min` stays untouched by design (no cross-repo impact);
   `staging_market_data_1min` is where each provider writes independently before reconciliation.
+  `IBKRIntraDay` (`src/quant_data/_internal/shared/providers/ibkr.py`) uses a long-lived
+  `connect()`/`close()` lifecycle (not connect-per-call) so it can be amortized across a batch
+  ingest run once #22 wires it in.
 
 ## Pending Tasks
 

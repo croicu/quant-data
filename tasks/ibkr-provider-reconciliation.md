@@ -1,6 +1,7 @@
 # IBKR Provider Reconciliation
 
-## Status: Brainstorm (schema-only slice done — see issue #18, ready-to-submit)
+## Status: Brainstorm (schema-only slice done — issue #18, ready-to-submit; IBKR `IntraDayProvider`
+slice done — issue #21, ready-to-submit)
 
 ## Problem statement
 
@@ -135,6 +136,34 @@ IBKR `IntraDayProvider` and reconciliation logic are separate, later work):
    cross-linking back to this task file for the broader reconciliation context — same pattern as
    issue #12 (`--catch-up`) was split out of `tasks/scheduled_jobs.md`.
 
+## Implementation plan (IBKR `IntraDayProvider` slice, issue #21)
+
+Scoped narrower than this file's full reconciliation design, same pattern as #18's schema-only
+slice: build the fetch-only provider, leave staging writes/reconciliation for a later issue.
+
+- **Fetch-only, not wired into `ingest`.** `IBKRIntraDay` (`providers/ibkr.py`) implements
+  `IntraDayProvider.fetch_bars`, symmetric to `YahooFinanceIntraDay`, covered by unit tests plus a
+  live integration test against a real IB Gateway. `ingest/cli.py` still only constructs
+  `YahooFinanceIntraDay` by default — running both providers per `--catch-up` and writing to
+  `staging_market_data_1min` is deferred to whichever issue actually wires up reconciliation
+  (needs the still-open questions below resolved first: tolerance config shape, "which providers
+  are currently configured," etc.).
+- **Long-lived connection across a batch**, not connect-per-call like `quant-scratch`'s validated
+  approach. `connect()`/`close()` are explicit and separate from `fetch_bars()`, since IBKR's
+  connection handshake is expensive enough to amortize across many (ticker, date) fetches once
+  this is wired into a batch ingest run — `fetch_bars()` raises `AppError` if called before
+  `connect()`.
+- **`fetchFields=StartupFetchNONE`** on `connect()` skips `ib_async`'s default positions/orders/
+  account-updates fetch, which a Read-Only-API Gateway (the correct setting for data-only ingest)
+  otherwise rejects — the ~10s-per-connection quirk `quant-scratch` already found and fixed.
+- **No zero-volume-as-incomplete heuristic** (unlike `YahooFinanceIntraDay`): IBKR only returns
+  bars it actually has trade data for, so a zero-volume bar is a real "no trades that minute"
+  fact, not a synthesized placeholder.
+- **Ingest-scale pacing** (IBKR's documented 60 requests/10 minutes ceiling) was flagged by
+  `quant-scratch` as worth a real test at batch scale — still untested here too, since this slice
+  doesn't wire into a real batch run yet. Revisit once `ingest` actually drives this provider
+  across many tickers/dates.
+
 ## Test results
 
 **Schema-only slice (issue #18): done.** Applied to the real CroicuWS1 database via `psql` as
@@ -143,6 +172,18 @@ IBKR `IntraDayProvider` and reconciliation logic are separate, later work):
 with `yfinance`/`ibkr`, `staging_market_data_1min`'s columns/PK/index/FKs all match the design. No
 automated tests (no Python code changed).
 
-Rest of this brainstorm (tolerance config, manual resolution mechanism, reputation table, the
-IBKR `IntraDayProvider` itself) remains open — this file stays as the working document for that,
-not deleted, the same way `tasks/scheduled_jobs.md` survived `--catch-up` (#12) closing.
+**IBKR `IntraDayProvider` slice (issue #21): done.** 11 unit tests (mocked `ib_async`) covering
+connect/close lifecycle, the not-connected/unqualified-contract/no-bars/provider-exception error
+paths, and OHLCV mapping (including the no-incomplete-heuristic behavior). Live integration test
+(`tests/integration/test_ibkr.py`) run against a real local IB Gateway (paper, port 4002) —
+fetched 960 real 1-minute bars for SPY on 2026-07-31, only 40/960 zero-volume, versus the
+practically-all-zero-volume premarket gap that motivated this work
+(`Yahoo`: 315/315 zero-volume premarket bars for the same symbol/date, per issue #21). `ruff
+format`/`ruff check` clean, full `pytest` suite (88 tests) passes — though
+`tests/integration/test_ibkr.py` specifically requires a locally running IB Gateway/TWS at
+`127.0.0.1:4002` to pass, unlike the Yahoo integration test which only needs network access.
+
+Rest of this brainstorm (tolerance config, manual resolution mechanism, reputation table, wiring
+both providers into `--catch-up` + staging, and the reconciliation logic itself) remains open —
+this file stays as the working document for that, not deleted, the same way
+`tasks/scheduled_jobs.md` survived `--catch-up` (#12) closing.

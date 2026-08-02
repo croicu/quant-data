@@ -194,11 +194,11 @@ independent top-level packages.
   `incomplete=True` (with the value coerced to `0`/`0.0`) whenever `yfinance` returns `NaN` for
   any OHLCV field, or a literal `0` for volume — a real tick can't have zero volume, so `yfinance`
   reporting either NaN or a literal 0 both signal the same underlying problem (most commonly
-  pre-market/after-hours minutes with no trades recorded). This is today's provider, not
-  necessarily the long-term one — `quant-scratch`'s IBKR work (`tasks/ibkr_tws_extended_hours.md`)
-  is the eventually-intended intraday source; `ingest` depends on `IntraDayProvider`, not on
-  `YahooFinanceIntraDay` concretely, so swapping providers later doesn't touch `ingest/cli.py`'s
-  logic.
+  pre-market/after-hours minutes with no trades recorded). This is `ingest`'s default provider
+  today, not the only one anymore — see `providers/ibkr.py` below, added to close exactly this
+  pre-/after-market zero-volume gap, though not yet wired into `ingest` as an alternative/second
+  source; `ingest` depends on `IntraDayProvider`, not on `YahooFinanceIntraDay` concretely, so
+  swapping/adding providers doesn't touch `ingest/cli.py`'s logic.
 - `providers/yfinance_logging.py` — redirects `yfinance`'s own diagnostics (it logs through the
   stdlib `logging` module, e.g. `logging.getLogger('yfinance')`, rather than raising or going
   through our `Logger`) into `Logger` instead of letting them print straight to stderr.
@@ -215,6 +215,29 @@ independent top-level packages.
   second handler if the module is imported more than once). All of this is additive — it doesn't
   change `_ingest_one`'s own existing fetch/write failure logging (see the `ingest` section below);
   see `tasks/ingest_error_classification.md` for whether the two should eventually be related.
+- `providers/ibkr.py` — `IBKRIntraDay`, an `IntraDayProvider` implementation wrapping `ib_async`
+  (the maintained fork of the archived `ib_insync`), ported from `quant-scratch`'s
+  `shared/providers/ibkr.py` (see croicu/quant-scratch#11/#12). Connects to a local IB Gateway/TWS
+  (`127.0.0.1:4002` by default, IB Gateway's paper port) and fetches 1-minute `TRADES` bars
+  (`useRTH=False`, i.e. including pre-/after-market) via `reqHistoricalData`, ending each session
+  day at 20:00 America/New_York. Unlike `YahooFinanceIntraDay`'s stateless per-call HTTP fetch,
+  IBKR's connection handshake is expensive enough to amortize across a batch, so `connect()`/
+  `close()` are explicit and separate from `fetch_bars()` — a caller connects once, fetches many
+  (ticker, date) pairs, then closes; `fetch_bars()` raises `AppError` if called before `connect()`.
+  `connect()` passes `fetchFields=StartupFetchNONE` to skip `ib_async`'s default positions/open-
+  and-completed-orders/account-updates fetch, which a Read-Only-API Gateway (the correct setting
+  for data-only ingest) otherwise rejects — costing ~10s per connection waiting for that fetch to
+  time out. No zero-volume-as-incomplete heuristic (unlike Yahoo's): IBKR only returns bars it
+  actually has trade data for, so a zero-volume bar is a real "no trades that minute" fact, not a
+  synthesized placeholder — this is exactly the gap `YahooFinanceIntraDay` has (see the `ingest`
+  section's IBKR note below) that motivated adding this provider. **Fetch-only, not yet wired into
+  `ingest`**: this class exists and is tested (`tests/unit/test_ibkr.py`, plus a live
+  `tests/integration/test_ibkr.py` probe against a real Gateway), but `cli.py` still only
+  constructs `YahooFinanceIntraDay` by default — wiring both providers into `--catch-up` alongside
+  `staging_market_data_1min` writes and reconciliation is later work per
+  `tasks/ibkr-provider-reconciliation.md`. Requires a running IB Gateway/TWS reachable at the
+  configured host/port to actually connect — `tests/integration/test_ibkr.py` will fail (not skip)
+  without one, same as any other integration test in this repo hitting a real external dependency.
 
 ### `ingest`
 
@@ -251,12 +274,13 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
   under `ingest` — so the two are attributable/filterable independently, even though both still
   count the same toward the exit code today (see `tasks/ingest_error_classification.md` for the
   postponed work on making that distinction affect the exit code itself).
-- No IBKR `IntraDayProvider` yet — the actual goal (see `tasks/ibkr-provider-reconciliation.md`)
-  is running IBKR alongside Yahoo Finance and reconciling the two, not swapping one for the other,
-  since they won't necessarily agree bar-for-bar. `003_add_dim_provider_and_staging` laid the
-  schema groundwork for this (`dim_provider`, `staging_market_data_1min` — see `docs/SCHEMA.md`),
-  but no Python code consumes either table yet; the `IntraDayProvider` implementation and
-  reconciliation logic itself remain unaddressed, tracked in that task file.
+- `providers/ibkr.py`'s `IBKRIntraDay` exists now (issue #21) but isn't wired into `ingest` here —
+  the actual goal (see `tasks/ibkr-provider-reconciliation.md`) is running IBKR alongside Yahoo
+  Finance and reconciling the two, not swapping one for the other, since they won't necessarily
+  agree bar-for-bar. `003_add_dim_provider_and_staging` laid the schema groundwork for this
+  (`dim_provider`, `staging_market_data_1min` — see `docs/SCHEMA.md`), but no Python code consumes
+  either table yet; running both providers in `--catch-up` and the reconciliation logic itself
+  remain unaddressed, tracked in that task file.
 
 ### `quant_data.client`
 
