@@ -8,6 +8,7 @@ from quant_data.protocols import OHLCV
 class MockPostgresDatabase:
     def __init__(self) -> None:
         self.written_bars: list[OHLCV] = []
+        self.written_staging_bars: list[tuple[str, OHLCV]] = []
         self.closed = False
 
     def fetch_bars(self, ticker: str, start_date: date, end_date: date) -> list[OHLCV]:
@@ -23,6 +24,12 @@ class MockPostgresDatabase:
     def write_bars(self, bars: list[OHLCV]) -> int:
         for bar in bars:
             self.written_bars.append(bar)
+
+        return len(bars)
+
+    def write_staging_bars(self, provider_name: str, bars: list[OHLCV]) -> int:
+        for bar in bars:
+            self.written_staging_bars.append((provider_name, bar))
 
         return len(bars)
 

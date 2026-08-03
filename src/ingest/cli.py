@@ -12,11 +12,20 @@ from quant_data._internal.contracts import IntraDayProvider
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
+from quant_data._internal.shared.providers.ibkr import CATEGORY_IBKR, IBKRIntraDay
 from quant_data._internal.shared.providers.yfinance import CATEGORY_YFINANCE, YahooFinanceIntraDay
 from quant_data._internal.shared.settings import PostgresSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
 
 CATEGORY_INGEST = "ingest"
+
+# Per-provider fetch-failure log category, so a Yahoo vs. IBKR fetch problem stays filterable
+# apart from a Postgres write problem -- same reasoning _ingest_one's own comment gives for
+# keeping fetch/write failures logged separately in the first place.
+_FETCH_FAILURE_CATEGORY: dict[str, str] = {
+    "yfinance": CATEGORY_YFINANCE,
+    "ibkr": CATEGORY_IBKR,
+}
 
 
 @dataclass
@@ -112,51 +121,79 @@ def _default_database_factory(postgres_settings: PostgresSettings) -> PostgresDa
     )
 
 
-def _ingest_one(provider: IntraDayProvider, database: PostgresDatabase, ticker: str, target_date: date_type) -> int | None:
+def _build_provider(name: str, settings: Settings) -> IntraDayProvider:
+    if name == "yfinance":
+        return YahooFinanceIntraDay()
+    if name == "ibkr":
+        return IBKRIntraDay(host=settings.ibkr.host, port=settings.ibkr.port, client_id=settings.ibkr.client_id)
+    raise AppError(f"Unknown provider '{name}' in settings.providers -- expected one of: yfinance, ibkr.")
+
+
+def _default_providers(settings: Settings) -> dict[str, IntraDayProvider]:
+    providers: dict[str, IntraDayProvider] = {}
+    for name in settings.providers:
+        providers[name] = _build_provider(name, settings)
+    return providers
+
+
+def _ingest_one(providers: dict[str, IntraDayProvider], database: PostgresDatabase, ticker: str, target_date: date_type) -> int | None:
     # Fetch and write failures are logged separately (rather than one catch-all at the call
     # site) so the log category actually reflects where the failure came from -- both raise the
-    # same AppError type, so a single shared catch couldn't tell a Yahoo Finance fetch problem
-    # (e.g. a weekend, or a bad ticker -- indistinguishable from each other today) apart from a
-    # Postgres write problem (e.g. a date outside the populated dim_date range).
+    # same AppError type, so a single shared catch couldn't tell a fetch problem (e.g. a weekend,
+    # or a bad ticker -- indistinguishable from each other today) apart from a Postgres write
+    # problem (e.g. a date outside the populated dim_date range). Each configured provider writes
+    # independently to staging_market_data_1min, blind to what other providers wrote for the same
+    # bar -- one provider failing (bad ticker on that source, gateway unreachable, ...) doesn't
+    # stop the others from still writing their own data for this (ticker, date).
     Logger.diagnostic(
         f"quant-ingest: starting {ticker.upper()} on {target_date.isoformat()}.",
         category=CATEGORY_INGEST,
     )
 
-    try:
-        bars = provider.fetch_bars(ticker, target_date)
-    except AppError as error:
-        Logger.warning(
-            f"quant-ingest: failed to fetch '{ticker.upper()}' on {target_date.isoformat()}: {error}",
-            category=CATEGORY_YFINANCE,
-        )
-        return None
+    total_written = 0
+    total_incomplete = 0
+    any_provider_succeeded = False
 
-    try:
-        written = database.write_bars(bars)
-    except AppError as error:
-        Logger.warning(
-            f"quant-ingest: failed to write '{ticker.upper()}' on {target_date.isoformat()}: {error}",
-            category=CATEGORY_INGEST,
-        )
-        return None
+    for provider_name, provider in providers.items():
+        try:
+            bars = provider.fetch_bars(ticker, target_date)
+        except AppError as error:
+            Logger.warning(
+                f"quant-ingest: failed to fetch '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
+                category=_FETCH_FAILURE_CATEGORY.get(provider_name, CATEGORY_INGEST),
+            )
+            continue
 
-    incomplete_count = 0
-    for bar in bars:
-        if bar.incomplete:
-            incomplete_count += 1
+        try:
+            written = database.write_staging_bars(provider_name, bars)
+        except AppError as error:
+            Logger.warning(
+                f"quant-ingest: failed to write staging bars for '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
+                category=CATEGORY_INGEST,
+            )
+            continue
+
+        any_provider_succeeded = True
+        total_written += written
+        for bar in bars:
+            if bar.incomplete:
+                total_incomplete += 1
+
+    if not any_provider_succeeded:
+        return None
 
     Logger.info(
-        f"quant-ingest: wrote {written} bars for {ticker.upper()} on {target_date.isoformat()} ({incomplete_count} incomplete).",
+        f"quant-ingest: wrote {total_written} staging bars for {ticker.upper()} on {target_date.isoformat()} "
+        f"across {len(providers)} provider(s) ({total_incomplete} incomplete).",
         category=CATEGORY_INGEST,
     )
-    return written
+    return total_written
 
 
 def main(
     argv: list[str] | None = None,
     settings_path: Path | None = None,
-    provider: IntraDayProvider | None = None,
+    providers: dict[str, IntraDayProvider] | None = None,
     database_factory: Callable[[PostgresSettings], PostgresDatabase] | None = None,
     today: Callable[[], date_type] | None = None,
 ) -> int:
@@ -209,7 +246,27 @@ def main(
 
         target_dates = _date_range(effective_start_date, effective_end_date)
 
-        active_provider = provider if provider is not None else YahooFinanceIntraDay()
+        active_providers = providers if providers is not None else _default_providers(settings)
+
+        # Connect once per batch (see IntraDayProvider.connect()'s own docstring) rather than
+        # per-call -- a provider that fails to connect (e.g. IBKR Gateway not running) is dropped
+        # for the rest of this run instead of aborting it, matching the per-(ticker, date)
+        # fetch/write tolerance below.
+        connected_providers: dict[str, IntraDayProvider] = {}
+        for provider_name, provider_instance in active_providers.items():
+            try:
+                provider_instance.connect()
+            except AppError as error:
+                Logger.warning(
+                    f"quant-ingest: failed to connect provider '{provider_name}': {error}",
+                    category=_FETCH_FAILURE_CATEGORY.get(provider_name, CATEGORY_INGEST),
+                )
+                continue
+            connected_providers[provider_name] = provider_instance
+
+        if not connected_providers:
+            raise AppError("No configured provider could connect -- check settings.providers and each provider's connection settings.")
+
         active_database_factory = database_factory if database_factory is not None else _default_database_factory
 
         database = active_database_factory(settings.postgres)
@@ -218,13 +275,15 @@ def main(
         try:
             for target_date in target_dates:
                 for ticker in tickers:
-                    written = _ingest_one(active_provider, database, ticker, target_date)
+                    written = _ingest_one(connected_providers, database, ticker, target_date)
                     if written is None:
                         failed.append((ticker, target_date))
                     else:
                         succeeded.append((ticker, target_date))
         finally:
             database.close()
+            for provider_instance in connected_providers.values():
+                provider_instance.close()
 
         Logger.info(f"quant-ingest: completed ({len(succeeded)} succeeded, {len(failed)} failed).")
         return 1 if failed else 0

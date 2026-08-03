@@ -27,6 +27,15 @@ def _safe_int(value: float) -> tuple[int, bool]:
 
 
 class YahooFinanceIntraDay:
+    def connect(self) -> None:
+        # Stateless per-call HTTP fetch -- no persistent connection to establish, unlike
+        # IBKRIntraDay. Satisfies IntraDayProvider's connect()/close() lifecycle as a no-op so
+        # ingest can treat every provider uniformly.
+        pass
+
+    def close(self) -> None:
+        pass
+
     def fetch_bars(self, ticker: str, target_date: date) -> list[OHLCV]:
         normalized_ticker = ticker.upper()
         start = datetime.combine(target_date, datetime.min.time())

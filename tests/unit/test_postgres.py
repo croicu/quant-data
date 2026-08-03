@@ -187,3 +187,73 @@ def test_write_bars_rolls_back_on_missing_dim_time(mock_psycopg):
 
     mock_connection.rollback.assert_called_once()
     mock_connection.commit.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_write_staging_bars_commits_on_success(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [(5,), (1,), (10,), (20,)])  # provider_id, ticker_id, date_id, time_id
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+    bar = OHLCV(ticker="AAPL", timestamp=datetime(2026, 7, 24, 13, 30), open=1.0, high=2.0, low=0.5, close=1.5, volume=100)
+
+    written = database.write_staging_bars("ibkr", [bar])
+
+    assert written == 1
+    mock_connection.commit.assert_called_once()
+    mock_connection.rollback.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_write_staging_bars_raises_on_unknown_provider(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [None])  # no dim_provider row for this name
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+    bar = OHLCV(ticker="AAPL", timestamp=datetime(2026, 7, 24, 13, 30), open=1.0, high=2.0, low=0.5, close=1.5, volume=100)
+
+    with pytest.raises(AppError):
+        database.write_staging_bars("not-a-real-provider", [bar])
+
+    mock_connection.rollback.assert_called_once()
+    mock_connection.commit.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_write_staging_bars_rolls_back_on_missing_dim_date(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [(5,), (1,), None])  # provider_id, ticker_id ok, date_id missing
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+    bar = OHLCV(ticker="AAPL", timestamp=datetime(2026, 7, 24, 13, 30), open=1.0, high=2.0, low=0.5, close=1.5, volume=100)
+
+    with pytest.raises(DateOutOfRangeError):
+        database.write_staging_bars("ibkr", [bar])
+
+    mock_connection.rollback.assert_called_once()
+    mock_connection.commit.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_write_staging_bars_lowercases_provider_name(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [(5,), (1,), (10,), (20,)])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+    bar = OHLCV(ticker="AAPL", timestamp=datetime(2026, 7, 24, 13, 30), open=1.0, high=2.0, low=0.5, close=1.5, volume=100)
+
+    database.write_staging_bars("IBKR", [bar])
+
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    first_call_args = mock_cursor.execute.call_args_list[0].args
+    assert first_call_args[1] == ("ibkr",)
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_write_staging_bars_reports_perf_to_injected_logger(mock_psycopg):
+    _connect(mock_psycopg, [(5,), (1,), (10,), (20,)])
+    logger = _FakeLogger()
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data", logger=logger)
+    bar = OHLCV(ticker="AAPL", timestamp=datetime(2026, 7, 24, 13, 30), open=1.0, high=2.0, low=0.5, close=1.5, volume=100)
+
+    database.write_staging_bars("ibkr", [bar])
+
+    perf_descriptions = [description for description, _ in logger.perf_calls]
+    assert "write_staging_bars(ibkr, 1 bars)" in perf_descriptions

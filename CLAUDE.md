@@ -291,26 +291,31 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
-- **File**: [IBKR provider reconciliation](tasks/ibkr-provider-reconciliation.md)
-- **Status**: Brainstorm overall (design converged on `dim_provider`/staging/reconciliation
-  approach, several pieces still open — tolerance config, manual resolution UI, reputation
-  schema, "currently configured providers" scope). Schema-only slice closed (issue #18, migration
-  `003_add_dim_provider_and_staging.sql` applied to the real database). Fetch-only `IBKRIntraDay`
-  provider built and tested (`status:implementation` as issue #21, not closed) — deliberately held
-  there rather than `status:ready-to-submit`: it's not wired into `ingest` yet, so on its own it
-  doesn't unblock `quant-scratch`'s integration. **Issue #21 is blocked on issue #22** (wiring
-  `IBKRIntraDay` + `YahooFinanceIntraDay` into `ingest`, writing to `staging_market_data_1min`),
-  which is `status:brainstorm` — several open questions (settings shape for IBKR
-  host/port/client_id, "currently configured providers" scope, new staging-write DB method, where
-  in the CLI this plugs in) need resolving before implementation starts.
+- **File**: [quant-reconcile](tasks/quant-reconcile.md) (successor to
+  [IBKR provider reconciliation](tasks/ibkr-provider-reconciliation.md), which stays as historical
+  context for the now-closed-out schema/provider/wiring slices below)
+- **Status**: Brainstorm. `dim_provider`/staging schema (#18), the fetch-only `IBKRIntraDay`
+  provider (#21, `status:implementation`, not closed), and wiring both providers into `ingest`
+  (#22, `status:ready-to-submit`, live-verified against CroicuWS1 — 50,318 real staging rows) are
+  all done. What's left is `quant-reconcile` itself — a new CLI, `src/reconcile/cli.py` (mirrors
+  `src/ingest/`'s shape: console script only, no importable surface), that reads
+  `staging_market_data_1min` and promotes agreeing bars into `fact_market_data_1min`. Not started —
+  blocked on three open design questions in `tasks/quant-reconcile.md`: tolerance-configuration
+  shape (settings.json vs. a dedicated config vs. a DB table), the manual `settlement`-resolution
+  mechanism (CLI subcommand vs. direct SQL vs. something else), and the provider-reputation-event
+  table's exact schema.
 - **Key Context**: Goal is running IBKR alongside Yahoo Finance and reconciling the two (not
-  swapping one for the other) — they won't necessarily agree bar-for-bar. IBKR's real and paper
-  accounts share a single `dim_provider` row (`'ibkr'`), since they return identical data for
-  research purposes. `fact_market_data_1min` stays untouched by design (no cross-repo impact);
-  `staging_market_data_1min` is where each provider writes independently before reconciliation.
-  `IBKRIntraDay` (`src/quant_data/_internal/shared/providers/ibkr.py`) uses a long-lived
-  `connect()`/`close()` lifecycle (not connect-per-call) so it can be amortized across a batch
-  ingest run once #22 wires it in.
+  swapping one for the other) — they won't necessarily agree bar-for-bar. `quant-ingest` now
+  writes *only* to staging (never `fact_market_data_1min` directly, as of #22) — every configured
+  provider (`settings.providers`, global list, default `["yfinance"]`) writes its own bars there
+  independently, keyed by `provider_id`; `fact_market_data_1min` goes stale after a normal
+  `quant-ingest` run until `quant-reconcile` exists and is actually run. `IBKRIntraDay`
+  (`src/quant_data/_internal/shared/providers/ibkr.py`) uses a long-lived `connect()`/`close()`
+  lifecycle (not connect-per-call), now part of `IntraDayProvider` itself since `ingest`
+  orchestrates every configured provider's lifecycle uniformly. Filed but not fixed: #23, the
+  per-bar write path (`write_bars`/`write_staging_bars`) being slow at ingest scale (unbatched
+  round trips) — batching the insert + caching `dim_time`/`dim_date` in memory is the leading
+  direction, not implemented.
 
 ## Pending Tasks
 

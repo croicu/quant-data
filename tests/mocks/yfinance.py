@@ -14,6 +14,14 @@ class MockIntraDayProvider:
     def __init__(self, data_path: Path = DEFAULT_DATA_PATH) -> None:
         with data_path.open("r", encoding="utf-8") as f:
             self._bars_by_ticker: dict = json.load(f)
+        self.connected = False
+        self.closed = False
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def close(self) -> None:
+        self.closed = True
 
     def fetch_bars(self, ticker: str, target_date: date) -> list[OHLCV]:
         normalized_ticker = ticker.upper()

@@ -112,9 +112,14 @@ independent top-level packages.
   `PostgresDatabase` concretely) and that `PostgresDatabase` implements (via
   `create_postgres_provider`) — not something external consumers import directly, since they use
   `MarketData` plus a factory instead.
-- `IntraDayProvider(Protocol)`: `fetch_bars(ticker, target_date) -> list[OHLCV]` for a single
-  session day. The ingest-side contract for external data sources — `ingest` depends on this
-  abstraction, not concretely on whichever provider is plugged in.
+- `IntraDayProvider(Protocol)`: `connect() -> None`, `fetch_bars(ticker, target_date) ->
+  list[OHLCV]` for a single session day, and `close() -> None`. The ingest-side contract for
+  external data sources — `ingest` depends on this abstraction, not concretely on whichever
+  provider(s) are plugged in. `connect()`/`close()` were added alongside `IBKRIntraDay` (issue
+  #21/#22): a no-op for a stateless per-call fetcher like `YahooFinanceIntraDay`, but real
+  lifecycle methods for a provider with an expensive connection handshake to amortize across a
+  batch — `ingest` calls `connect()` once per provider at the start of a run and `close()` once at
+  the end, uniformly across every configured provider.
 - `ConnectionTransport(Protocol)`: `open() -> tuple[str, int]` (establish whatever's needed to
   reach Postgres, returning the `(host, port)` to connect to) plus `close() -> None`. Introduced so
   `PostgresDatabase` never needs to know *how* Postgres is actually reached (direct TCP vs. an SSH
@@ -195,10 +200,11 @@ independent top-level packages.
   any OHLCV field, or a literal `0` for volume — a real tick can't have zero volume, so `yfinance`
   reporting either NaN or a literal 0 both signal the same underlying problem (most commonly
   pre-market/after-hours minutes with no trades recorded). This is `ingest`'s default provider
-  today, not the only one anymore — see `providers/ibkr.py` below, added to close exactly this
-  pre-/after-market zero-volume gap, though not yet wired into `ingest` as an alternative/second
-  source; `ingest` depends on `IntraDayProvider`, not on `YahooFinanceIntraDay` concretely, so
-  swapping/adding providers doesn't touch `ingest/cli.py`'s logic.
+  (`settings.providers` defaults to `["yfinance"]`), not the only one anymore — see
+  `providers/ibkr.py` below, added to close exactly this pre-/after-market zero-volume gap and
+  wired in as an additional configured provider (issue #22); `ingest` depends on
+  `IntraDayProvider`, not on `YahooFinanceIntraDay` concretely, so adding/swapping providers is a
+  `settings.providers` change, not a code change to `ingest/cli.py`'s logic.
 - `providers/yfinance_logging.py` — redirects `yfinance`'s own diagnostics (it logs through the
   stdlib `logging` module, e.g. `logging.getLogger('yfinance')`, rather than raising or going
   through our `Logger`) into `Logger` instead of letting them print straight to stderr.
@@ -229,23 +235,30 @@ independent top-level packages.
   for data-only ingest) otherwise rejects — costing ~10s per connection waiting for that fetch to
   time out. No zero-volume-as-incomplete heuristic (unlike Yahoo's): IBKR only returns bars it
   actually has trade data for, so a zero-volume bar is a real "no trades that minute" fact, not a
-  synthesized placeholder — this is exactly the gap `YahooFinanceIntraDay` has (see the `ingest`
-  section's IBKR note below) that motivated adding this provider. **Fetch-only, not yet wired into
-  `ingest`**: this class exists and is tested (`tests/unit/test_ibkr.py`, plus a live
-  `tests/integration/test_ibkr.py` probe against a real Gateway), but `cli.py` still only
-  constructs `YahooFinanceIntraDay` by default — wiring both providers into `--catch-up` alongside
-  `staging_market_data_1min` writes and reconciliation is later work per
-  `tasks/ibkr-provider-reconciliation.md`. Requires a running IB Gateway/TWS reachable at the
-  configured host/port to actually connect — `tests/integration/test_ibkr.py` will fail (not skip)
-  without one, same as any other integration test in this repo hitting a real external dependency.
+  synthesized placeholder — this is exactly the gap `YahooFinanceIntraDay` has that motivated
+  adding this provider. Tested via `tests/unit/test_ibkr.py` plus a live
+  `tests/integration/test_ibkr.py` probe against a real Gateway (requires one running and
+  reachable at the configured host/port — that test fails, not skips, without one, same as any
+  other integration test in this repo hitting a real external dependency). **Wired into `ingest`**
+  as of issue #22 — add `"ibkr"` to `settings.providers` to have `quant-ingest` run it alongside
+  (or instead of) `YahooFinanceIntraDay`; see the `ingest` section below for how `settings.providers`
+  and `settings.ibkr` control this. Reconciliation itself (staging -> `fact_market_data_1min`) is
+  still separate, later work — see `tasks/ibkr-provider-reconciliation.md`.
 
 ### `ingest`
 
 `cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER]`:
-fetches bars over an inclusive date range via an injected `IntraDayProvider` (defaults to
-`YahooFinanceIntraDay`) and writes them via an injected `PostgresDatabase` factory (defaults to
-constructing one from `settings.postgres`). Both dependencies are constructor-injectable per this
-repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mocks/yfinance.py`,
+fetches bars over an inclusive date range from every provider named in `settings.providers`
+(default `["yfinance"]`; `IntraDayProvider` instances built by `_build_provider`/
+`_default_providers`, or injected directly via `main`'s `providers: dict[str, IntraDayProvider]`
+parameter) and writes each provider's bars into `staging_market_data_1min` via an injected
+`PostgresDatabase` factory (defaults to constructing one from `settings.postgres`). **Writes go to
+staging only** — `quant-ingest` never writes `fact_market_data_1min` directly (issue #22); a
+separate, not-yet-built `quant-reconcile` tool owns promoting agreeing staging rows into
+`fact_market_data_1min` (see `tasks/ibkr-provider-reconciliation.md`; supersedes that file's
+earlier "reconciliation folded into `--catch-up`" idea — reconciliation is its own CLI now, not a
+mode of `quant-ingest`). Both `providers` and the database factory are constructor-injectable per
+this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mocks/yfinance.py`,
 `tests/mocks/postgres.py`) instead of patching `ingest`'s own internals.
 
 - `--ticker` is optional — omit it to fetch every ticker in `settings.tickers` instead of one.
@@ -257,30 +270,38 @@ repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mock
   today (computed via an injectable `today: Callable[[], date]` parameter on `main`, defaulting to
   `date.today`, per this repo's clock-injection convention). Deliberately does no gap
   *detection* — it just re-runs the same per-day fetch+write for the whole window unconditionally.
-  Because `write_bars` upserts on `(ticker_id, date_id, time_id)`, re-ingesting an already-complete
-  day is a harmless no-op; a day a prior run only partially ingested (e.g. `quant-ingest` run
-  manually mid-session, or interrupted) gets filled in. This is the first concrete job to come out
-  of the scheduled-jobs brainstorm (`tasks/scheduled_jobs.md`, issue #3) — deliberately the
-  narrowest slice of it: no jobs table, no in-DB scheduling mechanism, just a CLI flag. Actually
-  running it nightly means wiring a cron/systemd timer on whatever host runs it, which stays
-  outside this public repo per that brainstorm's design lean (box-specific scheduling detail
-  shouldn't leak into committed source).
-- One connection is opened for the whole run and reused across every (ticker, date) pair.
-- One (ticker, date) pair failing (bad ticker, no data for that day — e.g. a weekend) continues
-  rather than aborting the rest of the range/batch; the exit code is `1` if anything failed, `0`
-  if everything succeeded. `_ingest_one` logs the fetch step and the write step separately —
-  a `yfinance`-sourced fetch failure logs under category `yfinance`
-  (`quant_data._internal.shared.providers.yfinance.CATEGORY_YFINANCE`), a Postgres write failure
-  under `ingest` — so the two are attributable/filterable independently, even though both still
-  count the same toward the exit code today (see `tasks/ingest_error_classification.md` for the
-  postponed work on making that distinction affect the exit code itself).
-- `providers/ibkr.py`'s `IBKRIntraDay` exists now (issue #21) but isn't wired into `ingest` here —
-  the actual goal (see `tasks/ibkr-provider-reconciliation.md`) is running IBKR alongside Yahoo
-  Finance and reconciling the two, not swapping one for the other, since they won't necessarily
-  agree bar-for-bar. `003_add_dim_provider_and_staging` laid the schema groundwork for this
-  (`dim_provider`, `staging_market_data_1min` — see `docs/SCHEMA.md`), but no Python code consumes
-  either table yet; running both providers in `--catch-up` and the reconciliation logic itself
-  remain unaddressed, tracked in that task file.
+  Because `write_staging_bars` upserts on `(provider_id, ticker_id, date_id, time_id)`,
+  re-ingesting an already-complete day is a harmless no-op; a day a prior run only partially
+  ingested (e.g. `quant-ingest` run manually mid-session, or interrupted) gets filled in. This is
+  the first concrete job to come out of the scheduled-jobs brainstorm (`tasks/scheduled_jobs.md`,
+  issue #3) — deliberately the narrowest slice of it: no jobs table, no in-DB scheduling mechanism,
+  just a CLI flag. Actually running it nightly means wiring a cron/systemd timer on whatever host
+  runs it, which stays outside this public repo per that brainstorm's design lean (box-specific
+  scheduling detail shouldn't leak into committed source).
+- Every configured provider is `connect()`ed once at the start of the run (see
+  `IntraDayProvider.connect()`/`close()`) and `close()`d in the `finally` alongside the database
+  connection — amortized across the whole batch, not reconnected per (ticker, date). A provider
+  that fails to `connect()` (e.g. IBKR Gateway not running) is dropped from the run entirely
+  (logged as a warning) rather than aborting it; if every configured provider fails to connect,
+  that *does* abort the run (`AppError`, no data source left to use).
+- One Postgres connection is opened for the whole run and reused across every (ticker, date) pair.
+- Fetch and write are attempted independently **per provider, per (ticker, date) pair** — one
+  provider failing (bad ticker on that source, no data for that day, e.g. a weekend, a gateway
+  hiccup) doesn't stop the others from still writing their own `staging_market_data_1min` rows for
+  the same (ticker, date); a (ticker, date) pair only counts as failed if *every* configured
+  provider failed it. `_ingest_one` logs the fetch step and the write step separately, and fetch
+  failures are tagged by provider (`_FETCH_FAILURE_CATEGORY`: `yfinance` ->
+  `quant_data._internal.shared.providers.yfinance.CATEGORY_YFINANCE`, `ibkr` ->
+  `quant_data._internal.shared.providers.ibkr.CATEGORY_IBKR`) so a Yahoo vs. IBKR fetch problem
+  stays filterable apart from a Postgres write problem — both still count the same toward the exit
+  code today (see `tasks/ingest_error_classification.md` for the postponed work on making that
+  distinction affect the exit code itself).
+- `settings.providers` (`list[str]`, lowercased, default `["yfinance"]`) is a flat global list —
+  the same providers run for every ticker in a given invocation; there's no per-ticker provider
+  override (see `tasks/ibkr-provider-reconciliation.md`'s now-resolved "currently configured
+  providers" question). `_build_provider` raises `AppError` for any name that isn't `"yfinance"` or
+  `"ibkr"`. `settings.ibkr` (`IbkrSettings`: `host`/`port`/`client_id`, all defaulting to
+  `IBKRIntraDay`'s own module-level defaults) is only consulted when `"ibkr"` is configured.
 
 ### `quant_data.client`
 

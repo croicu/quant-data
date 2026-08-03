@@ -196,6 +196,56 @@ def test_load_postgres_settings_raises_when_only_ssh_key_path_given(tmp_path):
         Settings.load(path=settings_path)
 
 
+def test_load_defaults_providers_to_yfinance_only(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.providers == ["yfinance"]
+
+
+def test_load_parses_providers_and_lowercases_them(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"providers": ["YFinance", "IBKR"]})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.providers == ["yfinance", "ibkr"]
+
+
+def test_load_raises_when_providers_is_not_a_list(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"providers": "yfinance"})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_defaults_ibkr_settings(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.ibkr.host == "127.0.0.1"
+    assert settings.ibkr.port == 4002
+    assert settings.ibkr.client_id == 1
+
+
+def test_load_parses_ibkr_settings_overrides(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": {"host": "10.0.0.5", "port": 7497, "clientId": 9}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.ibkr.host == "10.0.0.5"
+    assert settings.ibkr.port == 7497
+    assert settings.ibkr.client_id == 9
+
+
+def test_load_raises_when_ibkr_settings_is_not_an_object(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": "not-an-object"})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
 def test_load_local_path_is_scoped_to_given_path_directory(tmp_path):
     # Regression guard: local_path used to default relative to the process's cwd regardless of
     # which `path` was passed, so loading a fixture elsewhere could silently pick up whatever

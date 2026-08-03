@@ -88,12 +88,16 @@ identical bar columns to `fact_market_data_1min`, plus `provider_id` — so mult
 (`yfinance`, `ibkr`) can write independently for the same ticker/date/minute without overwriting
 each other. Primary key `(provider_id, ticker_id, date_id, time_id)`, matching how each
 `IntraDayProvider` writes its own rows (blind to what other providers wrote for the same bar).
+Written by `PostgresDatabase.write_staging_bars` — every `quant-ingest` run writes here now (issue
+#22), never straight to `fact_market_data_1min`.
 
 A staging row is purged once its bar reconciles into `fact_market_data_1min`. A bar with staging
 rows still present is implicitly in an unresolved ("settlement") state — either not every
-configured provider has reported yet, or the providers that have disagree beyond tolerance. See
-`tasks/ibkr-provider-reconciliation.md` for the reconciliation logic itself (not yet implemented —
-this migration only adds the tables it will eventually need).
+configured provider has reported yet, or the providers that have disagree beyond tolerance. The
+reconciliation logic itself — reading staging, comparing per-field against tolerance, promoting
+agreeing bars, purging their staging rows — is a separate CLI, `quant-reconcile` (same repo, same
+`quant-<verb>` naming as `quant-ingest`), not yet built; see
+`tasks/ibkr-provider-reconciliation.md`.
 
 ## `fact_market_data_1min`
 

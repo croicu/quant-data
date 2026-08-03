@@ -8,9 +8,18 @@ from typing import ClassVar
 
 from .diagnostics import CATEGORY_GENERAL, LEVEL_RANK, TelemetryLevel
 from .errors import TaskError
+from .providers.ibkr import DEFAULT_CLIENT_ID as IBKR_DEFAULT_CLIENT_ID
+from .providers.ibkr import DEFAULT_HOST as IBKR_DEFAULT_HOST
+from .providers.ibkr import DEFAULT_PORT as IBKR_DEFAULT_PORT
 
 _SETTINGS_PATH = Path("./settings.json")
 _LOCAL_PATH_NAME = "settings.local.json"
+
+DEFAULT_PROVIDERS = ["yfinance"]
+
+
+def _default_providers() -> list[str]:
+    return list(DEFAULT_PROVIDERS)
 
 
 @dataclass
@@ -25,6 +34,13 @@ class PostgresSettings:
 
 
 @dataclass
+class IbkrSettings:
+    host: str = IBKR_DEFAULT_HOST
+    port: int = IBKR_DEFAULT_PORT
+    client_id: int = IBKR_DEFAULT_CLIENT_ID
+
+
+@dataclass
 class Settings:
     debug: bool
     logging: TelemetryLevel = TelemetryLevel.ERROR
@@ -35,6 +51,8 @@ class Settings:
     start_date: date | None = None
     end_date: date | None = None
     catch_up_lookback_days: int = 7
+    providers: list[str] = field(default_factory=_default_providers)
+    ibkr: IbkrSettings = field(default_factory=IbkrSettings)
 
     _instance: ClassVar[Settings | None] = None
 
@@ -183,6 +201,27 @@ class Settings:
         if catch_up_lookback_days < 1:
             raise TaskError(f"'settings.catchUpLookbackDays' must be at least 1, got {catch_up_lookback_days}.")
 
+        providers_payload = settings_payload.get("providers", list(DEFAULT_PROVIDERS))
+        if not isinstance(providers_payload, list):
+            raise TaskError("'settings.providers' must be an array of strings.")
+        providers: list[str] = []
+        for provider_name in providers_payload:
+            # Lowercase, matching dim_provider.name's own CHECK constraint and this repo's
+            # existing log-category convention (e.g. CATEGORY_YFINANCE = "yfinance") -- unlike
+            # settings.tickers, which is uppercased instead, per that column's own convention.
+            providers.append(str(provider_name).lower())
+
+        ibkr_settings = IbkrSettings()
+        ibkr_payload = settings_payload.get("ibkr")
+        if ibkr_payload is not None:
+            if not isinstance(ibkr_payload, dict):
+                raise TaskError("'settings.ibkr' must be a JSON object.")
+            ibkr_settings = IbkrSettings(
+                host=str(ibkr_payload.get("host", IBKR_DEFAULT_HOST)),
+                port=int(ibkr_payload.get("port", IBKR_DEFAULT_PORT)),
+                client_id=int(ibkr_payload.get("clientId", IBKR_DEFAULT_CLIENT_ID)),
+            )
+
         cls._instance = cls(
             debug=debug,
             logging=log_level,
@@ -193,6 +232,8 @@ class Settings:
             start_date=start_date_setting,
             end_date=end_date_setting,
             catch_up_lookback_days=catch_up_lookback_days,
+            providers=providers,
+            ibkr=ibkr_settings,
         )
 
         return cls._instance

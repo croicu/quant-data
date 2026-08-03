@@ -113,6 +113,36 @@ class PostgresDatabase:
 
         return bars
 
+    def _resolve_dimension_ids(self, cursor: psycopg.Cursor, bar: OHLCV) -> tuple[int, int, int]:
+        normalized_ticker = bar.ticker.upper()
+
+        cursor.execute(
+            """
+            INSERT INTO dim_ticker (ticker) VALUES (%s)
+            ON CONFLICT (ticker) DO UPDATE SET ticker = EXCLUDED.ticker
+            RETURNING ticker_id
+            """,
+            (normalized_ticker,),
+        )
+        ticker_id = cursor.fetchone()[0]
+
+        cursor.execute("SELECT date_id FROM dim_date WHERE date = %s", (bar.timestamp.date(),))
+        date_row = cursor.fetchone()
+        if date_row is None:
+            raise DateOutOfRangeError(f"No dim_date row for {bar.timestamp.date()} — outside the populated date range.")
+        date_id = date_row[0]
+
+        cursor.execute(
+            "SELECT time_id FROM dim_time WHERE hour = %s AND minute = %s",
+            (bar.timestamp.hour, bar.timestamp.minute),
+        )
+        time_row = cursor.fetchone()
+        if time_row is None:
+            raise AppError(f"No dim_time row for {bar.timestamp.hour:02d}:{bar.timestamp.minute:02d}.")
+        time_id = time_row[0]
+
+        return ticker_id, date_id, time_id
+
     def write_bars(self, bars: list[OHLCV]) -> int:
         written = 0
         started = time.perf_counter()
@@ -120,32 +150,7 @@ class PostgresDatabase:
         try:
             with self._connection.cursor() as cursor:
                 for bar in bars:
-                    normalized_ticker = bar.ticker.upper()
-
-                    cursor.execute(
-                        """
-                        INSERT INTO dim_ticker (ticker) VALUES (%s)
-                        ON CONFLICT (ticker) DO UPDATE SET ticker = EXCLUDED.ticker
-                        RETURNING ticker_id
-                        """,
-                        (normalized_ticker,),
-                    )
-                    ticker_id = cursor.fetchone()[0]
-
-                    cursor.execute("SELECT date_id FROM dim_date WHERE date = %s", (bar.timestamp.date(),))
-                    date_row = cursor.fetchone()
-                    if date_row is None:
-                        raise DateOutOfRangeError(f"No dim_date row for {bar.timestamp.date()} — outside the populated date range.")
-                    date_id = date_row[0]
-
-                    cursor.execute(
-                        "SELECT time_id FROM dim_time WHERE hour = %s AND minute = %s",
-                        (bar.timestamp.hour, bar.timestamp.minute),
-                    )
-                    time_row = cursor.fetchone()
-                    if time_row is None:
-                        raise AppError(f"No dim_time row for {bar.timestamp.hour:02d}:{bar.timestamp.minute:02d}.")
-                    time_id = time_row[0]
+                    ticker_id, date_id, time_id = self._resolve_dimension_ids(cursor, bar)
 
                     cursor.execute(
                         """
@@ -184,4 +189,60 @@ class PostgresDatabase:
             raise AppError(f"Failed to write bars: {error}") from error
 
         self._logger.perf(f"write_bars({written} bars)", time.perf_counter() - started)
+        return written
+
+    def write_staging_bars(self, provider_name: str, bars: list[OHLCV]) -> int:
+        normalized_provider_name = provider_name.lower()
+        written = 0
+        started = time.perf_counter()
+
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT provider_id FROM dim_provider WHERE name = %s", (normalized_provider_name,))
+                provider_row = cursor.fetchone()
+                if provider_row is None:
+                    raise AppError(f"No dim_provider row for '{normalized_provider_name}' -- expected one of the seeded provider names.")
+                provider_id = provider_row[0]
+
+                for bar in bars:
+                    ticker_id, date_id, time_id = self._resolve_dimension_ids(cursor, bar)
+
+                    cursor.execute(
+                        """
+                        INSERT INTO staging_market_data_1min
+                            (provider_id, ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, incomplete)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (provider_id, ticker_id, date_id, time_id) DO UPDATE SET
+                            open = EXCLUDED.open,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            close = EXCLUDED.close,
+                            volume = EXCLUDED.volume,
+                            timestamp = EXCLUDED.timestamp,
+                            incomplete = EXCLUDED.incomplete
+                        """,
+                        (
+                            provider_id,
+                            ticker_id,
+                            date_id,
+                            time_id,
+                            bar.open,
+                            bar.high,
+                            bar.low,
+                            bar.close,
+                            bar.volume,
+                            bar.timestamp,
+                            bar.incomplete,
+                        ),
+                    )
+                    written += 1
+            self._connection.commit()
+        except AppError:
+            self._connection.rollback()
+            raise
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to write staging bars: {error}") from error
+
+        self._logger.perf(f"write_staging_bars({normalized_provider_name}, {written} bars)", time.perf_counter() - started)
         return written

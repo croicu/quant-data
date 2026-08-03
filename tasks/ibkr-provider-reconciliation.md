@@ -1,7 +1,10 @@
 # IBKR Provider Reconciliation
 
 ## Status: Brainstorm (schema-only slice done — issue #18, ready-to-submit; IBKR `IntraDayProvider`
-slice done — issue #21, ready-to-submit)
+slice done — issue #21, `status:implementation`; both-providers-into-staging slice done and
+live-verified — issue #22. Perf follow-up filed, not fixed — issue #23. Still open: tolerance
+config, manual resolution mechanism, reputation schema, and `quant-reconcile` itself — the CLI
+that reads staging and promotes into `fact_market_data_1min`.)
 
 ## Problem statement
 
@@ -47,11 +50,18 @@ data to know how reliable either provider actually is.
   cross-repo announcement issue to `quant-scratch` per `CLAUDE.md`'s placement rule. Keeping
   reconciliation's *output* shaped exactly like today's fact table avoids all of that — only the
   *input* side (staging) needs the new dimension.
-- **Reconciliation is folded into the existing `--catch-up` flow**, not a separate scheduled job.
-  `--catch-up` already runs nightly and already tolerates partial/incomplete per-(ticker, date)
-  state by design (see `docs/PROTOCOL.md`/`docs/ARCHITECTURE.md`), making it the natural home for
-  a "fetch from every configured provider, then reconcile whatever's in staging" step, rather than
-  introducing a second unattended job to operate.
+- **~~Reconciliation is folded into the existing `--catch-up` flow~~ — superseded.** Originally
+  planned as a step inside `--catch-up` itself; decided instead (during issue #22) to keep it as a
+  wholly separate CLI, `quant-reconcile` (same `quant-<verb>` naming as `quant-ingest`, same repo —
+  no separate repo just for this tool), living at `src/reconcile/cli.py` — a new top-level package
+  mirroring `src/ingest/`'s own shape (console script only, no importable surface, outside the
+  `quant_data` namespace). Cleaner separation of concerns: `quant-ingest`'s job ends at "run every
+  configured provider, write staging" (issue #22); `quant-reconcile`'s job is "read staging,
+  compare, promote to `fact_market_data_1min`" — the two can be scheduled independently (e.g.
+  ingest nightly, reconcile on a different cadence or manually) without one tool's flags
+  controlling unrelated behavior in the other. Not built yet — this is a placement decision only,
+  made ahead of the reconciliation-logic design itself (tolerance config, manual resolution, etc.,
+  all still open above).
 - **Per-bar reconciliation logic**:
   1. If any *currently configured* provider hasn't yet written a staging row for a given bar, that
      bar stays in staging in a `settlement` stage — it is **not** promoted to golden on partial
@@ -114,9 +124,15 @@ Still open — belong to the reconciliation-logic implementation, a later task, 
 - **Reputation table shape**: an event/history table (`provider_reputation_events` or similar) is
   favored over a single mutable score column, but the exact schema (what triggers an event, what
   it records beyond "provider X, direction, timestamp") isn't designed yet.
-- **"Currently configured providers" scope**: is the provider list global (one list applies to
-  every ticker), or could it vary per ticker (e.g. IBKR covers a ticker Yahoo doesn't, or vice
-  versa)? Affects how reconciliation decides "all expected providers have reported" for a given bar.
+
+Resolved for the staging-wiring slice (issue #22, see below) — reconciliation itself can rely on
+this too, not just re-litigate it:
+
+- ~~"Currently configured providers" scope~~ — global: one `settings.providers` list applies to
+  every ticker in `settings.tickers`. Matches how `settings.tickers` itself already works (one
+  flat list, no per-ticker overrides anywhere in this repo), and there's no evidence yet that any
+  ticker genuinely isn't available on one of the two providers. Reconciliation's own "have all
+  expected providers reported for this bar" check reads this same global list.
 
 ## Implementation plan
 
@@ -141,13 +157,10 @@ IBKR `IntraDayProvider` and reconciliation logic are separate, later work):
 Scoped narrower than this file's full reconciliation design, same pattern as #18's schema-only
 slice: build the fetch-only provider, leave staging writes/reconciliation for a later issue.
 
-- **Fetch-only, not wired into `ingest`.** `IBKRIntraDay` (`providers/ibkr.py`) implements
-  `IntraDayProvider.fetch_bars`, symmetric to `YahooFinanceIntraDay`, covered by unit tests plus a
-  live integration test against a real IB Gateway. `ingest/cli.py` still only constructs
-  `YahooFinanceIntraDay` by default — running both providers per `--catch-up` and writing to
-  `staging_market_data_1min` is deferred to whichever issue actually wires up reconciliation
-  (needs the still-open questions below resolved first: tolerance config shape, "which providers
-  are currently configured," etc.).
+- **Fetch-only, not wired into `ingest`** (as of #21 — wired in by #22, see below). `IBKRIntraDay`
+  (`providers/ibkr.py`) implements `IntraDayProvider.fetch_bars`, symmetric to
+  `YahooFinanceIntraDay`, covered by unit tests plus a live integration test against a real IB
+  Gateway.
 - **Long-lived connection across a batch**, not connect-per-call like `quant-scratch`'s validated
   approach. `connect()`/`close()` are explicit and separate from `fetch_bars()`, since IBKR's
   connection handshake is expensive enough to amortize across many (ticker, date) fetches once
@@ -163,6 +176,39 @@ slice: build the fetch-only provider, leave staging writes/reconciliation for a 
   `quant-scratch` as worth a real test at batch scale — still untested here too, since this slice
   doesn't wire into a real batch run yet. Revisit once `ingest` actually drives this provider
   across many tickers/dates.
+
+## Implementation plan (wire providers into staging, issue #22)
+
+Scoped per this file's phasing: get `quant-ingest` running every configured provider and writing
+each one's raw fetch into `staging_market_data_1min`. Reconciliation itself (staging ->
+`fact_market_data_1min`) stays out of scope — that's `quant-reconcile`, not built yet (see the
+now-superseded design decision above for its planned location).
+
+- **`quant-ingest` writes to staging only, unconditionally** — even a single-provider (just
+  `yfinance`) run no longer touches `fact_market_data_1min` directly. `PostgresDatabase.write_bars`
+  (straight to fact) still exists and is still tested, but nothing in `ingest` calls it anymore;
+  it's dead code from `ingest`'s perspective until something else needs it. Accepted tradeoff:
+  `fact_market_data_1min` goes stale after a normal `quant-ingest` run until `quant-reconcile`
+  exists and is actually run.
+- **`settings.providers`** (`list[str]`, default `["yfinance"]`, lowercased) is the global
+  provider list `quant-ingest` runs every invocation — see the now-resolved "currently configured
+  providers" open question above. **`settings.ibkr`** (`IbkrSettings`: `host`/`port`/`clientId`)
+  configures `IBKRIntraDay`'s connection when `"ibkr"` is included; all fields optional, defaulting
+  to `IBKRIntraDay`'s own module-level defaults.
+- **`IntraDayProvider` gained `connect()`/`close()`** (previously just `fetch_bars`) — real second
+  call site now (IBKR's batch-lifecycle need from #21 plus `ingest`'s own orchestration) justified
+  extending the shared contract rather than duck-typing/hasattr-checking around it.
+  `YahooFinanceIntraDay` implements both as no-ops.
+- **Per-provider partial-failure tolerance**: a (ticker, date) pair only counts as failed if every
+  configured provider failed it — one provider's bad ticker or unreachable gateway doesn't stop
+  the others from writing their own staging rows for the same pair. Same tolerance extends to
+  `connect()`: a provider that fails to connect is dropped for the rest of the run (logged), not
+  fatal unless *every* provider fails to connect.
+- **`PostgresDatabase.write_staging_bars(provider_name, bars)`** — new method mirroring
+  `write_bars`, upserting into `staging_market_data_1min` keyed on
+  `(provider_id, ticker_id, date_id, time_id)`. Shares a new private `_resolve_dimension_ids`
+  helper with `write_bars` for the ticker/date/time lookup, extracted once a second real call site
+  existed (not preemptively).
 
 ## Test results
 
@@ -183,7 +229,30 @@ format`/`ruff check` clean, full `pytest` suite (88 tests) passes — though
 `tests/integration/test_ibkr.py` specifically requires a locally running IB Gateway/TWS at
 `127.0.0.1:4002` to pass, unlike the Yahoo integration test which only needs network access.
 
-Rest of this brainstorm (tolerance config, manual resolution mechanism, reputation table, wiring
-both providers into `--catch-up` + staging, and the reconciliation logic itself) remains open —
+**Staging-wiring slice (issue #22): done, verified live against CroicuWS1.** 17 new/updated unit
+tests across `test_ingest_cli.py` (multi-provider connect/close, tagged staging writes,
+partial-provider-failure tolerance, connect-failure tolerance, unknown-provider-name rejection),
+`test_postgres.py` (`write_staging_bars` commit/rollback/perf/provider-lookup), and
+`test_settings.py` (`settings.providers`/`settings.ibkr` parsing) — full suite: 105 passed. `ruff
+format`/`ruff check` clean.
+
+Live run against the real CroicuWS1 database (explicit go-ahead given first, per `CLAUDE.md`'s
+rule to confirm before any write against the real database): `quant-ingest --start-date
+2026-07-27 --end-date 2026-07-31` with `settings.providers = ["yfinance", "ibkr"]` across all 6
+configured tickers (`SPY`, `SH`, `QQQ`, `PSQ`, `DIA`, `DOG`) — `30 succeeded, 0 failed`. Verified
+independently, read-only, via `quant_reader`: 50,318 rows landed in `staging_market_data_1min`,
+both providers present for all 30 (ticker, date) pairs. Real confirmation of the gap this whole
+feature exists to close: IBKR consistently near-complete (~955-960 bars/day, full extended-hours
+session), Yahoo consistently thinner (e.g. `DOG` 2026-07-29: IBKR 787 vs. Yahoo 427; `DIA`
+2026-07-27: IBKR 960 vs. Yahoo 692). `settings.local.json`'s `providers` override was kept as the
+new real default (not reverted) — every future `quant-ingest` run, including any future
+`--catch-up`, now writes both providers into staging.
+
+One follow-up filed, not fixed here (out of scope for #22): `write_staging_bars` took ~15-18s per
+~960-bar write (unbatched per-bar round trips over the SSH tunnel, same pre-existing pattern
+`write_bars` already had) — see #23.
+
+Rest of this brainstorm (tolerance config, manual resolution mechanism, reputation table, and the
+reconciliation logic itself — `quant-reconcile`, `src/reconcile/cli.py`, not built) remains open —
 this file stays as the working document for that, not deleted, the same way
 `tasks/scheduled_jobs.md` survived `--catch-up` (#12) closing.

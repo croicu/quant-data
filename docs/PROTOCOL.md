@@ -9,7 +9,11 @@ CLI signature and file format schemas for `quant-data`.
 ### `quant-ingest`
 
 - Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]`
-- Fetches 1-minute OHLCV bars from Yahoo Finance and writes them into the warehouse — see
+- Fetches 1-minute OHLCV bars from every provider in `settings.providers` (default: just
+  `yfinance`; add `ibkr` to also run `IBKRIntraDay`) and writes each provider's bars independently
+  into `staging_market_data_1min` — **not** `fact_market_data_1min` directly. Promoting agreeing
+  staging rows into `fact_market_data_1min` is a separate, not-yet-built tool (`quant-reconcile`,
+  see `tasks/ibkr-provider-reconciliation.md`); `quant-ingest`'s job ends at staging. See
   `docs/ARCHITECTURE.md` for the full design.
 - `--ticker` — single ticker (e.g. `AAPL`); omit to use every ticker in `settings.tickers` instead.
 - `--start-date` — first trading date, `YYYY-MM-DD`; omit to use `settings.startDate`.
@@ -20,15 +24,21 @@ CLI signature and file format schemas for `quant-data`.
   `--start-date`/`--end-date`. Meant for an unattended nightly run (cron/systemd timer, set up
   outside this repo — see `tasks/scheduled_jobs.md`) that catches up any day a prior run only
   partially ingested (e.g. `quant-ingest` run manually mid-session); safe to run against
-  already-complete days too, since `write_bars` upserts are idempotent.
+  already-complete days too, since `write_staging_bars` upserts are idempotent.
 - `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
   instead of printing a one-line error, for upfront failures (settings load, no ticker/date
-  configured at all).
-- Exit codes: `0` every (ticker, date) pair succeeded; `1` settings load failure, no
-  ticker/date-range configured at all, or one or more (ticker, date) pairs failed (a failing pair
-  logs a warning and the run continues rather than aborting — `1` here can mean "partial success",
-  not necessarily "nothing happened"); `2` argument parsing error (argparse's default behavior on
-  missing/bad args, e.g. malformed dates or `--end-date` without `--start-date`).
+  configured at all, every configured provider failing to connect).
+- `settings.providers` (array of strings, default `["yfinance"]`) — which providers to run each
+  invocation; unrecognized names fail fast at startup. `settings.ibkr` (`host`/`port`/`clientId`,
+  all optional — default to `IBKRIntraDay`'s own defaults, IB Gateway's paper port `4002`) — only
+  consulted when `"ibkr"` is in `settings.providers`.
+- Exit codes: `0` every (ticker, date) pair had at least one provider succeed; `1` settings load
+  failure, no ticker/date-range configured at all, every configured provider failing to connect, or
+  one or more (ticker, date) pairs where every provider failed (an individual provider failing for
+  one pair — bad ticker on that source, gateway unreachable — logs a warning and the run continues
+  with whatever providers/pairs still work, rather than aborting — `1` here can mean "partial
+  success", not necessarily "nothing happened"); `2` argument parsing error (argparse's default
+  behavior on missing/bad args, e.g. malformed dates or `--end-date` without `--start-date`).
 
 There is no generic `quant-data` command — `quant-ingest` (write side, package `ingest`, outside
 the `quant_data` namespace — no importable surface, console script only) and `quant_data.MarketData`

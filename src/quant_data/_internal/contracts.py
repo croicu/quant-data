@@ -26,10 +26,21 @@ class MarketDataProvider(Protocol):
 
 
 class IntraDayProvider(Protocol):
+    def connect(self) -> None:
+        """Establish whatever's needed to fetch (e.g. a persistent API connection), so it can be
+        amortized across a batch of fetch_bars() calls rather than reconnecting each time. A
+        no-op for stateless/per-call providers (e.g. plain HTTP). Called once per batch, before
+        any fetch_bars() calls."""
+        ...
+
     def fetch_bars(self, ticker: str, target_date: date) -> list[OHLCV]:
         """Fetch 1-minute OHLCV bars for a single session day from an external data provider.
         Raises AppError if the ticker is invalid, the network call fails, or no bars are
         available for that date."""
+        ...
+
+    def close(self) -> None:
+        """Release any resources opened by connect(). A no-op for stateless providers."""
         ...
 
 
