@@ -24,9 +24,13 @@ the same dimension keys without touching the raw 1-minute data.
 
 `003_add_dim_provider_and_staging` added a fourth dimension, `dim_provider`, and a
 `staging_market_data_1min` table alongside (not instead of) the fact table — see "`dim_provider`"
-and "`staging_market_data_1min`" below. `fact_market_data_1min` itself is unchanged: it remains the
-single golden, reconciled dataset every reader (`MarketData`) queries, regardless of which
-provider(s) a bar's value ultimately came from.
+and "`staging_market_data_1min`" below. `004_add_reconciliation_tables` added `dim_provider.role`,
+a fifth dimension (`dim_field_group`), and the `fact_reconciliation`/
+`fact_reconciliation_participant`/`provider_pair_disagreement` tables `quant-reconcile` (not yet
+built) will read/write — see those sections below and `tasks/quant-reconcile.md`.
+`fact_market_data_1min` itself is unchanged throughout: it remains the single golden, reconciled
+dataset every reader (`MarketData`) queries, regardless of which provider(s) a bar's value
+ultimately came from.
 
 ## `dim_ticker`
 
@@ -63,12 +67,20 @@ populated once, not per ticker/date.
 |---|---|---|
 | `provider_id` | `SERIAL PRIMARY KEY` | |
 | `name` | `TEXT NOT NULL UNIQUE` | Always lowercase — enforced by a `CHECK` constraint |
+| `role` | `TEXT NOT NULL DEFAULT 'candidate'` | `'candidate'` or `'whistleblower'`, enforced by a `CHECK` constraint. Added in `004_add_reconciliation_tables` |
 | `created_at` | `TIMESTAMP` | Defaults to insert time |
 
 Data-source dimension, added in `003_add_dim_provider_and_staging`. Seeded with `'yfinance'` and
 `'ibkr'` — IBKR's real and paper accounts return identical market data, so both share the single
 `'ibkr'` row; the account used is an execution detail, not a distinct data identity. Not hardcoded
 to exactly two rows — more providers can be added later without a design change.
+
+`role` distinguishes real candidate providers (`'ibkr'` today — data that can actually be promoted
+into `fact_market_data_1min`) from a whistleblower provider (`'yfinance'` — compared against to
+derive reconciliation's tolerance and completeness signals, never promoted except via a person's
+manual correction; see `tasks/quant-reconcile.md`). This is the single source of truth for that
+distinction — deliberately not duplicated as a separate list in `settings.json`, so it can't drift
+out of sync with what's actually seeded here.
 
 ## `staging_market_data_1min`
 
@@ -94,10 +106,12 @@ Written by `PostgresDatabase.write_staging_bars` — every `quant-ingest` run wr
 A staging row is purged once its bar reconciles into `fact_market_data_1min`. A bar with staging
 rows still present is implicitly in an unresolved ("settlement") state — either not every
 configured provider has reported yet, or the providers that have disagree beyond tolerance. The
-reconciliation logic itself — reading staging, comparing per-field against tolerance, promoting
-agreeing bars, purging their staging rows — is a separate CLI, `quant-reconcile` (same repo, same
-`quant-<verb>` naming as `quant-ingest`), not yet built; see
-`tasks/ibkr-provider-reconciliation.md`.
+reconciliation logic itself — reading staging, comparing per-field-group against a measured
+tolerance, promoting agreeing bars, purging their staging rows — is a separate CLI,
+`quant-reconcile` (same repo, same `quant-<verb>` naming as `quant-ingest`), not yet built; see
+`tasks/quant-reconcile.md` (the schema it depends on — `dim_provider.role`, `dim_field_group`,
+`fact_reconciliation`, `fact_reconciliation_participant`, `provider_pair_disagreement` — shipped in
+`004_add_reconciliation_tables`, ahead of the CLI itself, same pattern `003` used for this table).
 
 ## `fact_market_data_1min`
 
@@ -114,6 +128,88 @@ agreeing bars, purging their staging rows — is a separate CLI, `quant-reconcil
 Primary key: `(ticker_id, date_id, time_id)` — enforces exactly one bar per ticker per minute per
 date.
 
+## `dim_field_group`
+
+| Column | Type | Notes |
+|---|---|---|
+| `field_group_id` | `SERIAL PRIMARY KEY` | |
+| `name` | `TEXT NOT NULL UNIQUE` | e.g. `'ohlc'`, `'volume'` |
+| `created_at` | `TIMESTAMP` | Defaults to insert time |
+
+Added in `004_add_reconciliation_tables`. Groups `fact_market_data_1min` columns that
+`quant-reconcile` must resolve from a single provider together — seeded with `'ohlc'`
+(`open`/`high`/`low`/`close`, which must come from one provider so a promoted bar is never
+internally inconsistent, e.g. `low` > `close`) and `'volume'` (independent). Not hardcoded to
+exactly these two rows — a later migration adding a new `fact_market_data_1min` column assigns it
+to an existing or new group row, a data change, not a schema change.
+
+## `fact_reconciliation`
+
+| Column | Type | Notes |
+|---|---|---|
+| `ticker_id` | `INT NOT NULL` | FK → `dim_ticker` |
+| `date_id` | `INT NOT NULL` | FK → `dim_date` |
+| `time_id` | `INT NOT NULL` | FK → `dim_time` |
+| `field_group_id` | `INT NOT NULL` | FK → `dim_field_group` |
+| `winning_provider_id` | `INT NOT NULL` | FK → `dim_provider` |
+| `resolution_path` | `TEXT NOT NULL` | One of `'completeness'` / `'agreement'` / `'boundary_fix'` / `'finalized'` / `'manual_override'`, enforced by a `CHECK` constraint |
+| `resolved_at` | `TIMESTAMP` | Defaults to insert time |
+
+Primary key: `(ticker_id, date_id, time_id, field_group_id)`. Added in
+`004_add_reconciliation_tables`. One row per (bar, field group) once `quant-reconcile` resolves it
+— presence of a row *is* "resolved"; a bar with no row here for one of its groups is still stuck in
+`staging_market_data_1min`. `resolution_path` distinguishes `quant-reconcile`'s automatic pass
+(`'completeness'` / `'agreement'` / `'boundary_fix'`) from `--finalize`'s `preferredProvider`
+algorithm (`'finalized'`) from an actual person directly correcting a bar (`'manual_override'` —
+the only path a whistleblower provider's value can ever reach `fact_market_data_1min` through).
+See `tasks/quant-reconcile.md` for the full per-tier logic.
+
+## `fact_reconciliation_participant`
+
+| Column | Type | Notes |
+|---|---|---|
+| `ticker_id` | `INT NOT NULL` | |
+| `date_id` | `INT NOT NULL` | |
+| `time_id` | `INT NOT NULL` | |
+| `field_group_id` | `INT NOT NULL` | |
+| `provider_id` | `INT NOT NULL` | FK → `dim_provider` |
+| `won` | `BOOLEAN NOT NULL` | |
+
+Primary key: `(ticker_id, date_id, time_id, field_group_id, provider_id)`, with a composite foreign
+key on `(ticker_id, date_id, time_id, field_group_id)` back to `fact_reconciliation`. Added in
+`004_add_reconciliation_tables`. One row per provider that competed for a resolved (bar, group),
+win or lose — including a `role = 'whistleblower'` provider, which gets a row like any other
+provider that wrote a staging row for that bar, not just the winning candidate. Doubles as the
+provider-reputation record: "who tends to lose" is `WHERE won = FALSE` grouped by `provider_id`,
+filtered (via a join to `fact_reconciliation`) to `resolution_path = 'manual_override'` — no
+separate reputation table needed. For the whistleblower specifically, `won = TRUE` rows (always
+`manual_override`, its only path to winning) are their own signal: how often a person actually
+reached for its value specifically, as opposed to hand-correcting to something else entirely.
+
+## `provider_pair_disagreement`
+
+| Column | Type | Notes |
+|---|---|---|
+| `provider_id` | `INT NOT NULL` | FK → `dim_provider` — always a `role = 'candidate'` provider, never the whistleblower |
+| `field_group_id` | `INT NOT NULL` | FK → `dim_field_group` |
+| `sample_count` | `BIGINT NOT NULL DEFAULT 0` | `>= 0` |
+| `running_mean` | `NUMERIC NOT NULL DEFAULT 0` | Signed: `candidate_value - whistleblower_value`, not the reverse |
+| `running_m2` | `NUMERIC NOT NULL DEFAULT 0` | Welford's algorithm accumulator |
+| `stddev` | `NUMERIC` | Denormalized from `running_m2`/`sample_count` for fast reads |
+| `updated_at` | `TIMESTAMP` | Defaults to insert time |
+
+Primary key: `(provider_id, field_group_id)`. Added in `004_add_reconciliation_tables`. Running
+variance of each candidate provider's disagreement against the fixed whistleblower (`yfinance`
+today), per field group — measured directly rather than reconstructed from two
+individually-unmeasurable per-provider "precision" figures (no ground-truth reference exists to
+attribute disagreement to one side or the other). No ticker dimension — noise is a property of
+methodology, not of individual tickers. `stddev` is relative/fractional, scaled against an actual
+reference value at comparison time to get `quant-reconcile`'s bar-specific absolute tolerance
+(`tolerance = k * stddev * reference_value`, `k = 3`). Only in-band (raw-agreement) observations
+update this — `finalized`/`manual_override` resolutions are excluded so outliers can't gradually
+widen "normal." Seeded with an illustrative starting value per field group at migration time (not
+measured data), pseudo-count 100 so it fades slowly as real observations accumulate.
+
 ## Indexes
 
 - `idx_fact_1min_ticker_date_time` on `(ticker_id, date_id, time_id)` — matches the primary key
@@ -127,6 +223,11 @@ date.
   the opposite leading-column order from that table's own primary key. The primary key
   (`provider_id` first) matches how each provider writes its own rows; this index matches
   reconciliation's actual read pattern — gathering every provider's row for one bar.
+- `idx_fact_reconciliation_resolution_path` on `fact_reconciliation(resolution_path)` — supports
+  counting/filtering by how bars resolved (e.g. "how many were `finalized` vs. `manual_override`").
+- `idx_fact_reconciliation_participant_provider` on
+  `fact_reconciliation_participant(provider_id, won)` — supports the reputation read pattern:
+  aggregating win/loss by provider without scanning the whole table.
 
 ## Query examples
 
