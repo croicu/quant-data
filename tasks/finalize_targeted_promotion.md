@@ -34,6 +34,16 @@ command. (This also means `tasks/quant_reconcile.md`'s Test Results, if it's eve
 specific bars, should be cross-checked against this correction rather than trusted at face value for
 this case.)
 
+**Independently confirmed against a third-party reference (DataBento, `tasks/*.csv`).** Pulled
+paid DataBento 1-minute data for `SPY` over the same 3-day window (raw export has multiple
+per-venue records per minute, not one row per bar — combined by hand via min-of-lows/max-of-highs
+for a quick check). `yfinance`'s specific outlier value is decisively refuted on all three bars —
+DataBento isn't within miles of any of them. `ibkr` matches closely on 07-28 and 07-30; on 07-29,
+`ibkr`'s own `L`=725.98 sits ~2.9 below DataBento's combined low of 728.88 — a smaller, unresolved
+residual gap, not chased further. **Decision: not adopting DataBento as an ongoing/routine
+reference** — it's a paid data source (even though this one pull was inexpensive), and this was a
+one-off sanity check for this specific investigation, not a new candidate provider.
+
 ## Design (from initial conversation, not fully converged — see Open questions)
 
 New CLI arguments on `--finalize` for targeted single-bar mode, replacing the bulk sweep for that
