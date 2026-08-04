@@ -12,11 +12,27 @@ specific bar. The only existing path for that is exactly what `tasks/quant_recon
 correction" section already documents: directly hand-editing `staging_market_data_1min`/
 `fact_market_data_1min`, "no dedicated tooling implied."
 
-Concrete motivating case: investigating the 3 pending `SPY` bars (2026-08-03), the person reviewing
-them judged `yfinance`'s raw value correct for all three (against `ibkr`'s, which looked
-internally-consistent but was actually the outlier — see `tasks/quant_reconcile.md`'s Test Results
-for the actual values and the reasoning). Promoting that judgment currently means hand-writing SQL
-against three tables, not running a command.
+Concrete motivating case: investigating the 3 pending `SPY` bars (2026-08-03/04). **Corrected
+finding, superseding an earlier same-session read**: the original pass judged `yfinance`'s raw
+value correct for all three, believing `ibkr` was the outlier. Visual inspection of candlestick
+charts (`tasks/Conflict - 2026.7.28/29/30.png`) plus the raw `staging_market_data_1min` rows
+reversed that — `ibkr`'s OHLC sits smoothly inside the surrounding candle pattern on all three
+days, while `yfinance` has exactly one outlier extreme field per bar, and that field isn't fixed
+(`L` on 07-28 and 07-30, `H` on 07-29, where `L` actually matches `ibkr` exactly at 725.98). Each
+outlier value sits suspiciously close to the *adjacent* day's closing price level — `yfinance`
+`H`=740.4873 on 07-29 ≈ 07-28's close (~740.9); `yfinance` `L`=729.2697 on 07-30 ≈ 07-29's close
+(~729.5). A further 3-day candlestick comparison (`ibkr` vs. `yfinance` raw staging data,
+`tasks/IBKR - 2026.7.28-30.png` / `tasks/Yahoo - 2026.7.28-30.png`) showed this isn't a specific
+"adjacent-day" mechanism — `yfinance`'s curve has sporadic unexplained spikes throughout the window
+(more than just these 3 bars) with nothing in `ibkr` at the same instant, consistent with ordinary
+Yahoo/yfinance feed noise rather than a nameable bug; a few happening to land near an adjacent day's
+price is most likely coincidence. See `tasks/yahoo_data_sanitization.md` for the follow-up this
+spawned (excluding these bad ticks from reconciliation generally, not just these 3 bars). So the
+actual motivating case is the reverse of the original framing: **`ibkr` should win all three**, and
+promoting that judgment currently means hand-writing SQL against three tables, not running a
+command. (This also means `tasks/quant_reconcile.md`'s Test Results, if it's ever read for these
+specific bars, should be cross-checked against this correction rather than trusted at face value for
+this case.)
 
 ## Design (from initial conversation, not fully converged — see Open questions)
 

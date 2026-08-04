@@ -319,14 +319,34 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Status**: Brainstorm, not converged — several open questions (date/time input format
   especially, given the UTC-vs-ET confusion earlier this session) need resolving before
   implementation.
-- **Key Context**: prompted by reviewing the 3 pending `SPY` bars and judging `yfinance`'s value
-  correct for all three — currently the only way to promote that judgment is hand-writing SQL
-  against three tables (`tasks/quant_reconcile.md`'s "Manual correction" section, "no dedicated
-  tooling implied"). Proposed: new `--finalize` arguments (ticker, date/time, field group, winner)
-  for targeted single-bar promotion, always recorded as `resolution_path = 'manual_override'`
-  regardless of which provider wins — the first *tooled* path for `yfinance` to ever reach
+- **Key Context**: prompted by reviewing the 3 pending `SPY` bars. An initial pass judged
+  `yfinance`'s value correct for all three; a later look at candlestick charts plus the raw
+  `staging_market_data_1min` rows **reversed that** — `ibkr` is internally consistent on all three
+  days, while `yfinance` has one outlier extreme field per bar (alternating `L`/`H`/`L`), each
+  landing suspiciously close to the *adjacent* day's closing price (see
+  `tasks/finalize_targeted_promotion.md`'s Problem statement for the exact numbers). Further
+  candlestick comparison across the full 3-day window (`ibkr`'s curve smooth throughout, `yfinance`'s
+  has sporadic unexplained spikes with no `ibkr` counterpart, including more beyond just these 3
+  bars) points at ordinary Yahoo/yfinance feed noise rather than a specific nameable bug — see the
+  new `tasks/yahoo_data_sanitization.md` this spawned. So `ibkr` should actually win all three —
+  currently the only way to promote that judgment is hand-writing SQL against three tables
+  (`tasks/quant_reconcile.md`'s "Manual correction" section, "no dedicated tooling implied").
+  Proposed: new `--finalize` arguments (ticker, date/time, field group, winner) for targeted
+  single-bar promotion, always recorded as `resolution_path = 'manual_override'` regardless of
+  which provider wins — the first *tooled* path for `yfinance` to ever reach
   `fact_market_data_1min`, correctly feeding `fact_reconciliation_participant`'s existing
   reputation tracking with no changes needed there.
+
+- **File**: [Yahoo data sanitization](tasks/yahoo_data_sanitization.md)
+- **Status**: Brainstorm, disposition converged (mark outlier bars `incomplete=True` and keep the
+  row, reusing Tier 1/`_resolve_completeness` rather than discarding at ingest or building a new
+  tier), outlier-detection rule still open.
+- **Key Context**: spawned from the same `SPY` investigation above. `yfinance`'s raw feed shows
+  sporadic single-field spikes (confirmed via 3-day candlestick comparison against `ibkr`'s smooth
+  curve) that drag an otherwise-agreeing bar's whole `field_group` comparison outside tolerance
+  (`_max_field_diff` takes the max across all 4 OHLC fields), producing false "stuck" bars needing
+  manual review even though `ibkr`'s own value was fine. Not yet quantified how much of the 622-bar
+  backlog (`DOG` especially) this same pattern explains.
 
 ## Pending Tasks
 
