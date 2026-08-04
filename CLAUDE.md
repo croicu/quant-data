@@ -330,25 +330,6 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 
 ## Pending Tasks
 
-- **`MarketData.fetch_pending_resolution_bars`** — issue #26, opened by Claude mid-task (ad-hoc,
-  no `tasks/*.md`). `status:ready-to-submit`, code written locally (lint + unit tests pass), not yet
-  committed — sitting in the working tree pending the repo owner's review. New public
-  `quant_data.protocols.PendingResolutionBar` (`field_group`, `provider`, `bar: OHLCV`) plus
-  `MarketDataProvider`/`PostgresDatabase`/`MarketData`'s
-  `fetch_pending_resolution_bars(ticker, start_date, end_date)` — since
-  `fact_pending_manual_resolution` itself holds no `OHLCV` columns (only the key marking a bar as
-  disputed), the query joins it against `staging_market_data_1min` to return one entry per (bar,
-  field group, provider) still in dispute. Deliberately exposed on the public, `quant_reader`-backed
-  surface (external consumers, not just internal `--finalize` tooling) — a scoping decision made
-  explicitly when this was picked up, since it's the first public method exposing anything from the
-  reconciliation domain (see `docs/ARCHITECTURE.md`'s "Contracts" section). The `quant_reader` grant
-  (`docs/DATABASE.md`'s "Granting quant_reader access to new tables") was applied by the repo owner
-  directly on CroicuWS1 and confirmed via `information_schema.table_privileges`; live-verified
-  end-to-end against the real database for every ticker with a known pending backlog (SPY/DOG/SH/PSQ
-  row counts matched the 2026-08-03 backlog snapshot exactly, 2 providers per pending bar). Once
-  committed/merged, this needs a `cross-repo` announcement issue in `quant-scratch` (new public
-  capability) — not opened yet, deliberately deferred until the code actually ships.
-
 - **Fix ~130s SSH-tunnel connect stall; add `Logger.perf()` timing markers** — issue #19, opened by
   the repo owner from `quant-scratch`-side testing. `status:ready-for-integration`, fix pushed to
   `main` as `cd424a0` — **left open**, per this file's "Who closes an issue" rule:
@@ -556,3 +537,23 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   `DOG`/`SH`/`PSQ`'s already-reliable long counterpart as a third-reference anomaly flag on
   `ibkr`). A third follow-up, `tasks/finalize_targeted_promotion.md` (CLI-tooled single-bar manual
   correction), was prompted by reviewing 3 pending `SPY` bars by hand.
+- **`MarketData.fetch_pending_resolution_bars`** — closed issue #26 (ad-hoc, opened and closed by
+  Claude mid-task per this file's "Who closes an issue" exception; commit `9bed431`). New public
+  `quant_data.protocols.PendingResolutionBar` (`field_group`, `provider`, `bar: OHLCV`) plus
+  `MarketDataProvider`/`PostgresDatabase`/`MarketData`'s
+  `fetch_pending_resolution_bars(ticker, start_date, end_date)`. `fact_pending_manual_resolution`
+  itself holds no `OHLCV` columns, only the key marking a (bar, field group) as still disputed, so
+  the method joins it against `staging_market_data_1min` to return one entry per (bar, field group,
+  provider) still in dispute — surfacing the actual disagreement rather than just that a bar is
+  stuck. Deliberately exposed on the public, `quant_reader`-backed surface (external consumers, not
+  just internal `--finalize` tooling) — the first public method exposing anything from the
+  reconciliation domain, so `docs/ARCHITECTURE.md`'s "Contracts" section (previously claiming
+  `fetch_bars` was the *only* external contract) was updated to match. Required a new `quant_reader`
+  grant on `staging_market_data_1min`/`fact_pending_manual_resolution`/`dim_field_group`/
+  `dim_provider` (`docs/DATABASE.md`'s "Granting quant_reader access to new tables") — role/grant
+  setup isn't tracked in `migrations/`, so this was applied by hand by the repo owner directly on
+  CroicuWS1, not run by Claude (paste-and-run convention for privileged DB ops). Live-verified
+  end-to-end against the real database: row counts matched the known 2026-08-03 pending backlog
+  exactly on every ticker with a backlog (SPY 6, DOG 998, SH 108, PSQ 132 — each pending bar's
+  count doubled, one row per reporting provider). **Cross-repo announcement to `quant-scratch` not
+  yet opened** — deliberately deferred until after this shipped; still outstanding.
