@@ -36,6 +36,74 @@ field_group) instead of sweeping the whole pending queue with `preferredProvider
 - Reuses the existing promote+lazy-purge machinery once the resolution is recorded — no new
   behavior needed there.
 
+## Library API extension (2026-08-04, brainstorm continued)
+
+Originally scoped as a `quant-reconcile --finalize` CLI-only flag (see "Design" above). Once
+`MarketData.fetch_pending_resolution_bars` (quant-data#26/#27) shipped, the same capability came up
+again from the *consumer* side: should `quant-scratch` be able to trigger a targeted resolution
+programmatically, not just have a person run the CLI? Conclusions reached so far, not yet
+implemented:
+
+- **Mechanism: a narrow, credentialed public class, not a network service.** The read side
+  (`MarketData`) is read-only by DB privilege (`quant_reader`, no write grant at all) — a write
+  capability can't just be added to it. The alternative considered was a real network
+  service/RPC layer (so `quant_writer` credentials never reach `quant-scratch`'s machine at all),
+  but the actual goal here is catching *honest mistakes* (hand-writing SQL against three tables),
+  not isolating an untrusted/adversarial caller — there's no multi-tenant or hostile-actor threat
+  model to design against. So a new class (working name `MarketDataWriter`) constructed with
+  `quant_writer` host/user/password — same shape `create_postgres_provider` already uses for
+  `quant_reader` — with a narrow method surface (`resolve_pending_bar(...)`, not raw
+  `write_bars`/SQL access) is enough: it guides a caller toward the validated path instead of
+  hand-rolled writes, without requiring a whole new hosted-service component this repo doesn't
+  have today.
+- **`resolve_pending_bar`'s input shape**: identify the target via `ticker`, `timestamp`,
+  `field_group`, and a winner provider name — exactly the fields `PendingResolutionBar` already
+  exposes (`bar.ticker`, `bar.timestamp`, `field_group`, `provider`), so a client can call
+  `fetch_pending_resolution_bars`, pick whichever entry it wants to win (including the
+  whistleblower's, which is this whole task's original motivating case), and pass those four
+  values straight through. Deliberately **not** passing the candidate's `OHLCV` value itself back
+  to the server — `resolve_pending_bar` re-fetches and validates against the *current*
+  `staging_market_data_1min` row for that (ticker, timestamp, field_group, provider) rather than
+  trusting a client-echoed copy, since it could be stale between the `fetch` and the `resolve`
+  call. No new fields needed on `PendingResolutionBar` for this.
+- **Naming, deferred**: `MarketData` should become `MarketDataReader` once `MarketDataWriter`
+  actually exists, so the two are named by capability rather than one being the unmarked default.
+  Not renamed yet — bundle the rename with actually introducing `MarketDataWriter`/
+  `resolve_pending_bar` as one coordinated breaking change, rather than renaming today with no
+  functional payoff and breaking a second time later.
+- **Breaking changes are fine here, deliberately**: the repo owner is comfortable breaking
+  `MarketData`'s import name outright when this lands — no deprecated alias needed — since
+  `quant-data` and `quant-scratch` are both under their control and can be synchronized directly.
+  Explicit preference for breaking *now*, while `quant-scratch` is still the only consumer, over
+  accumulating back-compat shims that get harder to unwind once more components depend on
+  `quant-data` (see `CLAUDE.md`'s "Future: multiple consumers" section on the registry that doesn't
+  exist yet either, for the same reason).
+- Still needs to converge with the CLI-flag open questions below — both `quant-reconcile
+  --finalize`'s targeted mode and `MarketDataWriter.resolve_pending_bar` should share one
+  underlying core implementation, not duplicate the promote+validate logic.
+- **Optional narrower DB role, `quant_resolver`**: instead of (or alongside) `MarketDataWriter`
+  holding full `quant_writer` credentials, a dedicated role scoped to only what a targeted resolve
+  actually needs — least-privilege on top of the "honest mistakes, not hard security" mechanism
+  already chosen, still without needing a hosted network-service boundary. Based on what
+  `promote_bar_to_fact`/`record_reconciliation`/`clear_pending_manual_resolution`/
+  `purge_staging_bar` (`postgres.py`) actually touch, the grant list is bigger than just the two
+  fact tables in the queue's own name:
+  - `fact_market_data_1min` — INSERT/UPDATE (the promotion itself)
+  - `fact_pending_manual_resolution` — DELETE (clearing the resolved key)
+  - `staging_market_data_1min` — SELECT at minimum, to validate the winner's current value before
+    promoting (the "don't trust the client's echoed `OHLCV`" design above depends on this read);
+    DELETE only if `resolve_pending_bar` also purges (see the open fork below)
+  - `fact_reconciliation` / `fact_reconciliation_participant` — INSERT, or the reputation-tracking
+    benefit this task's own "Design" section calls out silently stops working
+  - `dim_ticker`/`dim_date`/`dim_time`/`dim_field_group`/`dim_provider` — SELECT only (not
+    `quant_writer`'s upsert-on-missing behavior), so a targeted resolve fails clearly on an unknown
+    bar instead of silently creating dimension rows — same reasoning as the existing "Dimension
+    lookup" open question below.
+  - **Open fork**: should `resolve_pending_bar` also purge `staging_market_data_1min` (matching
+    `quant-reconcile`'s existing lazy-purge behavior, needing DELETE there too), or leave purging to
+    the next regular `quant-reconcile` run (a resolved bar's now-redundant staging rows are harmless
+    until then, and it shrinks `quant_resolver` to read-only on that table)?
+
 ## Open questions
 
 Everything below needs to converge before implementation:
