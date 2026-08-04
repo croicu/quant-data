@@ -140,7 +140,7 @@ arguments (or `settings.postgres.sshUser`/`sshKeyPath`, both optional and must b
       # docs/SCHEMA.md's fact_pending_manual_resolution section.
       pending = client.fetch_pending_resolution_bars("SPY", start_date=date(2026, 8, 3), end_date=date(2026, 8, 3))
       for candidate in pending:
-          print(candidate.provider, candidate.field_group, candidate.bar.close)
+          print(candidate.provider, candidate.role.value, candidate.field_group, candidate.bar.close)
   ```
 
 - **CroicuWS1's on-prem hosting** — pass `ssh_user`/`ssh_key_path`; `host`/`port` now mean the

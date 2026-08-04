@@ -7,7 +7,7 @@ from datetime import date, datetime
 import psycopg
 
 from quant_data._internal.contracts import ConnectionTransport
-from quant_data.protocols import OHLCV, LoggingSink, PendingResolutionBar
+from quant_data.protocols import OHLCV, LoggingSink, PendingResolutionBar, ProviderRole
 
 from .diagnostics import Logger
 from .errors import AppError, DateOutOfRangeError
@@ -160,7 +160,7 @@ class PostgresDatabase:
         normalized_ticker = ticker.upper()
 
         query = """
-            SELECT t.ticker, s.timestamp, g.name, p.name, s.open, s.high, s.low, s.close, s.volume, s.incomplete
+            SELECT t.ticker, s.timestamp, g.name, p.name, p.role, s.open, s.high, s.low, s.close, s.volume, s.incomplete
             FROM fact_pending_manual_resolution fpmr
             JOIN dim_ticker t ON t.ticker_id = fpmr.ticker_id
             JOIN dim_date d ON d.date_id = fpmr.date_id
@@ -185,7 +185,7 @@ class PostgresDatabase:
 
         candidates: list[PendingResolutionBar] = []
         for row in rows:
-            row_ticker, row_timestamp, row_field_group, row_provider, row_open, row_high, row_low, row_close, row_volume, row_incomplete = row
+            row_ticker, row_timestamp, row_field_group, row_provider, row_role, row_open, row_high, row_low, row_close, row_volume, row_incomplete = row
             bar = OHLCV(
                 ticker=row_ticker,
                 timestamp=row_timestamp,
@@ -196,7 +196,7 @@ class PostgresDatabase:
                 volume=int(row_volume),
                 incomplete=bool(row_incomplete),
             )
-            candidates.append(PendingResolutionBar(field_group=row_field_group, provider=row_provider, bar=bar))
+            candidates.append(PendingResolutionBar(field_group=row_field_group, provider=row_provider, role=ProviderRole(row_role), bar=bar))
 
         return candidates
 

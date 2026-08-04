@@ -13,6 +13,6 @@ from __future__ import annotations
 
 from quant_data.client.market_data import MarketData
 from quant_data.client.postgres_provider import create_postgres_provider
-from quant_data.protocols import OHLCV, LoggingSink, PendingResolutionBar
+from quant_data.protocols import OHLCV, LoggingSink, PendingResolutionBar, ProviderRole
 
-__all__ = ["MarketData", "OHLCV", "LoggingSink", "PendingResolutionBar", "create_postgres_provider"]
+__all__ = ["MarketData", "OHLCV", "LoggingSink", "PendingResolutionBar", "ProviderRole", "create_postgres_provider"]

@@ -249,11 +249,12 @@ realistic cadence (e.g. plain `quant-reconcile` daily, `--finalize` weekly) — 
 
 Readable externally via `MarketData.fetch_pending_resolution_bars(ticker, start_date, end_date)`
 (`docs/ARCHITECTURE.md`'s `MarketDataProvider` section) — since this table itself has no `OHLCV`
-columns, that method joins it against `staging_market_data_1min` to return one entry per (bar,
-field group, provider) still in dispute, exposing every reporting provider's raw value rather than
-just the fact that a bar is stuck. Requires `quant_reader` to have `SELECT` on
-`staging_market_data_1min`, `dim_field_group`, and `dim_provider` in addition to this table — see
-`docs/DATABASE.md`'s "Granting quant_reader access to new tables".
+columns, that method joins it against `staging_market_data_1min` (and `dim_provider`, for `role`)
+to return one entry per (bar, field group, provider) still in dispute, exposing every reporting
+provider's raw value *and* whether it's the candidate or whistleblower, rather than just the fact
+that a bar is stuck. Requires `quant_reader` to have `SELECT` on `staging_market_data_1min`,
+`dim_field_group`, and `dim_provider` in addition to this table — see `docs/DATABASE.md`'s
+"Granting quant_reader access to new tables".
 
 ## Indexes
 

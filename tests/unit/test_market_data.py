@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from quant_data.client.market_data import MarketData
-from quant_data.protocols import OHLCV, PendingResolutionBar
+from quant_data.protocols import OHLCV, PendingResolutionBar, ProviderRole
 from tests.mocks.postgres import MockPostgresDatabase
 
 
@@ -25,11 +25,13 @@ def test_fetch_pending_resolution_bars_delegates_to_provider():
         PendingResolutionBar(
             field_group="ohlc",
             provider="yfinance",
+            role=ProviderRole.WHISTLEBLOWER,
             bar=OHLCV(ticker="SPY", timestamp=datetime(2026, 8, 3, 13, 30), open=1.0, high=2.0, low=0.5, close=1.5, volume=100),
         ),
         PendingResolutionBar(
             field_group="ohlc",
             provider="ibkr",
+            role=ProviderRole.CANDIDATE,
             bar=OHLCV(ticker="SPY", timestamp=datetime(2026, 8, 3, 13, 30), open=1.1, high=2.1, low=0.6, close=1.6, volume=110),
         ),
     ]
@@ -41,6 +43,12 @@ def test_fetch_pending_resolution_bars_delegates_to_provider():
     assert {candidate.provider for candidate in candidates} == {"yfinance", "ibkr"}
     assert all(candidate.field_group == "ohlc" for candidate in candidates)
     assert all(candidate.bar.ticker == "SPY" for candidate in candidates)
+
+    whistleblower_providers = []
+    for candidate in candidates:
+        if candidate.role == ProviderRole.WHISTLEBLOWER:
+            whistleblower_providers.append(candidate.provider)
+    assert whistleblower_providers == ["yfinance"]
 
 
 def test_close_delegates_to_provider():

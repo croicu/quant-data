@@ -84,12 +84,21 @@ independent top-level packages.
   `False`) — set when the provider couldn't supply full data for that minute (see
   `docs/SCHEMA.md`'s `fact_market_data_1min.incomplete`). Re-exported at the `quant_data` top
   level.
-- `PendingResolutionBar`: `field_group` (`str`), `provider` (`str`), `bar` (`OHLCV`) — one
-  provider's disputed staging value for a (bar, field group) still awaiting manual resolution
-  (`fact_pending_manual_resolution`). A bar is pending precisely because its reporting providers
-  disagree, so `MarketDataProvider.fetch_pending_resolution_bars` returns one entry per (bar,
-  field group, provider) rather than a single `OHLCV`, letting a caller see the actual
-  disagreement instead of just that a bar is stuck. Re-exported at the `quant_data` top level.
+- `ProviderRole(Enum)`: `CANDIDATE`/`WHISTLEBLOWER`, mirroring `dim_provider.role`'s `CHECK`
+  constraint. A closed set (unlike e.g. `LoggingSink`'s open `category` strings), so this follows
+  the same pattern as `_internal.shared.diagnostics.TelemetryLevel` — the one other closed-set
+  string column in this codebase already modeled as an `Enum` — rather than a plain `str`.
+  Re-exported at the `quant_data` top level.
+- `PendingResolutionBar`: `field_group` (`str`), `provider` (`str`), `role` (`ProviderRole`),
+  `bar` (`OHLCV`) — one provider's disputed staging value for a (bar, field group) still awaiting
+  manual resolution (`fact_pending_manual_resolution`). A bar is pending precisely because its
+  reporting providers disagree, so `MarketDataProvider.fetch_pending_resolution_bars` returns one
+  entry per (bar, field group, provider) rather than a single `OHLCV`, letting a caller see the
+  actual disagreement instead of just that a bar is stuck. `role` (sourced from
+  `dim_provider.role`) is what actually lets a caller identify the reference value among possibly
+  several candidates — today's data is exactly one whistleblower (`yfinance`) plus one candidate
+  (`ibkr`), but `dim_provider` isn't hardcoded to two rows, so don't assume exactly one candidate.
+  Re-exported at the `quant_data` top level.
 - `LoggingSink(Protocol)`: `diagnostic`/`info`/`warning`/`error`/`fatal(message, category="general")`
   plus `perf(description, elapsed_seconds)` — the injectable logging contract (quant-data#20).
   Mirrors `_internal.shared.diagnostics.DiagnosticsLogSink`'s method surface exactly, so a host

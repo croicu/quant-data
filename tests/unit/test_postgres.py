@@ -7,7 +7,7 @@ import pytest
 
 from quant_data._internal.shared.errors import AppError, DateOutOfRangeError
 from quant_data._internal.shared.postgres import DisagreementStatsRow, FieldGroupRow, PostgresDatabase, ProviderRow, StagingRow
-from quant_data.protocols import OHLCV, PendingResolutionBar
+from quant_data.protocols import OHLCV, PendingResolutionBar, ProviderRole
 
 
 class _FakeTransport:
@@ -460,8 +460,8 @@ def test_fetch_pending_manual_resolution_staging_rows_returns_rows(mock_psycopg)
 def test_fetch_pending_resolution_bars_returns_one_candidate_per_provider(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
     mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        ("SPY", datetime(2026, 8, 3, 13, 30), "ohlc", "ibkr", 100.0, 101.0, 99.0, 100.5, 1000, False),
-        ("SPY", datetime(2026, 8, 3, 13, 30), "ohlc", "yfinance", 100.1, 101.1, 99.1, 100.6, 1010, False),
+        ("SPY", datetime(2026, 8, 3, 13, 30), "ohlc", "ibkr", "candidate", 100.0, 101.0, 99.0, 100.5, 1000, False),
+        ("SPY", datetime(2026, 8, 3, 13, 30), "ohlc", "yfinance", "whistleblower", 100.1, 101.1, 99.1, 100.6, 1010, False),
     ]
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_reader", password="", dbname="quant_data")
@@ -472,11 +472,13 @@ def test_fetch_pending_resolution_bars_returns_one_candidate_per_provider(mock_p
         PendingResolutionBar(
             field_group="ohlc",
             provider="ibkr",
+            role=ProviderRole.CANDIDATE,
             bar=OHLCV(ticker="SPY", timestamp=datetime(2026, 8, 3, 13, 30), open=100.0, high=101.0, low=99.0, close=100.5, volume=1000, incomplete=False),
         ),
         PendingResolutionBar(
             field_group="ohlc",
             provider="yfinance",
+            role=ProviderRole.WHISTLEBLOWER,
             bar=OHLCV(ticker="SPY", timestamp=datetime(2026, 8, 3, 13, 30), open=100.1, high=101.1, low=99.1, close=100.6, volume=1010, incomplete=False),
         ),
     ]
