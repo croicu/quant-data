@@ -537,24 +537,34 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   `DOG`/`SH`/`PSQ`'s already-reliable long counterpart as a third-reference anomaly flag on
   `ibkr`). A third follow-up, `tasks/finalize_targeted_promotion.md` (CLI-tooled single-bar manual
   correction), was prompted by reviewing 3 pending `SPY` bars by hand.
-- **`MarketData.fetch_pending_resolution_bars`** — closed issue #26 (ad-hoc, opened and closed by
-  Claude mid-task per this file's "Who closes an issue" exception; commit `9bed431`). New public
-  `quant_data.protocols.PendingResolutionBar` (`field_group`, `provider`, `bar: OHLCV`) plus
-  `MarketDataProvider`/`PostgresDatabase`/`MarketData`'s
-  `fetch_pending_resolution_bars(ticker, start_date, end_date)`. `fact_pending_manual_resolution`
-  itself holds no `OHLCV` columns, only the key marking a (bar, field group) as still disputed, so
-  the method joins it against `staging_market_data_1min` to return one entry per (bar, field group,
-  provider) still in dispute — surfacing the actual disagreement rather than just that a bar is
-  stuck. Deliberately exposed on the public, `quant_reader`-backed surface (external consumers, not
-  just internal `--finalize` tooling) — the first public method exposing anything from the
-  reconciliation domain, so `docs/ARCHITECTURE.md`'s "Contracts" section (previously claiming
-  `fetch_bars` was the *only* external contract) was updated to match. Required a new `quant_reader`
-  grant on `staging_market_data_1min`/`fact_pending_manual_resolution`/`dim_field_group`/
-  `dim_provider` (`docs/DATABASE.md`'s "Granting quant_reader access to new tables") — role/grant
-  setup isn't tracked in `migrations/`, so this was applied by hand by the repo owner directly on
-  CroicuWS1, not run by Claude (paste-and-run convention for privileged DB ops). Live-verified
-  end-to-end against the real database: row counts matched the known 2026-08-03 pending backlog
-  exactly on every ticker with a backlog (SPY 6, DOG 998, SH 108, PSQ 132 — each pending bar's
-  count doubled, one row per reporting provider). Announced to `quant-scratch` via
-  [croicu/quant-scratch#15](https://github.com/croicu/quant-scratch/issues/15) (additive, so
-  informational/opt-in rather than a forced migration — same pattern as issue #17's announcement).
+- **`MarketData.fetch_pending_resolution_bars`** — closed issues #26 and #27 (both ad-hoc, opened
+  and closed by Claude mid-task per this file's "Who closes an issue" exception; commits `9bed431`
+  and `7b4423b`). New public `quant_data.protocols.PendingResolutionBar` (`field_group`,
+  `provider`, `role: ProviderRole`, `bar: OHLCV`), new public `ProviderRole(Enum)`
+  (`CANDIDATE`/`WHISTLEBLOWER`, mirroring `dim_provider.role`'s `CHECK` constraint — modeled as an
+  `Enum` rather than a plain `str` since it's a genuinely closed set, matching
+  `_internal.shared.diagnostics.TelemetryLevel`'s precedent, the one other closed-set string column
+  in this codebase; #27 was a same-session follow-up fixing this after `provider`-only made the
+  whistleblower unidentifiable in the returned list), plus `MarketDataProvider`/`PostgresDatabase`/
+  `MarketData`'s `fetch_pending_resolution_bars(ticker, start_date, end_date)`.
+  `fact_pending_manual_resolution` itself holds no `OHLCV` columns, only the key marking a (bar,
+  field group) as still disputed, so the method joins it against `staging_market_data_1min` (and
+  `dim_provider`, for `role`) to return one entry per (bar, field group, provider) still in
+  dispute — surfacing the actual disagreement and which side is the reference, rather than just
+  that a bar is stuck. Deliberately exposed on the public, `quant_reader`-backed surface (external
+  consumers, not just internal `--finalize` tooling) — the first public method exposing anything
+  from the reconciliation domain, so `docs/ARCHITECTURE.md`'s "Contracts" section (previously
+  claiming `fetch_bars` was the *only* external contract) was updated to match. Required a new
+  `quant_reader` grant on `staging_market_data_1min`/`fact_pending_manual_resolution`/
+  `dim_field_group`/`dim_provider` (`docs/DATABASE.md`'s "Granting quant_reader access to new
+  tables") — role/grant setup isn't tracked in `migrations/`, so this was applied by hand by the
+  repo owner directly on CroicuWS1, not run by Claude (paste-and-run convention for privileged DB
+  ops); #27 needed no additional grant (`dim_provider` was already covered). Live-verified
+  end-to-end against the real database at both stages: row counts matched the known 2026-08-03
+  pending backlog exactly on every ticker with a backlog (SPY 6, DOG 998, SH 108, PSQ 132 — each
+  pending bar's count doubled, one row per reporting provider), and `role` correctly resolved to
+  `ProviderRole.CANDIDATE`/`ProviderRole.WHISTLEBLOWER` on every row. Announced to `quant-scratch`
+  via [croicu/quant-scratch#15](https://github.com/croicu/quant-scratch/issues/15) (additive, so
+  informational/opt-in rather than a forced migration — same pattern as issue #17's announcement);
+  its body was edited in place (not left stale) once #27 landed, since #15 was still
+  `status:brainstorm`/unintegrated at that point.
