@@ -22,6 +22,19 @@ class OHLCV:
     incomplete: bool = False
 
 
+@dataclass
+class PendingResolutionBar:
+    """One provider's disputed staging value for a (bar, field group) still awaiting manual
+    resolution (fact_pending_manual_resolution) -- a bar is pending precisely because its
+    reporting providers disagree, so a single OHLCV per bar would hide the actual disagreement.
+    field_group is currently always "ohlc" (the only active dim_field_group row), included for
+    forward compatibility if a second field group is ever added."""
+
+    field_group: str
+    provider: str
+    bar: OHLCV
+
+
 class LoggingSink(Protocol):
     """Injectable logging contract -- a host application (e.g. quant-scratch) can pass its own
     logger into create_postgres_provider/PostgresDatabase/MarketData and quant_data writes

@@ -135,6 +135,12 @@ arguments (or `settings.postgres.sshUser`/`sshKeyPath`, both optional and must b
   with MarketData(provider) as client:
       bars = client.fetch_bars("AAPL", start_date=date(2026, 1, 15), end_date=date(2026, 1, 15))
       print(len(bars))
+
+      # One entry per (bar, field group, provider) still awaiting manual resolution -- see
+      # docs/SCHEMA.md's fact_pending_manual_resolution section.
+      pending = client.fetch_pending_resolution_bars("SPY", start_date=date(2026, 8, 3), end_date=date(2026, 8, 3))
+      for candidate in pending:
+          print(candidate.provider, candidate.field_group, candidate.bar.close)
   ```
 
 - **CroicuWS1's on-prem hosting** — pass `ssh_user`/`ssh_key_path`; `host`/`port` now mean the
@@ -167,6 +173,23 @@ private one (see `docs/ARCHITECTURE.md`'s `LoggingSink` section).
 (e.g. writing your own ingest tooling), with connection details from
 `settings.json`/`settings.local.json`'s `postgres` section (see `docs/ARCHITECTURE.md` for the
 full shape).
+
+## Granting `quant_reader` access to new tables
+
+Role/grant setup isn't tracked in `migrations/` (it was done ad hoc when `quant_reader` was
+created — see `docs/SCHEMA.md`'s "Roles" note) — new tables don't automatically become readable by
+`quant_reader` just because a new `MarketData` method queries them. As of
+`MarketData.fetch_pending_resolution_bars`, `quant_reader` additionally needs `SELECT` on
+`staging_market_data_1min`, `fact_pending_manual_resolution`, `dim_field_group`, and `dim_provider`
+(join targets of that query) — run this once, connected as the schema-owner role, against each
+environment that should serve it:
+
+```sql
+GRANT SELECT ON staging_market_data_1min, fact_pending_manual_resolution, dim_field_group, dim_provider TO quant_reader;
+```
+
+Without this, `fetch_pending_resolution_bars` fails with a real Postgres `permission denied`, the
+same enforcement `docs/ARCHITECTURE.md` documents for the write side.
 
 ## Populating real data
 

@@ -7,7 +7,7 @@ from datetime import date, datetime
 import psycopg
 
 from quant_data._internal.contracts import ConnectionTransport
-from quant_data.protocols import OHLCV, LoggingSink
+from quant_data.protocols import OHLCV, LoggingSink, PendingResolutionBar
 
 from .diagnostics import Logger
 from .errors import AppError, DateOutOfRangeError
@@ -155,6 +155,50 @@ class PostgresDatabase:
             bars.append(bar)
 
         return bars
+
+    def fetch_pending_resolution_bars(self, ticker: str, start_date: date, end_date: date) -> list[PendingResolutionBar]:
+        normalized_ticker = ticker.upper()
+
+        query = """
+            SELECT t.ticker, s.timestamp, g.name, p.name, s.open, s.high, s.low, s.close, s.volume, s.incomplete
+            FROM fact_pending_manual_resolution fpmr
+            JOIN dim_ticker t ON t.ticker_id = fpmr.ticker_id
+            JOIN dim_date d ON d.date_id = fpmr.date_id
+            JOIN dim_field_group g ON g.field_group_id = fpmr.field_group_id
+            JOIN staging_market_data_1min s
+                ON s.ticker_id = fpmr.ticker_id AND s.date_id = fpmr.date_id AND s.time_id = fpmr.time_id
+            JOIN dim_provider p ON p.provider_id = s.provider_id
+            WHERE t.ticker = %s AND d.date BETWEEN %s AND %s
+            ORDER BY s.timestamp, p.name
+        """
+
+        started = time.perf_counter()
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(query, (normalized_ticker, start_date, end_date))
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch pending-resolution bars for '{normalized_ticker}' from {start_date} to {end_date}: {error}") from error
+        self._logger.perf(
+            f"fetch_pending_resolution_bars({normalized_ticker}, {start_date.isoformat()}..{end_date.isoformat()})", time.perf_counter() - started
+        )
+
+        candidates: list[PendingResolutionBar] = []
+        for row in rows:
+            row_ticker, row_timestamp, row_field_group, row_provider, row_open, row_high, row_low, row_close, row_volume, row_incomplete = row
+            bar = OHLCV(
+                ticker=row_ticker,
+                timestamp=row_timestamp,
+                open=float(row_open),
+                high=float(row_high),
+                low=float(row_low),
+                close=float(row_close),
+                volume=int(row_volume),
+                incomplete=bool(row_incomplete),
+            )
+            candidates.append(PendingResolutionBar(field_group=row_field_group, provider=row_provider, bar=bar))
+
+        return candidates
 
     def _resolve_dimension_ids(self, cursor: psycopg.Cursor, bar: OHLCV) -> tuple[int, int, int]:
         normalized_ticker = bar.ticker.upper()

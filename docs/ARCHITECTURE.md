@@ -84,6 +84,12 @@ independent top-level packages.
   `False`) — set when the provider couldn't supply full data for that minute (see
   `docs/SCHEMA.md`'s `fact_market_data_1min.incomplete`). Re-exported at the `quant_data` top
   level.
+- `PendingResolutionBar`: `field_group` (`str`), `provider` (`str`), `bar` (`OHLCV`) — one
+  provider's disputed staging value for a (bar, field group) still awaiting manual resolution
+  (`fact_pending_manual_resolution`). A bar is pending precisely because its reporting providers
+  disagree, so `MarketDataProvider.fetch_pending_resolution_bars` returns one entry per (bar,
+  field group, provider) rather than a single `OHLCV`, letting a caller see the actual
+  disagreement instead of just that a bar is stuck. Re-exported at the `quant_data` top level.
 - `LoggingSink(Protocol)`: `diagnostic`/`info`/`warning`/`error`/`fatal(message, category="general")`
   plus `perf(description, elapsed_seconds)` — the injectable logging contract (quant-data#20).
   Mirrors `_internal.shared.diagnostics.DiagnosticsLogSink`'s method surface exactly, so a host
@@ -107,11 +113,16 @@ independent top-level packages.
 
 ### `quant_data._internal.contracts`
 
-- `MarketDataProvider(Protocol)`: `fetch_bars(ticker, start_date, end_date) -> list[OHLCV]` plus
+- `MarketDataProvider(Protocol)`: `fetch_bars(ticker, start_date, end_date) -> list[OHLCV]`,
+  `fetch_pending_resolution_bars(ticker, start_date, end_date) -> list[PendingResolutionBar]`, plus
   `close() -> None`, read-only. The read-side contract `MarketData` depends on (not
   `PostgresDatabase` concretely) and that `PostgresDatabase` implements (via
   `create_postgres_provider`) — not something external consumers import directly, since they use
-  `MarketData` plus a factory instead.
+  `MarketData` plus a factory instead. `fetch_pending_resolution_bars` joins
+  `fact_pending_manual_resolution` against `staging_market_data_1min` (on ticker/date/time) to
+  surface every candidate/whistleblower provider's disputed raw value for a still-pending (bar,
+  field group) — `fact_pending_manual_resolution` itself holds no `OHLCV` data, only the key
+  marking a (bar, field group) as stuck, so the actual values are read from staging.
 - `IntraDayProvider(Protocol)`: `connect() -> None`, `fetch_bars(ticker, target_date) ->
   list[OHLCV]` for a single session day, and `close() -> None`. The ingest-side contract for
   external data sources — `ingest` depends on this abstraction, not concretely on whichever
@@ -418,7 +429,10 @@ the full design (field consistency groups, the candidate/whistleblower model, th
   factory. Deliberately doesn't expose `write_bars` at all — for the Postgres backend specifically,
   the real enforcement of "no client can write" is the `quant_reader` role's DB-level privileges,
   not this class's shape, but a narrower surface is still better ergonomics regardless of backend.
-  Re-exported at `quant_data` top level (`from quant_data import MarketData`).
+  `fetch_pending_resolution_bars(ticker, start_date, end_date)` delegates straight to the provider,
+  same shape as `fetch_bars` — the first public method exposing anything from the reconciliation
+  domain (see "Contracts" below). Re-exported at `quant_data` top level (`from quant_data import
+  MarketData`).
 - `postgres_provider.py` — `create_postgres_provider(host, port, dbname, user="quant_reader",
   password="", ssh_user=None, ssh_key_path=None)`: today's factory, resolves a
   `ConnectionTransport` from the `ssh_user`/`ssh_key_path` kwargs (`transports.resolve_transport`)
@@ -465,6 +479,11 @@ behavior — `LoggingSink` is behavioral too — it's public-vs-private: `protoc
 external consumers. The database schema itself (five dimension tables, `fact_market_data_1min`,
 `staging_market_data_1min`, and `reconcile`'s own `fact_reconciliation`/
 `fact_reconciliation_participant`/`provider_pair_disagreement`) remains the underlying persisted
-contract — see `docs/SCHEMA.md`. Only `fact_market_data_1min` and `MarketData.fetch_bars` are the
-actual external contract, though — everything else is this repo's own internal write-path
-plumbing, never queried directly by `quant-scratch` or any other consumer.
+contract — see `docs/SCHEMA.md`. `fact_market_data_1min` (via `MarketData.fetch_bars`) and, as of
+`MarketData.fetch_pending_resolution_bars`, `fact_pending_manual_resolution` joined against
+`staging_market_data_1min` are the actual external contract now — everything else (
+`fact_reconciliation`, `fact_reconciliation_participant`, `provider_pair_disagreement`,
+`dim_provider.role`) is still this repo's own internal write-path plumbing, never queried directly
+by `quant-scratch` or any other consumer. Exposing pending-resolution data required a `quant_reader`
+grant on `staging_market_data_1min`/`fact_pending_manual_resolution`/`dim_field_group`/
+`dim_provider` — see `docs/DATABASE.md`'s "Granting quant_reader access to new tables".

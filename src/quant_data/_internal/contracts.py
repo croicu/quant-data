@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Protocol
 
-from quant_data.protocols import OHLCV
+from quant_data.protocols import OHLCV, PendingResolutionBar
 
 
 class MarketDataProvider(Protocol):
@@ -18,6 +18,14 @@ class MarketDataProvider(Protocol):
         no write methods on this contract; see quant_data._internal.shared.postgres.PostgresDatabase
         for the concrete implementation, which does expose a write path but only for the
         ingest-side caller."""
+        ...
+
+    def fetch_pending_resolution_bars(self, ticker: str, start_date: date, end_date: date) -> list[PendingResolutionBar]:
+        """Read every provider's disputed staging value for (bar, field group)s still awaiting
+        manual resolution (fact_pending_manual_resolution), for a ticker over an inclusive date
+        range -- one entry per (bar, field group, provider) that reported a staging value, so a
+        caller can see the actual disagreement instead of just that a bar is stuck. Read-only,
+        same contract shape as fetch_bars."""
         ...
 
     def close(self) -> None:
