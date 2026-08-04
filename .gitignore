@@ -31,7 +31,3 @@ settings.local.json
 
 # Local DB backups (real data snapshots, personal-machine artifacts)
 backups/
-
-# Machine-local scratch data (e.g. paid third-party data pulls) -- never committed, never shared
-# outside whichever machine it was created on
-/local/
