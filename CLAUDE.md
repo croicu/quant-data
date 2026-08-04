@@ -153,6 +153,14 @@ For any non-trivial feature or change, follow these stages:
    consumer (e.g. `quant-scratch`) to pull the updated `quant-data` and re-test in its own context.
    An issue with no such downstream dependency (a same-repo bug, nothing cross-repo) skips this
    stage entirely — `status:ready-to-submit` is already its terminal pre-close state.
+   **The gate is real, verifiable output existing for the consumer to check, not just code having
+   merged** — issue #21 (IBKR provider) was relabeled `status:ready-for-integration` when the
+   provider code itself landed, but `fact_market_data_1min` was still empty at that point, so there
+   was nothing yet for `quant-scratch` to actually pull and verify. A later, otherwise-unrelated
+   commit (`f5b192f`, `quant-reconcile` promoting real `ibkr`-sourced rows into
+   `fact_market_data_1min` for the first time) is what made the label meaningfully true. When
+   relabeling, ask whether the consumer would actually see something different by pulling now —
+   not just whether the relevant code merged.
 6. **Done** — close the issue after merge. For a planned task, delete `tasks/<task-name>.md` once the issue is closed — the issue (body + comments) is the sole source of truth from that point on, so there's no reason to keep a stale duplicate on disk. (Only applies when a real issue holds the full history; a Done task with no issue keeps its local file.) Ad-hoc tasks have nothing to delete.
 
 **Who closes an issue**: applies to issues opened "in the family" — by the repo owner themselves
