@@ -28,3 +28,6 @@ settings.local.json
 .env
 *.pem
 *.key
+
+# Local DB backups (real data snapshots, personal-machine artifacts)
+backups/

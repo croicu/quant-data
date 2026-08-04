@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 quant-ingest = "ingest.cli:main"
+quant-reconcile = "reconcile.cli:main"
 
 [project.optional-dependencies]
 dev = [

@@ -1,8 +1,10 @@
 # quant-reconcile
 
 ## Status: Brainstorm overall (design converged, no open questions remaining) — schema-only slice
-done, applied to the real database, verified — issue #24, `status:ready-to-submit`.
-`quant-reconcile`'s own CLI/logic (automatic pass, `--finalize`, manual correction) is not started.
+done, applied to the real database, verified — issue #24, closed. `quant-reconcile` itself
+(`src/reconcile/`: `algorithm.py`'s Tiers 1-3 + Welford stats, `cli.py`'s orchestration and
+`--finalize`) is implemented and unit-tested; manual correction needs no code (direct hand-edit,
+per design). Not yet verified against the real database.
 
 ## Problem statement
 
@@ -41,7 +43,9 @@ that resolve independently:
 - **OHLC** (`open`/`high`/`low`/`close`) forms one group — must come from a single provider
   together, since assembling it from two different providers' individual fields risks an
   internally inconsistent bar (e.g. `low` > `close`).
-- **Volume** is its own independent group.
+- **Volume was originally its own independent group** — see "Superseded: volume as an
+  independent group" below. As of `tasks/volume_reconciliation.md`, it no longer is: volume
+  simply rides along with whichever provider wins the `ohlc` group.
 - Modeled as a proper dimension, `dim_field_group` (mirrors `dim_ticker`/`dim_provider`'s shape),
   not a code-only mapping — extensible the same way those are: new fields added to
   `fact_market_data_1min` later get assigned to an existing group or a new group row at that time,
@@ -230,6 +234,68 @@ deliberately overrides in. Recorded with `resolution_path = 'manual_override'`, 
   actually correct. Only an actual person overriding a specific value is real evidence about which
   provider was wrong, so only that counts toward reputation.
 
+**Updated (2026-08-03): explicit pending-manual-resolution queue, `fact_pending_manual_resolution`.**
+The original design (Tier 4 above, and `--finalize`'s own description) treated "still stuck" as an
+*implicit* state — inferred by absence of a `fact_reconciliation` row, with every plain
+`quant-reconcile` run re-fetching and re-evaluating every such bar regardless of whether anything
+relevant had changed since the last attempt. Under a realistic operational cadence (e.g. plain
+`quant-reconcile` run daily, `--finalize` run only weekly) this compounds for days between any
+relief, and would keep compounding indefinitely for any residual disagreement automatic tiers never
+resolve (real anomalies are *supposed* to stay unresolved — that's the point of the state; the
+re-processing cost was the actual problem, not the state itself). Fixed by making the state
+explicit, following the same "presence of a row is the status" pattern `fact_reconciliation`
+already uses:
+
+- `fact_pending_manual_resolution(ticker_id, date_id, time_id, field_group_id, flagged_at)` — one
+  row per (bar, group) that exhausted Tiers 1-3 within a run's automatic pass and still didn't
+  resolve. Presence *is* "awaiting `--finalize`/manual correction"; absence (for a bar otherwise
+  still in staging) means either not yet attempted at all, or not yet fully evaluated this run.
+  Same grain as `fact_reconciliation`, on purpose — if a second field group is ever added, pending
+  state stays trackable per-group, not just per-bar. Partial index on this table's own rows (it
+  only ever holds the pending subset, so no `WHERE` qualifier needed on the index itself) keeps
+  `--finalize`'s fetch fast regardless of how large `staging_market_data_1min` grows.
+- **Plain `quant-reconcile` only ever fetches/evaluates (bar, group)s with no row here.** Once the
+  automatic pass's fixed-point loop (see the seeding-lag fix above) concludes for a run and a group
+  still hasn't resolved, it gets a row inserted here — a new write path; previously nothing was
+  written for a stuck group at all. Every future plain run then skips it entirely, rather than
+  paying fetch-and-evaluate cost for an outcome that can't have changed.
+- **`--finalize` fetches *only* what has a row here** and runs the finalize algorithm directly (no
+  Tier 1-3 re-attempt — already known to fail). It is deliberately **not** a superset of the plain
+  pass; it doesn't also evaluate not-yet-attempted (bar, group)s. This is a clean two-step split —
+  plain runs own "attempt and flag," `--finalize` owns "sweep what's flagged" — matching the
+  intended cadence above. Consequence, accepted as correct rather than a bug: a `--finalize` run
+  with no plain run ever having happened first has nothing to do yet.
+- Once `--finalize` (or manual correction) resolves a pending (bar, group), its
+  `fact_pending_manual_resolution` row is deleted as part of the same promotion — the table only
+  ever holds what's genuinely still awaiting attention.
+- Trades away automatic re-resolution of a flagged (bar, group) if conditions later improve enough
+  that Tiers 1-3 would have cleanly resolved it (e.g. `tasks/per_ticker_disagreement.md`'s
+  per-ticker training maturing after the flag was set) — accepted as a one-time, bounded cost:
+  once a ticker's tolerance is properly calibrated, *future* bars simply won't reach this state in
+  the first place, so this only affects bars already flagged before that point, not an ongoing drag.
+- **Known, accepted gap in the lazy-purge interaction**: a `--finalize` run doesn't re-check
+  purge-eligibility for an already-resolved bar whose only blocker was a *different*, still-pending
+  neighbor (that neighbor isn't fetched in `--finalize`'s narrower scope, so it can't be seen as
+  newly-unblocked). Self-heals on the very next plain run instead, which re-fetches the
+  already-resolved bar (no Tier 1-3 re-attempt, since `fact_reconciliation` already has it) and
+  re-checks the now-cleared neighbor. Not solved further, since the intended cadence bounds it to
+  at most one extra day's delay.
+
+**Live-verified against the real database, 2026-08-03.** `migrations/006_add_pending_manual_resolution.sql`
+applied, then `quant-reconcile` run against the real leftover staging data from the full-dataset run
+(9,006 rows: the 622 genuinely-stuck bars, ~400 already-resolved bars purge-blocked by a stuck
+neighbor, and 6,962 single-provider gaps). **Result: 0 resolved, 622 newly marked pending manual
+resolution** — matching exactly `DOG` 499 / `PSQ` 66 / `SH` 54 / `SPY` 3 (0 for `QQQ`/`DIA`, as
+expected). A second run immediately after touched **0 rows newly** and its own
+`fetch_staging_rows_for_reconciliation` fetch dropped from 2,044 rows to 800 — the 622 pending
+bars (1,244 rows) are now excluded entirely, confirming the skip mechanism works against real
+production data, not just the unit tests. `staging_market_data_1min` still holds all 9,006 rows
+(marking pending doesn't purge — only `--finalize` or manual correction resolving a bar does).
+
+Tracked as [issue #25](https://github.com/croicu/quant-data/issues/25), `status:ready-to-submit`
+— implemented, tested, live-verified; the code itself is still uncommitted alongside the rest of
+`quant-reconcile`'s still-uncommitted work.
+
 **Noise-source coverage** — what the above actually handles vs. defers:
 
 | Source | Handled by |
@@ -296,6 +362,40 @@ actual logic (automatic pass, `--finalize`, manual correction) as separate, late
 `preferredProvider`/`k` settings they read) is separate, later work — a follow-up issue once this
 schema slice lands.
 
+## Implementation plan (`quant-reconcile` CLI itself)
+
+1. `Settings.reconcile` (`ReconcileSettings`: `preferred_provider` default `"ibkr"`, `k` default
+   `3.0`), parsed from `settings.json`'s `reconcile` object (`preferredProvider`/`k`).
+2. `src/reconcile/algorithm.py` — pure functions, no database access:
+   `resolve_automatic` (Tiers 1-3), `resolve_finalize` (the `preferredProvider` fallback),
+   `welford_update`/`stddev_from_stats`/`relative_diffs_for_stats_update` (the running-variance
+   machinery). `ProviderBar`/`Resolution`/`DisagreementStats` are this module's own domain
+   types — deliberately not shared with `quant_data._internal.shared.postgres`, which stays
+   unaware of any reconciliation concept.
+3. `quant_data._internal.shared.postgres.PostgresDatabase` gains reconcile-facing read/write
+   methods (`fetch_dim_providers`, `fetch_dim_field_groups`, `fetch_provider_pair_disagreement`,
+   `fetch_staging_rows_for_reconciliation`, `fetch_resolved_field_groups`,
+   `record_reconciliation`, `promote_bar_to_fact`, `save_provider_pair_disagreement`) — same
+   connection-owning class as `ingest`'s writes, not a second implementation. Returns plain row
+   dataclasses (`ProviderRow`, `FieldGroupRow`, `StagingRow`, `DisagreementStatsRow`), keeping
+   `quant_data._internal` acyclic with respect to `reconcile` (rule 8).
+4. `src/reconcile/cli.py` — `quant-reconcile [--finalize] [--debug]`. `run_reconciliation` fetches
+   every dimension/stats table plus every staging row belonging to a bar where every provider in
+   `settings.providers` has reported (one bulk fetch per table, not a round trip per bar — Tier
+   3's neighbor-minute lookups are served from the same in-memory staging rows via each row's own
+   `timestamp` column), then resolves each not-yet-resolved (bar, field group), promoting a bar to
+   `fact_market_data_1min` once every group has a resolution.
+5. `pyproject.toml`: `quant-reconcile = "reconcile.cli:main"` console script; `src/reconcile/` is a
+   new top-level package, same shape as `src/ingest/` (no importable surface).
+6. `docs/ARCHITECTURE.md`/`docs/PROTOCOL.md`/`docs/SCHEMA.md` updated.
+7. Unit tests: `tests/unit/test_reconcile_algorithm.py` (pure tier logic), `tests/unit/
+   test_postgres.py` (new reconcile-facing methods, mocked `psycopg`), `tests/unit/
+   test_reconcile_cli.py` (`run_reconciliation` end-to-end against an in-memory
+   `FakeReconcileDatabase`, `tests/mocks/reconcile_database.py`), `tests/unit/test_settings.py`
+   (`ReconcileSettings` parsing).
+8. Live verification against the real CroicuWS1 database — **requires explicit go-ahead first**,
+   same rule as the schema migration itself.
+
 ## Test results
 
 **Schema-only slice: done.** Applied to the real CroicuWS1 database directly (via `psql` on the
@@ -310,7 +410,145 @@ box itself, as `quant_data`); verified independently, read-only, via `quant_read
   `fact_market_data_1min`, `fact_reconciliation`, `fact_reconciliation_participant`,
   `provider_pair_disagreement`, `schema_migrations`, `staging_market_data_1min`).
 - `fact_reconciliation`/`fact_reconciliation_participant` empty, as expected — no Python code
-  consumes them yet.
+  consumed them yet at that point.
 
-No automated tests (no Python code changed). `quant-reconcile`'s own CLI/logic remains open —
-tracked as a follow-up issue once this schema lands.
+**`quant-reconcile` CLI itself: implemented, unit-tested, not yet verified live.** 39 new unit
+tests: 14 in `test_reconcile_algorithm.py` (each tier, the preferred-provider tie-break, Welford
+update/stddev, relative-diff computation including the division-by-zero guard), 11 in
+`test_postgres.py` (every new reconcile-facing method, commit/rollback), 10 in
+`test_reconcile_cli.py` (`run_reconciliation` end-to-end: agreement promotes + purges staging,
+completeness resolves the actual Yahoo-premarket-gap scenario, a bar missing a configured
+provider is left untouched, a real disagreement stays stuck until `--finalize`, `--finalize`
+promotes `preferredProvider`'s raw value, agreement updates `provider_pair_disagreement`, plus
+`main()`/`parse_args` argument handling), 4 in `test_settings.py`
+(`ReconcileSettings` parsing/defaults/validation). Full suite: 141 passed (the one pre-existing
+IBKR integration test failure is environmental — no local IB Gateway running — not a regression).
+`ruff format`/`ruff check` clean.
+
+**Live-verified against CroicuWS1, 2026-08-03 — small deliberate sample, not the full dataset
+yet.** Rather than run against the full 50,318-row backup immediately, `staging_market_data_1min`
+was pared down (backup preserved first, per the confirm-before-real-DB-writes rule) to a
+297-bar/594-row sample: all 6 configured tickers (`SPY`, `SH`, `QQQ`, `PSQ`, `DIA`, `DOG`), all 5
+sessions (2026-07-27 through 2026-07-31), just the 10:00-10:09 ET window — small enough to
+inspect every result by hand before trusting a full run.
+
+- **First automatic pass**: 588 evaluated groups (294 bars × 2 field groups; 6 rows/3 bars
+  excluded entirely as missing one provider's report), 503 resolved / 85 stuck. **OHLC resolved
+  100% (294/294)** — 293 via agreement, 1 via completeness. **Volume was the entire gap**: 199
+  agreement, 9 boundary-fix, 1 completeness, 85 stuck.
+- **Seeding-lag re-runs**: re-running the plain automatic pass (no code/flag change) repeatedly —
+  since a stuck group has no `fact_reconciliation` row, it's re-evaluated every run with
+  whatever's current in `provider_pair_disagreement` — took the volume-stuck count from 85 → 68 →
+  63 → 61, then **0 further change on a 4th run**: a real, empirically-found convergence floor.
+  ~28% of the original stuck count (24/85) was purely the seed `stddev` (`0.03`) not yet having
+  caught up to the real measured value (converged to `~0.047`) — not a real disagreement, not
+  requiring any tolerance-logic change, just letting the running stats settle.
+- **Tested and disproved**: hypothesized that 3 of the most extreme outliers (`DIA`/7-31,
+  `SPY`/7-29, `SPY`/7-31, all at the window's first minute, 10:00 ET) were stuck only because
+  Tier 3's windowed-average check had no `t-1` neighbor (deleted by the sample's own truncation).
+  Restored the actual missing minutes (09:59/10:10 ET) from the backup and re-ran — **the 3 bars
+  still didn't resolve**; their disagreement (IBKR at roughly 1/5 to 1/7 of Yahoo's volume) is too
+  large for a 3-bar average to smooth over. The staging-only neighbor lookup (see below) is still
+  a real gap worth fixing, but it doesn't explain this specific pattern — an asserted cause that
+  didn't survive being tested.
+- **Ticker-level pattern in the 61-bar convergence floor**: volume stuck rate was sharply
+  ticker-dependent — `QQQ` 43%, `DIA` 43%, `SPY` 20%, `DOG` 15%, `PSQ` 2%, `SH` 0% — and
+  consistent in direction across every long/inverse pair (long always worse: `SPY` > `SH`, `QQQ`
+  > `PSQ`, `DIA` > `DOG`). Argues against "thin volume inflates the % diff" as the main driver,
+  since the inverse ETFs are the thinner-traded names and agree almost perfectly. Logged as
+  grounding data for `tasks/index_composite_check.md`'s "volume anomaly signal shape" open
+  question, not yet explained.
+- **Structural gap identified, then fixed (2026-08-03)**: Tier 3's windowed neighbor lookup only
+  searched `staging_market_data_1min`. Once a neighboring bar was fully promoted, its row was
+  purged, and any bar next to it permanently lost that neighbor for boundary-fix on every future
+  run. Fixed via **lazy purge**, not a fact-table fallback (see below) — `run_reconciliation` now
+  defers purging a resolved bar's staging rows until neither `t-1` nor `t+1` (same ticker) is still
+  unresolved, so the data survives exactly as long as a future run might genuinely need it.
+- **Seeding lag: also fixed (2026-08-03)**. The re-run-until-it-stops-changing behavior found above
+  is now automatic, not manual: `run_reconciliation` repeats its pass over `bars` internally until
+  one resolves nothing new, so a single `quant-reconcile` invocation reaches the same convergence
+  floor that previously took four manual re-runs. Both fixes are mechanical, not a change to the
+  tolerance/decision logic itself — see "Superseded: volume as an independent field group" below
+  for the earlier distinction between the two categories of fix; the seed *values* themselves
+  (`stddev`, pseudo-count 100) are unchanged.
+- Full 50,318-row backup restored to `staging_market_data_1min` on the local machine, then pruned
+  to a second small deliberate sample (all 6 tickers, all 5 sessions, the 09:30-09:39 ET window
+  this time — the market open — 599 rows) to live-verify the volume removal and the two fixes
+  above before trusting a full run. **Result: 299 groups resolved, 0 stuck, on a single
+  `quant-reconcile` invocation** — no
+  manual re-running needed. All 299 resolved via `agreement`. `fact_market_data_1min` got exactly
+  299 rows; `staging_market_data_1min` was left with exactly 1 row, the one bar in the window
+  missing one provider's report — correctly excluded from reconciliation and correctly untouched,
+  not force-processed. Every other bar's staging rows were fully purged, confirming lazy purge
+  doesn't leave stray rows behind once nothing needs them as a neighbor. `provider_pair_disagreement`'s
+  `ohlc` stats were already well-converged from the earlier live run, so this wasn't a cold-seed
+  stress test of the fixed-point loop specifically — but it is the first clean, real, end-to-end
+  confirmation that the redesigned pipeline (no volume field group, internal convergence, lazy
+  purge) works correctly against real data. The full 50,318-row dataset itself has not yet been
+  run through `quant-reconcile` — still pending its own explicit go-ahead.
+- **Third live sample, deliberately pre-market this time**: backup restored again, pruned to
+  05:00-05:09 ET (454 rows, real pre-market coverage — not full: `ibkr` had 290 rows in this window
+  vs. `yfinance`'s 164, `SPY`/`QQQ` had complete both-provider coverage while `DIA`/`DOG`/`PSQ`/`SH`
+  didn't). **Result: 162 groups resolved, 0 stuck — every single one via `completeness`, not
+  `agreement`, and the winner was `ibkr` 162/162 times.** This is the scenario the automatic pass's
+  Tier 1 was explicitly designed around (Yahoo premarket gaps), and it's the first real data
+  confirming it works exactly as designed: whenever one side had real data and the other was
+  incomplete, the complete side won outright, no tolerance check involved.
+  `provider_pair_disagreement` didn't move at all this run (`agreement` never fired). 130 of the
+  454 rows were single-provider bars, correctly excluded from reconciliation entirely rather than
+  force-processed — overwhelmingly `yfinance`'s row missing outright for `DIA`/`DOG`/`PSQ`/`SH`
+  (zero such gaps for `SPY`/`QQQ`), with two small exceptions where `DOG` was missing *`ibkr`'s* row
+  instead (2026-07-29, 05:00 and 05:07 ET) — so "Yahoo has premarket gaps" held up as a real pattern
+  here, but isn't a universal rule worth hard-coding an assumption on.
+
+  *(Correction: the two bullets above originally said 13:30-13:39 ET / 09:00-09:09 ET —
+  `dim_time.time_of_day` turned out to be literal UTC, not ET as assumed at the time. Verified
+  directly against the real `timestamp` column during the DOG investigation below. Corrected to
+  09:30-09:39 ET and 05:00-05:09 ET respectively; the underlying data/analysis was unaffected, only
+  the labels were wrong.)*
+
+- **Full 50,318-row dataset, 2026-08-03**: the real run. 1,235 seconds (~20.6 min) — `quant-reconcile`'s
+  writes are one round trip per bar (same unbatched profile as issue #23), so this scales roughly
+  linearly with bar count; ~25K bars landed almost exactly where a round-trip-count estimate
+  predicted. 43,356 of 50,318 rows belonged to two-provider-complete bars (21,678 bars); 6,962 rows
+  were single-provider gaps, correctly excluded. Of the 21,678: 461 already resolved from the two
+  earlier sample tests (idempotently re-promoted), **20,595 newly resolved, 622 genuinely stuck**
+  (2.9%). `fact_market_data_1min`: 21,056 rows. All-time resolution-path breakdown:
+  **`completeness` 10,599 (50%), `agreement` 9,517 (45%), `boundary_fix` 940 (4.5%)** — completeness,
+  not agreement, is the single largest path across a full week, meaning "one side has real data, the
+  other doesn't" is the common case, not the exception. Staging showed 1,022 two-provider bars
+  remaining, not 622 — confirmed via `fact_reconciliation` that 400 of those are already-resolved
+  bars whose purge is deferred because an adjacent minute is still stuck (lazy purge doing real work
+  for the first time at a scale where stuck bars have neighbors worth deferring for), leaving the
+  true 622 stuck. `provider_pair_disagreement`'s `ohlc` stddev kept tightening with more real data:
+  `0.000180` → `0.0000736` (sample_count 39,576).
+
+- **The 622 stuck bars are sharply concentrated in `DOG`** (499), followed by `PSQ` (66), `SH` (54),
+  `SPY` (3), with `QQQ`/`DIA` at 0 — investigated in depth; findings and the resulting design change
+  are in `tasks/per_ticker_disagreement.md`. Summary: neither ticker-average volume, per-bar volume
+  within `DOG`, nor price level explain the gap — the *true* stuck rate (computed correctly against
+  `fact_reconciliation`, not the purge-biased staging leftovers) is `DOG` 25.9% vs. `PSQ`/`SH`
+  ~1.8% vs. `SPY`/`QQQ`/`DIA` ~0%, a categorical outlier rather than a smooth gradient. `DOG`'s
+  stuck-bar diff *magnitudes* are similar to or smaller than `PSQ`/`SH`'s — it's not that `DOG`'s
+  disagreements are bigger, they're just far more frequent, which points at the pooled (all-ticker)
+  `provider_pair_disagreement` tolerance being distorted by `QQQ`/`SPY`/`DIA`'s much larger volume
+  of tight agreements. Led directly to `tasks/per_ticker_disagreement.md`'s per-ticker stats design
+  (brainstorm stage, converged on the training/graduation mechanism, not yet implemented).
+
+## Superseded: volume as an independent field group
+
+The findings above — 61/294 volume groups genuinely stuck, sharply and consistently
+ticker-dependent, not explained by seeding lag or missing neighbors — prompted reconsidering
+whether volume should be reconciled against `yfinance` at all, rather than continuing to adjust the
+tolerance/tier logic to fit what was observed (see [[feedback_infra_fix_vs_tuning]]). Two reasons
+volume was never a good fit for this mechanism in the first place, from how it's actually used
+downstream: it's a relative, provider-tied confidence signal (e.g. "50% of a normal session's
+volume"), not a value needing independent cross-provider corroboration the way price does; and
+`yfinance` (the whistleblower) has no pre-market volume data at all, which is exactly the window
+this project trades in, so the whistleblower comparison was never meaningful there.
+
+**Design and implementation now live in `tasks/volume_reconciliation.md`.** Everything in this
+file describing volume as an independent `dim_field_group` row with its own Tier 1-4 resolution and
+`provider_pair_disagreement` tracking is historical — it describes the design as originally built
+and live-tested, not the current behavior. Volume now simply rides along with whichever provider
+wins the `ohlc` group for that bar.

@@ -144,10 +144,30 @@ independent top-level packages.
   local_path)`'s `local_path` defaults relative to `path`'s own directory (not the process's cwd),
   so loading a test fixture's `settings.json` never accidentally picks up the real repo-root
   `settings.local.json`. `Settings.catch_up_lookback_days` (`catchUpLookbackDays`, default `7`)
-  sizes `quant-ingest --catch-up`'s trailing re-fetch window.
-- `postgres.py` — `PostgresDatabase`: the concrete `MarketDataProvider` implementation, plus a
-  `write_bars` method used only by `ingest` (not part of the `MarketDataProvider` Protocol itself —
-  see "Contracts" below on why that's ergonomics, not the actual security boundary). Single
+  sizes `quant-ingest --catch-up`'s trailing re-fetch window. `Settings.providers` (`providers`,
+  default `["yfinance"]`, lowercased) is the global list `quant-ingest` runs each invocation;
+  `Settings.ibkr` (`IbkrSettings`: `host`/`port`/`client_id`, parsed from `ibkr`) only matters
+  when `"ibkr"` is configured. `Settings.reconcile` (`ReconcileSettings`: `preferred_provider`
+  default `"ibkr"`, `k` default `3.0`, parsed from a `reconcile` object —
+  `preferredProvider`/`k`) configures `quant-reconcile`'s tie-break/fallback provider and its
+  tolerance multiplier; `k` must be positive.
+- `postgres.py` — `PostgresDatabase`: the concrete `MarketDataProvider` implementation, plus
+  `write_bars`/`write_staging_bars` (used only by `ingest`) and a set of reconcile-facing
+  read/write methods (`fetch_dim_providers`, `fetch_dim_field_groups`,
+  `fetch_provider_pair_disagreement`, `fetch_staging_rows_for_reconciliation`,
+  `fetch_resolved_field_groups`, `record_reconciliation`, `promote_bar_to_fact`,
+  `save_provider_pair_disagreement`, `fetch_pending_manual_resolution_staging_rows`,
+  `fetch_pending_manual_resolution_keys`, `mark_pending_manual_resolution`,
+  `clear_pending_manual_resolution` — used only by `reconcile`). None of this is part of the
+  `MarketDataProvider` Protocol itself — see "Contracts" below on why that's ergonomics, not the
+  actual security boundary. One connection-owning class for every internal purpose (reads,
+  ingest's writes, reconcile's reads/writes) rather than a second connection-management
+  implementation for a third caller. The reconcile-facing methods return plain row dataclasses
+  (`ProviderRow`, `FieldGroupRow`, `StagingRow`, `DisagreementStatsRow`) with no reconciliation
+  business meaning of their own (candidate/whistleblower, tiers, ...) — that domain model lives in
+  `reconcile.algorithm`, and `quant_data._internal` never imports from `reconcile` (rule 8's
+  acyclic dependency graph: `reconcile` depends on this module, never the other way around, same
+  direction `ingest` already uses). Single
   connection per invocation (no pooling); wraps `psycopg` errors as `AppError`, or
   `DateOutOfRangeError` (a specific `AppError` subclass) when a bar's date falls outside the
   populated `dim_date` range. Takes a `ConnectionTransport` (see `contracts.py` above) instead of
@@ -243,7 +263,8 @@ independent top-level packages.
   as of issue #22 — add `"ibkr"` to `settings.providers` to have `quant-ingest` run it alongside
   (or instead of) `YahooFinanceIntraDay`; see the `ingest` section below for how `settings.providers`
   and `settings.ibkr` control this. Reconciliation itself (staging -> `fact_market_data_1min`) is
-  still separate, later work — see `tasks/ibkr-provider-reconciliation.md`.
+  built as of `quant-reconcile` (see `tasks/quant-reconcile.md`) — see the `reconcile` section
+  below.
 
 ### `ingest`
 
@@ -303,6 +324,91 @@ this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests
   `"ibkr"`. `settings.ibkr` (`IbkrSettings`: `host`/`port`/`client_id`, all defaulting to
   `IBKRIntraDay`'s own module-level defaults) is only consulted when `"ibkr"` is configured.
 
+### `reconcile`
+
+`cli.py` — `quant-reconcile [--finalize] [--debug]`: reads `staging_market_data_1min`, resolves
+what it can automatically, and promotes fully-resolved bars into `fact_market_data_1min`, purging
+their staging rows once it's safe to (see "lazy purge" below). See `tasks/quant-reconcile.md` for
+the full design (field consistency groups, the candidate/whistleblower model, the tier algorithm,
+`--finalize`, manual correction, and the `fact_pending_manual_resolution` queue added
+2026-08-03). No importable surface, console script only, same shape as `ingest`.
+
+- **`algorithm.py`** — pure functions, no database access, directly unit-testable
+  (`tests/unit/test_reconcile_algorithm.py`). `ProviderBar` (one provider's reported values for a
+  bar, plus its `role`), `Resolution` (winning `provider_id` + `resolution_path`),
+  `DisagreementStats` (Welford's-algorithm accumulator) are the module's own domain types —
+  deliberately not shared with `quant_data._internal.shared.postgres`, which stays unaware of any
+  reconciliation concept (rule 8's acyclic dependency graph).
+  - `resolve_automatic(bars, field_group, windows, tolerances, k, preferred_provider_id)` — Tiers
+    1-3 (completeness / agreement / boundary-fix), first one that resolves a group wins. Returns
+    `None` if still stuck (Tier 4) — left in staging for a person to look at.
+  - `resolve_finalize(bars, preferred_provider_id)` — `--finalize`'s fallback: promotes
+    `preferredProvider`'s raw value outright, no tolerance check.
+  - `welford_update`/`stddev_from_stats`/`relative_diffs_for_stats_update` — the running-variance
+    machinery behind `provider_pair_disagreement`'s tolerance; population variance (`M2 / n`),
+    matching `004_add_reconciliation_tables`'s seed-value convention. Only called for
+    `RESOLUTION_AGREEMENT` resolutions (see "Design decisions" in the task file for why).
+- **`cli.py`'s `run_reconciliation(database, settings, finalize)`** dispatches to one of two
+  functions — they no longer share one code path, since a plain run and `--finalize` now operate
+  on disjoint fetch scopes:
+  - **`_run_automatic_pass`** (plain, `finalize=False`) — fetches every dimension/stats table plus
+    every staging row belonging to a bar where every provider in `settings.providers` has reported
+    *and* the bar has no `fact_pending_manual_resolution` row (bars missing an expected provider,
+    or already flagged pending, are skipped entirely, untouched), groups rows by bar, and for each
+    not-yet-resolved `(bar, field_group)` calls `resolve_automatic` only — no `resolve_finalize`
+    fallback in this path anymore. Whatever's still unresolved once the fixed-point loop below
+    converges gets a `fact_pending_manual_resolution` row inserted (a new write; previously nothing
+    was recorded for a stuck bar at all) so every future plain run skips it.
+  - **`_run_finalize_pass`** (`--finalize`) — fetches only staging rows for bars that already have
+    a `fact_pending_manual_resolution` row, and only the specific `(bar, field_group)` keys that
+    are actually pending (`fetch_pending_manual_resolution_keys`). Calls `resolve_finalize`
+    directly for each — no Tier 1-3 attempt, those already failed during a prior automatic pass —
+    and deletes the `fact_pending_manual_resolution` row once resolved
+    (`clear_pending_manual_resolution`). Does **not** also evaluate not-yet-attempted bars; a
+    `--finalize` run with nothing pending yet has nothing to do. Known, accepted tradeoff: a bar
+    that's already resolved but purge-blocked by a *different*, still-pending neighbor doesn't get
+    its own purge-eligibility re-checked during a `--finalize` run (that neighbor isn't fetched in
+    this narrower scope) — it self-heals on the next plain run, which re-fetches it (already
+    resolved, so no Tier 1-3 re-attempt) and re-checks the now-unblocked neighbor.
+  - Both share `_promote_and_lazily_purge` (promotion + lazy-purge, see below) and the same
+    one-bulk-fetch-per-table philosophy — no round trip per bar for reads. Tier 3's neighbor-minute
+    lookups (automatic pass only; `resolve_finalize` doesn't use windows at all) are served from
+    the same in-memory staging data via each row's own `timestamp` column, no extra queries.
+    Writes (record a resolution, update disagreement stats, mark/clear pending, promote a
+    fully-resolved bar, purge its staging rows) are still one round trip each, same performance
+    profile as `write_bars`/`write_staging_bars` (see issue #23) — deliberately not optimized
+    further here, since the read side was the actual N-per-bar problem this design avoids, and the
+    pending-queue mechanism above is what stops that read cost from compounding indefinitely for
+    bars that never resolve.
+- **Fixed-point convergence within a single automatic pass.** A bar visited early in a pass over
+  `bars` can fail Tier 2 using disagreement stats that a later bar's own agreement resolution
+  improves within that same pass — a plain single pass doesn't necessarily reach the real
+  convergence floor. Rather than requiring a person to re-invoke `quant-reconcile` several times by
+  hand (the live-tested finding in `tasks/quant_reconcile.md`: 85 → 68 → 63 → 61 → 0 stuck groups
+  across four manual re-runs), `_run_automatic_pass` repeats full passes over `bars` until one
+  resolves nothing new. Provably terminates: each pass either resolves at least one more group
+  (bounded by the finite total group count) or resolves zero, at which point `stats_by_key` can no
+  longer change and further passes would be identical. `_run_finalize_pass` has no equivalent loop
+  — `resolve_finalize` doesn't depend on stats, so it either succeeds or fails deterministically in
+  one attempt.
+- A bar promotes to `fact_market_data_1min` once **every** field group has a resolution (checked
+  after the convergence loop above, for every bar whether resolved just now or in an earlier run).
+  Today that's just `'ohlc'` — `volume` is no longer its own field group (see
+  `tasks/volume_reconciliation.md`); the promoted row's `volume` and `incomplete` come straight off
+  the `'ohlc'` winner's own `StagingRow`, not a separately resolved value.
+- **Lazy purge.** `promote_bar_to_fact` (upsert into `fact_market_data_1min`) and
+  `purge_staging_bar` (delete that bar's staging rows) are separate calls, not one atomic step.
+  After promoting, a bar's staging rows are purged only if neither adjacent minute (`t-1`/`t+1`,
+  same ticker) is still present in staging and unresolved — `_bar_still_needed_as_neighbor` checks
+  this via a `(ticker_id, timestamp) -> bar_key` index built alongside the staging fetch. Purging
+  immediately (the original design) permanently lost a promoted bar's raw data for any future run's
+  Tier-3 windowed-average check on its still-stuck neighbor — a real gap found during the
+  2026-08-03 live test (`tasks/quant_reconcile.md`). A neighbor that's absent (never existed, or
+  already purged) or already fully resolved will never call the windowed check again, so it doesn't
+  block purging.
+- `settings.reconcile.preferredProvider` (default `"ibkr"`) and `settings.reconcile.k` (default
+  `3.0`, must be positive) are the only two tunables — see `ReconcileSettings` above.
+
 ### `quant_data.client`
 
 - `market_data.py` — `MarketData`: a thin, read-only wrapper around a `MarketDataProvider`.
@@ -329,14 +435,18 @@ A caller supplies `ticker` + a date range → `MarketDataProvider.fetch_bars` jo
 `fact_market_data_1min` against `dim_ticker`/`dim_date` for that ticker/range → returns `OHLCV`
 rows ordered by timestamp.
 
-On the write side: for each (ticker, date) pair in the requested range/batch, `ingest` fetches that
-ticker/day of bars from an `IntraDayProvider` → `PostgresDatabase.write_bars` upserts the ticker
-into `dim_ticker` (insert-or-fetch, single round trip via `ON CONFLICT ... RETURNING`), resolves
-`date_id`/`time_id` from the pre-populated `dim_date`/`dim_time` dimensions, then upserts into
-`fact_market_data_1min` (idempotent re-run via `ON CONFLICT (ticker_id, date_id, time_id) DO
-UPDATE`) inside one transaction — any failure within that pair (e.g. a date outside the populated
-`dim_date` range) rolls back just that pair's writes, logs a warning, and the run continues with
-the rest of the range/batch rather than aborting entirely. `ingest` is the sole writer; consumer
+On the write side, two stages now (as of issue #22): for each (ticker, date) pair in the requested
+range/batch, `ingest` fetches that ticker/day of bars from every configured `IntraDayProvider` →
+`PostgresDatabase.write_staging_bars` upserts the ticker into `dim_ticker` (insert-or-fetch, single
+round trip via `ON CONFLICT ... RETURNING`), resolves `date_id`/`time_id` from the pre-populated
+`dim_date`/`dim_time` dimensions, then upserts into `staging_market_data_1min` (idempotent re-run
+via `ON CONFLICT (provider_id, ticker_id, date_id, time_id) DO UPDATE`) inside one transaction —
+any failure within that pair rolls back just that pair's writes, logs a warning, and the run
+continues rather than aborting entirely. `reconcile` then reads `staging_market_data_1min`,
+resolves what it can (`fact_reconciliation`/`fact_reconciliation_participant`/
+`provider_pair_disagreement` record how), and upserts fully-resolved bars into
+`fact_market_data_1min` — the only path anything reaches the fact table today (`write_bars` still
+exists and is tested but nothing calls it). `ingest`/`reconcile` are the only writers; consumer
 repos (`quant-scratch` and future others) only ever read, via `MarketData`/`quant_reader` —
 a `SELECT`-only, trust-authenticated role (no DB password; the SSH tunnel/key is the actual gate)
 with no write grant at all, enforced at the database-privilege level, not just by the Python
@@ -352,6 +462,9 @@ behavior — `LoggingSink` is behavioral too — it's public-vs-private: `protoc
 `Protocol`s a consumer is meant to actually implement/inject (`LoggingSink`), while
 `_internal.contracts` holds `Protocol`s that only wire quant_data's own internals together
 (`MarketDataProvider`, `IntraDayProvider`, `ConnectionTransport`) and are never imported by
-external consumers. The database schema itself (four dimension tables plus
-`fact_market_data_1min`/`staging_market_data_1min`) remains the underlying persisted contract —
-see `docs/SCHEMA.md`.
+external consumers. The database schema itself (five dimension tables, `fact_market_data_1min`,
+`staging_market_data_1min`, and `reconcile`'s own `fact_reconciliation`/
+`fact_reconciliation_participant`/`provider_pair_disagreement`) remains the underlying persisted
+contract — see `docs/SCHEMA.md`. Only `fact_market_data_1min` and `MarketData.fetch_bars` are the
+actual external contract, though — everything else is this repo's own internal write-path
+plumbing, never queried directly by `quant-scratch` or any other consumer.

@@ -16,6 +16,8 @@ _SETTINGS_PATH = Path("./settings.json")
 _LOCAL_PATH_NAME = "settings.local.json"
 
 DEFAULT_PROVIDERS = ["yfinance"]
+DEFAULT_PREFERRED_PROVIDER = "ibkr"
+DEFAULT_RECONCILE_K = 3.0
 
 
 def _default_providers() -> list[str]:
@@ -41,6 +43,12 @@ class IbkrSettings:
 
 
 @dataclass
+class ReconcileSettings:
+    preferred_provider: str = DEFAULT_PREFERRED_PROVIDER
+    k: float = DEFAULT_RECONCILE_K
+
+
+@dataclass
 class Settings:
     debug: bool
     logging: TelemetryLevel = TelemetryLevel.ERROR
@@ -53,6 +61,7 @@ class Settings:
     catch_up_lookback_days: int = 7
     providers: list[str] = field(default_factory=_default_providers)
     ibkr: IbkrSettings = field(default_factory=IbkrSettings)
+    reconcile: ReconcileSettings = field(default_factory=ReconcileSettings)
 
     _instance: ClassVar[Settings | None] = None
 
@@ -222,6 +231,19 @@ class Settings:
                 client_id=int(ibkr_payload.get("clientId", IBKR_DEFAULT_CLIENT_ID)),
             )
 
+        reconcile_settings = ReconcileSettings()
+        reconcile_payload = settings_payload.get("reconcile")
+        if reconcile_payload is not None:
+            if not isinstance(reconcile_payload, dict):
+                raise TaskError("'settings.reconcile' must be a JSON object.")
+            reconcile_k = float(reconcile_payload.get("k", DEFAULT_RECONCILE_K))
+            if reconcile_k <= 0:
+                raise TaskError(f"'settings.reconcile.k' must be positive, got {reconcile_k}.")
+            reconcile_settings = ReconcileSettings(
+                preferred_provider=str(reconcile_payload.get("preferredProvider", DEFAULT_PREFERRED_PROVIDER)).lower(),
+                k=reconcile_k,
+            )
+
         cls._instance = cls(
             debug=debug,
             logging=log_level,
@@ -234,6 +256,7 @@ class Settings:
             catch_up_lookback_days=catch_up_lookback_days,
             providers=providers,
             ibkr=ibkr_settings,
+            reconcile=reconcile_settings,
         )
 
         return cls._instance

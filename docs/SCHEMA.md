@@ -26,11 +26,12 @@ the same dimension keys without touching the raw 1-minute data.
 `staging_market_data_1min` table alongside (not instead of) the fact table — see "`dim_provider`"
 and "`staging_market_data_1min`" below. `004_add_reconciliation_tables` added `dim_provider.role`,
 a fifth dimension (`dim_field_group`), and the `fact_reconciliation`/
-`fact_reconciliation_participant`/`provider_pair_disagreement` tables `quant-reconcile` (not yet
-built) will read/write — see those sections below and `tasks/quant-reconcile.md`.
-`fact_market_data_1min` itself is unchanged throughout: it remains the single golden, reconciled
-dataset every reader (`MarketData`) queries, regardless of which provider(s) a bar's value
-ultimately came from.
+`fact_reconciliation_participant`/`provider_pair_disagreement` tables `quant-reconcile` reads/
+writes — see those sections below and `tasks/quant-reconcile.md`. `006_add_pending_manual_resolution`
+added `fact_pending_manual_resolution`, making "stuck" an explicit, queryable state instead of an
+implicit one — see its own section below. `fact_market_data_1min` itself is unchanged throughout:
+it remains the single golden, reconciled dataset every reader (`MarketData`) queries, regardless of
+which provider(s) a bar's value ultimately came from.
 
 ## `dim_ticker`
 
@@ -103,15 +104,19 @@ each other. Primary key `(provider_id, ticker_id, date_id, time_id)`, matching h
 Written by `PostgresDatabase.write_staging_bars` — every `quant-ingest` run writes here now (issue
 #22), never straight to `fact_market_data_1min`.
 
-A staging row is purged once its bar reconciles into `fact_market_data_1min`. A bar with staging
-rows still present is implicitly in an unresolved ("settlement") state — either not every
-configured provider has reported yet, or the providers that have disagree beyond tolerance. The
-reconciliation logic itself — reading staging, comparing per-field-group against a measured
-tolerance, promoting agreeing bars, purging their staging rows — is a separate CLI,
-`quant-reconcile` (same repo, same `quant-<verb>` naming as `quant-ingest`), not yet built; see
-`tasks/quant-reconcile.md` (the schema it depends on — `dim_provider.role`, `dim_field_group`,
-`fact_reconciliation`, `fact_reconciliation_participant`, `provider_pair_disagreement` — shipped in
-`004_add_reconciliation_tables`, ahead of the CLI itself, same pattern `003` used for this table).
+A staging row is purged once its bar reconciles into `fact_market_data_1min` **and** neither
+adjacent minute (`t-1`/`t+1`, same ticker) is still unresolved — a resolved bar's raw rows are kept
+a little longer if a neighboring bar might still need them as a Tier-3 windowed-average input, so a
+bar can be promoted into `fact_market_data_1min` immediately without losing that data for a future
+run (see `docs/ARCHITECTURE.md`'s `reconcile` section). A bar with staging rows still present is in
+one of three states: not every configured provider has reported yet; already resolved but waiting
+on a neighbor before it's safe to purge; or the providers disagree beyond tolerance and the bar has
+a row in `fact_pending_manual_resolution` (see below), in which case a plain `quant-reconcile` run
+skips it entirely and only `--finalize` touches it. The reconciliation logic itself — reading
+staging, comparing per-field-group against a measured tolerance, promoting agreeing bars, purging
+their staging rows once safe — is a separate CLI, `quant-reconcile` (same repo, same `quant-<verb>`
+naming as `quant-ingest`); see `tasks/quant-reconcile.md` and `docs/ARCHITECTURE.md`'s `reconcile`
+section for the full design.
 
 ## `fact_market_data_1min`
 
@@ -133,15 +138,19 @@ date.
 | Column | Type | Notes |
 |---|---|---|
 | `field_group_id` | `SERIAL PRIMARY KEY` | |
-| `name` | `TEXT NOT NULL UNIQUE` | e.g. `'ohlc'`, `'volume'` |
+| `name` | `TEXT NOT NULL UNIQUE` | `'ohlc'` today |
 | `created_at` | `TIMESTAMP` | Defaults to insert time |
 
 Added in `004_add_reconciliation_tables`. Groups `fact_market_data_1min` columns that
 `quant-reconcile` must resolve from a single provider together — seeded with `'ohlc'`
 (`open`/`high`/`low`/`close`, which must come from one provider so a promoted bar is never
-internally inconsistent, e.g. `low` > `close`) and `'volume'` (independent). Not hardcoded to
-exactly these two rows — a later migration adding a new `fact_market_data_1min` column assigns it
-to an existing or new group row, a data change, not a schema change.
+internally inconsistent, e.g. `low` > `close`). Originally also seeded a `'volume'` row, removed by
+`005_remove_volume_field_group`: volume is no longer independently reconciled against the
+whistleblower (see `tasks/volume_reconciliation.md`) — it now simply rides along with whichever
+provider wins the `'ohlc'` group for that bar. Not hardcoded to exactly this one row — a later
+migration adding a new `fact_market_data_1min` column that genuinely does need its own
+cross-provider agreement assigns it to an existing or new group row, a data change, not a schema
+change.
 
 ## `fact_reconciliation`
 
@@ -162,7 +171,10 @@ Primary key: `(ticker_id, date_id, time_id, field_group_id)`. Added in
 (`'completeness'` / `'agreement'` / `'boundary_fix'`) from `--finalize`'s `preferredProvider`
 algorithm (`'finalized'`) from an actual person directly correcting a bar (`'manual_override'` —
 the only path a whistleblower provider's value can ever reach `fact_market_data_1min` through).
-See `tasks/quant-reconcile.md` for the full per-tier logic.
+Since `005_remove_volume_field_group`, rows here only ever exist for the `'ohlc'` group — a bar
+promotes to fact as soon as `'ohlc'` resolves, with `volume` taken directly from the winning
+provider's own staging row (see `tasks/volume_reconciliation.md`). See `tasks/quant-reconcile.md`
+for the full per-tier logic.
 
 ## `fact_reconciliation_participant`
 
@@ -205,10 +217,35 @@ individually-unmeasurable per-provider "precision" figures (no ground-truth refe
 attribute disagreement to one side or the other). No ticker dimension — noise is a property of
 methodology, not of individual tickers. `stddev` is relative/fractional, scaled against an actual
 reference value at comparison time to get `quant-reconcile`'s bar-specific absolute tolerance
-(`tolerance = k * stddev * reference_value`, `k = 3`). Only in-band (raw-agreement) observations
+(`tolerance = k * stddev * reference_value`, `k = 3`). Since `005_remove_volume_field_group`, only
+ever has rows for the `'ohlc'` field group — volume no longer has its own measured tolerance (see
+`tasks/volume_reconciliation.md`). Only in-band (raw-agreement) observations
 update this — `finalized`/`manual_override` resolutions are excluded so outliers can't gradually
 widen "normal." Seeded with an illustrative starting value per field group at migration time (not
 measured data), pseudo-count 100 so it fades slowly as real observations accumulate.
+
+## `fact_pending_manual_resolution`
+
+| Column | Type | Notes |
+|---|---|---|
+| `ticker_id` | `INT NOT NULL` | FK → `dim_ticker` |
+| `date_id` | `INT NOT NULL` | FK → `dim_date` |
+| `time_id` | `INT NOT NULL` | FK → `dim_time` |
+| `field_group_id` | `INT NOT NULL` | FK → `dim_field_group` |
+| `flagged_at` | `TIMESTAMP` | Defaults to insert time |
+
+Primary key: `(ticker_id, date_id, time_id, field_group_id)`. Added in
+`006_add_pending_manual_resolution`. Same grain and "presence of a row is the status" convention as
+`fact_reconciliation` — presence *is* "this (bar, field group) exhausted the automatic pass's Tiers
+1-3 and is awaiting `--finalize` or manual correction"; absence (for a bar otherwise still in
+staging) means either not yet attempted, or not yet fully evaluated this run. Makes "stuck" an
+explicit, queryable state instead of an implicit one (inferred by absence of a
+`fact_reconciliation` row) — a plain `quant-reconcile` run fetches/evaluates only (bar, group)s
+with no row here; `--finalize` fetches only what has a row here, force-resolves it via
+`settings.reconcile.preferredProvider`, and deletes the row. Prevents every future plain run from
+re-fetching and re-evaluating the same known-stuck bars indefinitely, which compounds badly under a
+realistic cadence (e.g. plain `quant-reconcile` daily, `--finalize` weekly) — see
+`tasks/quant_reconcile.md`'s "Updated (2026-08-03)" section for the full design.
 
 ## Indexes
 
@@ -228,6 +265,10 @@ measured data), pseudo-count 100 so it fades slowly as real observations accumul
 - `idx_fact_reconciliation_participant_provider` on
   `fact_reconciliation_participant(provider_id, won)` — supports the reputation read pattern:
   aggregating win/loss by provider without scanning the whole table.
+- `fact_pending_manual_resolution` needs no index beyond its own primary key — the table only ever
+  holds the pending subset (small and self-limiting, unlike `staging_market_data_1min` which grows
+  with every ingested minute), so both the plain pass's per-bar existence check and `--finalize`'s
+  "fetch everything pending" already hit a small, fully-indexed table either way.
 
 ## Query examples
 

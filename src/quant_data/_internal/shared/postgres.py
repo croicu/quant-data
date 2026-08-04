@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import time
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime
 
 import psycopg
 
@@ -12,6 +13,48 @@ from .diagnostics import Logger
 from .errors import AppError, DateOutOfRangeError
 
 CATEGORY_POSTGRES = "postgres"
+
+
+# Plain data shapes for reconcile's read/write needs -- deliberately not aware of any
+# reconciliation business concept (candidate/whistleblower, tiers, ...); that domain model lives
+# in reconcile.algorithm. quant_data._internal must never import from reconcile/ingest (rule 8's
+# acyclic dependency graph) -- reconcile depends on this module, not the other way around, same
+# direction ingest already uses.
+@dataclass
+class ProviderRow:
+    provider_id: int
+    name: str
+    role: str
+
+
+@dataclass
+class FieldGroupRow:
+    field_group_id: int
+    name: str
+
+
+@dataclass
+class StagingRow:
+    ticker_id: int
+    date_id: int
+    time_id: int
+    timestamp: datetime
+    provider_id: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    incomplete: bool
+
+
+@dataclass
+class DisagreementStatsRow:
+    provider_id: int
+    field_group_id: int
+    sample_count: int
+    running_mean: float
+    running_m2: float
 
 
 class PostgresDatabase:
@@ -246,3 +289,354 @@ class PostgresDatabase:
 
         self._logger.perf(f"write_staging_bars({normalized_provider_name}, {written} bars)", time.perf_counter() - started)
         return written
+
+    # -- Reconcile-facing reads/writes below. quant-reconcile is the only caller; PostgresDatabase
+    # stays the single connection-owning class for every internal purpose (MarketDataProvider
+    # reads, ingest's writes, reconcile's reads/writes) rather than introducing a second
+    # connection-management implementation for a third caller. --
+
+    def fetch_dim_providers(self) -> list[ProviderRow]:
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT provider_id, name, role FROM dim_provider")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch dim_provider: {error}") from error
+
+        result: list[ProviderRow] = []
+        for provider_id, name, role in rows:
+            result.append(ProviderRow(provider_id=provider_id, name=name, role=role))
+        return result
+
+    def fetch_dim_field_groups(self) -> list[FieldGroupRow]:
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT field_group_id, name FROM dim_field_group")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch dim_field_group: {error}") from error
+
+        result: list[FieldGroupRow] = []
+        for field_group_id, name in rows:
+            result.append(FieldGroupRow(field_group_id=field_group_id, name=name))
+        return result
+
+    def fetch_provider_pair_disagreement(self) -> list[DisagreementStatsRow]:
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT provider_id, field_group_id, sample_count, running_mean, running_m2 FROM provider_pair_disagreement")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch provider_pair_disagreement: {error}") from error
+
+        result: list[DisagreementStatsRow] = []
+        for provider_id, field_group_id, sample_count, running_mean, running_m2 in rows:
+            result.append(
+                DisagreementStatsRow(
+                    provider_id=provider_id,
+                    field_group_id=field_group_id,
+                    sample_count=sample_count,
+                    running_mean=float(running_mean),
+                    running_m2=float(running_m2),
+                )
+            )
+        return result
+
+    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str]) -> list[StagingRow]:
+        """Every staging_market_data_1min row belonging to a bar where every name in
+        expected_provider_names has a row -- bars missing any expected provider are excluded
+        entirely (tasks/quant-reconcile.md's "wait for every configured provider") -- and where the
+        bar has no fact_pending_manual_resolution row, i.e. it hasn't already exhausted the
+        automatic pass and been handed off to --finalize (tasks/quant_reconcile.md's "Updated
+        (2026-08-03)" section)."""
+        started = time.perf_counter()
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT s.ticker_id, s.date_id, s.time_id, s.timestamp, s.provider_id,
+                           s.open, s.high, s.low, s.close, s.volume, s.incomplete
+                    FROM staging_market_data_1min s
+                    JOIN dim_provider p ON p.provider_id = s.provider_id
+                    WHERE p.name = ANY(%(names)s)
+                      AND (s.ticker_id, s.date_id, s.time_id) IN (
+                          SELECT s2.ticker_id, s2.date_id, s2.time_id
+                          FROM staging_market_data_1min s2
+                          JOIN dim_provider p2 ON p2.provider_id = s2.provider_id
+                          WHERE p2.name = ANY(%(names)s)
+                          GROUP BY s2.ticker_id, s2.date_id, s2.time_id
+                          HAVING COUNT(DISTINCT s2.provider_id) = %(expected_count)s
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM fact_pending_manual_resolution fpmr
+                          WHERE fpmr.ticker_id = s.ticker_id AND fpmr.date_id = s.date_id AND fpmr.time_id = s.time_id
+                      )
+                    """,
+                    {"names": expected_provider_names, "expected_count": len(expected_provider_names)},
+                )
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch staging rows for reconciliation: {error}") from error
+        self._logger.perf(f"fetch_staging_rows_for_reconciliation({len(rows)} rows)", time.perf_counter() - started)
+
+        result: list[StagingRow] = []
+        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, incomplete in rows:
+            result.append(
+                StagingRow(
+                    ticker_id=ticker_id,
+                    date_id=date_id,
+                    time_id=time_id,
+                    timestamp=timestamp,
+                    provider_id=provider_id,
+                    open=float(open_),
+                    high=float(high),
+                    low=float(low),
+                    close=float(close),
+                    volume=int(volume),
+                    incomplete=bool(incomplete),
+                )
+            )
+        return result
+
+    def fetch_pending_manual_resolution_staging_rows(self) -> list[StagingRow]:
+        """Every staging_market_data_1min row belonging to a bar with a fact_pending_manual_resolution
+        row -- exactly what --finalize operates on, skipping Tiers 1-3 entirely since they're
+        already known to fail for these."""
+        started = time.perf_counter()
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT s.ticker_id, s.date_id, s.time_id, s.timestamp, s.provider_id,
+                           s.open, s.high, s.low, s.close, s.volume, s.incomplete
+                    FROM staging_market_data_1min s
+                    WHERE EXISTS (
+                        SELECT 1 FROM fact_pending_manual_resolution fpmr
+                        WHERE fpmr.ticker_id = s.ticker_id AND fpmr.date_id = s.date_id AND fpmr.time_id = s.time_id
+                    )
+                    """
+                )
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch pending-manual-resolution staging rows: {error}") from error
+        self._logger.perf(f"fetch_pending_manual_resolution_staging_rows({len(rows)} rows)", time.perf_counter() - started)
+
+        result: list[StagingRow] = []
+        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, incomplete in rows:
+            result.append(
+                StagingRow(
+                    ticker_id=ticker_id,
+                    date_id=date_id,
+                    time_id=time_id,
+                    timestamp=timestamp,
+                    provider_id=provider_id,
+                    open=float(open_),
+                    high=float(high),
+                    low=float(low),
+                    close=float(close),
+                    volume=int(volume),
+                    incomplete=bool(incomplete),
+                )
+            )
+        return result
+
+    def fetch_pending_manual_resolution_keys(self) -> set[tuple[int, int, int, int]]:
+        """(ticker_id, date_id, time_id, field_group_id) for every (bar, field group) currently
+        awaiting --finalize -- lets the caller know exactly which groups to force-resolve, since
+        fetch_pending_manual_resolution_staging_rows only returns the raw bar data, not which
+        specific field group(s) are pending for it."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT ticker_id, date_id, time_id, field_group_id FROM fact_pending_manual_resolution")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch pending manual resolution keys: {error}") from error
+
+        result: set[tuple[int, int, int, int]] = set()
+        for ticker_id, date_id, time_id, field_group_id in rows:
+            result.add((ticker_id, date_id, time_id, field_group_id))
+        return result
+
+    def mark_pending_manual_resolution(self, ticker_id: int, date_id: int, time_id: int, field_group_id: int) -> None:
+        """Records that a (bar, field group) exhausted the automatic pass's Tiers 1-3 within a run
+        and is now awaiting --finalize or manual correction -- future plain quant-reconcile runs
+        will skip it entirely via fetch_staging_rows_for_reconciliation's NOT EXISTS check."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO fact_pending_manual_resolution (ticker_id, date_id, time_id, field_group_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (ticker_id, date_id, time_id, field_group_id) DO NOTHING
+                    """,
+                    (ticker_id, date_id, time_id, field_group_id),
+                )
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to mark ({ticker_id}, {date_id}, {time_id}, group {field_group_id}) pending manual resolution: {error}") from error
+
+    def clear_pending_manual_resolution(self, ticker_id: int, date_id: int, time_id: int, field_group_id: int) -> None:
+        """Removes a (bar, field group)'s pending-manual-resolution record once --finalize (or a
+        person's manual correction) has actually resolved it."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM fact_pending_manual_resolution WHERE ticker_id = %s AND date_id = %s AND time_id = %s AND field_group_id = %s",
+                    (ticker_id, date_id, time_id, field_group_id),
+                )
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to clear pending manual resolution for ({ticker_id}, {date_id}, {time_id}, group {field_group_id}): {error}") from error
+
+    def fetch_resolved_field_groups(self) -> dict[tuple[int, int, int, int], int]:
+        """(ticker_id, date_id, time_id, field_group_id) -> winning_provider_id, for whatever's
+        already in fact_reconciliation, scoped to bars still present in staging_market_data_1min
+        -- fact_reconciliation itself keeps growing forever (retention: keep everything), so this
+        avoids ever loading the whole table. The winning provider is needed (not just "resolved
+        or not") so a bar can still be promoted once its other groups resolve, without
+        re-deciding a group that resolved in an earlier run."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT ticker_id, date_id, time_id, field_group_id, winning_provider_id
+                    FROM fact_reconciliation
+                    WHERE (ticker_id, date_id, time_id) IN (
+                        SELECT DISTINCT ticker_id, date_id, time_id FROM staging_market_data_1min
+                    )
+                    """
+                )
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch resolved field groups: {error}") from error
+
+        result: dict[tuple[int, int, int, int], int] = {}
+        for ticker_id, date_id, time_id, field_group_id, winning_provider_id in rows:
+            result[(ticker_id, date_id, time_id, field_group_id)] = winning_provider_id
+        return result
+
+    def record_reconciliation(
+        self,
+        ticker_id: int,
+        date_id: int,
+        time_id: int,
+        field_group_id: int,
+        winning_provider_id: int,
+        resolution_path: str,
+        participant_results: list[tuple[int, bool]],
+    ) -> None:
+        """INSERT fact_reconciliation + one fact_reconciliation_participant row per
+        (provider_id, won) in participant_results -- every provider that wrote a staging row for
+        this bar, including the whistleblower, per tasks/quant-reconcile.md."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO fact_reconciliation
+                        (ticker_id, date_id, time_id, field_group_id, winning_provider_id, resolution_path)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (ticker_id, date_id, time_id, field_group_id, winning_provider_id, resolution_path),
+                )
+                for provider_id, won in participant_results:
+                    cursor.execute(
+                        """
+                        INSERT INTO fact_reconciliation_participant
+                            (ticker_id, date_id, time_id, field_group_id, provider_id, won)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (ticker_id, date_id, time_id, field_group_id, provider_id, won),
+                    )
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to record reconciliation for ({ticker_id}, {date_id}, {time_id}, group {field_group_id}): {error}") from error
+
+    def promote_bar_to_fact(
+        self,
+        ticker_id: int,
+        date_id: int,
+        time_id: int,
+        timestamp: datetime,
+        open: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: int,
+        incomplete: bool,
+    ) -> None:
+        """Upsert the fully-resolved bar into fact_market_data_1min -- called once every field
+        group for this bar has resolved. Does NOT purge staging rows; that's the separate,
+        deliberately lazy purge_staging_bar (see its docstring for why)."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO fact_market_data_1min
+                        (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, incomplete)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ticker_id, date_id, time_id) DO UPDATE SET
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
+                        close = EXCLUDED.close,
+                        volume = EXCLUDED.volume,
+                        timestamp = EXCLUDED.timestamp,
+                        incomplete = EXCLUDED.incomplete
+                    """,
+                    (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, incomplete),
+                )
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to promote bar ({ticker_id}, {date_id}, {time_id}) to fact_market_data_1min: {error}") from error
+
+    def purge_staging_bar(self, ticker_id: int, date_id: int, time_id: int) -> None:
+        """Deletes a fully-resolved bar's staging rows across every provider. Split out from
+        promote_bar_to_fact so a bar can be promoted immediately while its raw staging data is
+        deliberately kept a little longer if an adjacent bar (t-1/t+1) hasn't resolved yet and
+        might still need it as a Tier-3 windowed-average neighbor -- purging immediately on
+        promotion permanently lost that data for any future run (tasks/quant_reconcile.md's
+        "missing neighbor" gap)."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM staging_market_data_1min WHERE ticker_id = %s AND date_id = %s AND time_id = %s",
+                    (ticker_id, date_id, time_id),
+                )
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to purge staging rows for bar ({ticker_id}, {date_id}, {time_id}): {error}") from error
+
+    def save_provider_pair_disagreement(
+        self,
+        provider_id: int,
+        field_group_id: int,
+        sample_count: int,
+        running_mean: float,
+        running_m2: float,
+        stddev: float,
+    ) -> None:
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO provider_pair_disagreement
+                        (provider_id, field_group_id, sample_count, running_mean, running_m2, stddev, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (provider_id, field_group_id) DO UPDATE SET
+                        sample_count = EXCLUDED.sample_count,
+                        running_mean = EXCLUDED.running_mean,
+                        running_m2 = EXCLUDED.running_m2,
+                        stddev = EXCLUDED.stddev,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (provider_id, field_group_id, sample_count, running_mean, running_m2, stddev),
+                )
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to save provider_pair_disagreement for provider {provider_id}, group {field_group_id}: {error}") from error

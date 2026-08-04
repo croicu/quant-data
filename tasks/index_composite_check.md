@@ -46,6 +46,38 @@ bar is a meaningful anomaly signal, distinct from ordinary two-provider disagree
   adjusted "Dow Divisor" (changed for splits/spinoffs, not on a fixed calendar), not cap-weighted
   by share count like SPY (S&P 500) and QQQ (Nasdaq-100) — the composite formula and its
   weight-refresh trigger differ structurally for DIA and can't reuse SPY/QQQ's logic directly.
+- **Empirical grounding (from `quant-reconcile`'s first live test, 2026-08-03)**: a small sample
+  (6 tickers × 5 sessions × the 10:00-10:09 ET window, IBKR vs. Yahoo, full details in
+  `tasks/quant-reconcile.md`'s test results) gives this task its first real data instead of
+  speculation:
+  - **OHLC resolved 100% (294/294 bars); volume didn't (61/294 genuinely stuck after stats
+    converged).** Confirms this file's existing assumption above ("price aggregates meaningfully;
+    volume does not") in the most direct way possible — in this sample, price is exactly the part
+    that already agrees, and volume is exactly the part that doesn't. A composite-price check
+    would have nothing to catch here; the actual gap is on the side this file already flagged as
+    a weak fit for that mechanism.
+  - **Volume disagreement is sharply ticker-dependent**: stuck rate (fraction of bars where
+    IBKR/Yahoo volume differs beyond measured tolerance) was QQQ 43%, DIA 43%, SPY 20%, DOG 15%,
+    PSQ 2%, SH 0%. Not remotely uniform across tickers.
+  - **Every long/inverse pair shows the same direction**: the long ETF disagrees more than its
+    inverse counterpart — SPY (20%) > SH (0%), QQQ (43%) > PSQ (2%), DIA (43%) > DOG (15%),
+    consistently. This weighs *against* "thin/low volume amplifies the relative diff" as the main
+    driver — the inverse ETFs are the thinner-traded names here, and they're the ones agreeing
+    almost perfectly. Points more toward something specific to heavily-traded, multi-venue names
+    (unconfirmed hypothesis: consolidated-tape vs. primary-exchange volume attribution differing
+    more where there's more off-exchange/dark-pool activity to attribute) than to a generic
+    small-number-of-shares artifact.
+  - **Useful coincidence**: SPY/QQQ/DIA — the only three tickers this task's composite-check
+    mechanism can actually apply to (SH/PSQ/DOG have no constituent basket to reconstruct from) —
+    are also the three showing the worst volume disagreement. That's not the same as this
+    mechanism being able to *explain* it, though (next bullet).
+  - **Caveat, so this doesn't get overclaimed later**: none of the above means the composite-check
+    tool will explain this specific pattern once built. Its mechanism (index price ≈ weighted sum
+    of constituent prices) has no volume equivalent, and this file already scopes its volume
+    signal as coarse/day-level, not per-bar — it's not positioned to say *which specific minute's*
+    IBKR-vs-Yahoo volume diff is real disagreement vs. artifact. The QQQ/DIA pattern above still
+    needs its own investigation; this task is grounding for the "volume anomaly signal shape"
+    open question below, not a solution to today's puzzle.
 - **Index composition and weights are their own ongoing maintenance burden, not a one-time setup.**
   Two different update cadences apply:
   - **Constituent membership** (which stocks are in the index at all) changes infrequently —
@@ -77,8 +109,14 @@ context):
   tolerance/statistics machinery `quant-reconcile` uses for cross-provider comparison.
   - Design decisions here should be **derived from the actual data captured**, this task is created
    to have an dedicated space to reason about that decision.
-- **Volume anomaly signal shape**: not designed at all yet — what "coarse, day-level divergence"
-  concretely means, what threshold, what it would actually be used for once flagged.
+- **Volume anomaly signal shape**: still not designed, but no longer starting from nothing — see
+  the empirical grounding above. Real open sub-questions it raises: is the QQQ/DIA-vs-SH/PSQ/DOG
+  gap a per-ticker constant (something a per-ticker tolerance could absorb) or itself something
+  that needs explaining before any threshold is trustworthy? Is the long/inverse pattern
+  (consistent across all three pairs) reproducible outside a 10-minute regular-hours sample,
+  or specific to that window? Needs a larger, less artificially-truncated sample before designing
+  a real threshold — the 2026-08-03 sample was deliberately small and had its own edge artifacts
+  (see `tasks/quant-reconcile.md`'s test results for the boundary-truncation caveat).
 - **Relationship to `quant-reconcile`'s deferred outlier-analyzer tool**: this may end up as a
   component of that tool rather than a fully separate one — not decided, worth revisiting once
   `quant-reconcile` itself is further along.

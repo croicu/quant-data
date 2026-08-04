@@ -92,13 +92,18 @@ CREATE TABLE provider_pair_disagreement (
 COMMENT ON TABLE provider_pair_disagreement IS 'Running (Welford''s algorithm) variance of Var(candidate_value - whistleblower_value), per candidate provider (never the whistleblower itself -- always the fixed other side of the comparison) per field group. No ticker dimension: noise is a property of methodology, not of individual tickers. stddev is a relative/fractional value, denormalized for fast reads -- scaled against an actual reference value at comparison time to get a bar-specific absolute tolerance (tolerance = k * stddev * reference_value). Only in-band (Tier 2 raw-agreement) observations update this -- finalized/manual_override resolutions are deliberately excluded so outliers cannot gradually widen "normal".';
 COMMENT ON COLUMN provider_pair_disagreement.running_mean IS 'Signed: candidate_value - whistleblower_value, not the reverse -- carries directional-bias information (e.g. a future tool detecting the candidate consistently reading high) that the symmetric stddev alone would lose.';
 
--- Illustrative cold-start seed (not measured data -- revisit once real reconciliation history
--- exists), pseudo-count 100 so it fades slowly as real observations accumulate. running_m2
--- derived as (stddev^2 * sample_count), i.e. population variance, to match the seeded stddev.
+-- ohlc's seed is the real measured ibkr-vs-yfinance value from the local machine as of 2026-08-03
+-- (sample_count 2704, stddev ~0.00018 -- about 4.4x tighter than the original illustrative 8bps
+-- guess), updated here so a fresh database bootstrap starts from real history instead of a
+-- placeholder. volume's row is left as its original illustrative placeholder (not measured data)
+-- since dim_field_group's 'volume' row -- and this row along with it -- gets deleted immediately
+-- by 005_remove_volume_field_group in any full 001-005 sequence; its exact seed value is
+-- inconsequential. running_m2 derived as (stddev^2 * sample_count), i.e. population variance, to
+-- match the seeded stddev, for both rows.
 INSERT INTO provider_pair_disagreement (provider_id, field_group_id, sample_count, running_mean, running_m2, stddev)
 SELECT ibkr.provider_id, g.field_group_id, seed.sample_count, seed.running_mean, seed.running_m2, seed.stddev
 FROM (VALUES
-    ('ohlc', 100, 0, 0.000064, 0.0008),
+    ('ohlc', 2704, -0.00000501246391955176, 0.000087885498779083, 0.000180283203799317),
     ('volume', 100, 0, 0.09, 0.03)
 ) AS seed(field_group_name, sample_count, running_mean, running_m2, stddev)
 JOIN dim_field_group g ON g.name = seed.field_group_name

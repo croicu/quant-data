@@ -291,31 +291,107 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
-- **File**: [quant-reconcile](tasks/quant-reconcile.md) (successor to
+- **File**: [quant-reconcile](tasks/quant_reconcile.md) (successor to
   [IBKR provider reconciliation](tasks/ibkr-provider-reconciliation.md), which stays as historical
-  context for the now-closed-out schema/provider/wiring slices below)
-- **Status**: Brainstorm. `dim_provider`/staging schema (#18), the fetch-only `IBKRIntraDay`
-  provider (#21, `status:implementation`, not closed), and wiring both providers into `ingest`
-  (#22, `status:ready-to-submit`, live-verified against CroicuWS1 — 50,318 real staging rows) are
-  all done. What's left is `quant-reconcile` itself — a new CLI, `src/reconcile/cli.py` (mirrors
-  `src/ingest/`'s shape: console script only, no importable surface), that reads
-  `staging_market_data_1min` and promotes agreeing bars into `fact_market_data_1min`. Not started —
-  blocked on three open design questions in `tasks/quant-reconcile.md`: tolerance-configuration
-  shape (settings.json vs. a dedicated config vs. a DB table), the manual `settlement`-resolution
-  mechanism (CLI subcommand vs. direct SQL vs. something else), and the provider-reputation-event
-  table's exact schema.
-- **Key Context**: Goal is running IBKR alongside Yahoo Finance and reconciling the two (not
-  swapping one for the other) — they won't necessarily agree bar-for-bar. `quant-ingest` now
-  writes *only* to staging (never `fact_market_data_1min` directly, as of #22) — every configured
-  provider (`settings.providers`, global list, default `["yfinance"]`) writes its own bars there
-  independently, keyed by `provider_id`; `fact_market_data_1min` goes stale after a normal
-  `quant-ingest` run until `quant-reconcile` exists and is actually run. `IBKRIntraDay`
-  (`src/quant_data/_internal/shared/providers/ibkr.py`) uses a long-lived `connect()`/`close()`
-  lifecycle (not connect-per-call), now part of `IntraDayProvider` itself since `ingest`
-  orchestrates every configured provider's lifecycle uniformly. Filed but not fixed: #23, the
+  context for the now-closed-out schema/provider/wiring slices)
+- **Status**: Design fully converged (candidate/whistleblower model on `dim_provider.role`, field
+  consistency groups, the automatic-pass tier algorithm, `--finalize`, manual correction as the
+  whistleblower's only path to fact). Schema slice (#24: `dim_provider.role`, `dim_field_group`,
+  `fact_reconciliation`/`fact_reconciliation_participant`, `provider_pair_disagreement`) closed,
+  applied and verified against the real database. `quant-reconcile` itself
+  (`src/reconcile/algorithm.py`'s pure tier logic, `src/reconcile/cli.py`'s orchestration +
+  `--finalize`) is implemented and unit-tested (141 passing) — **not yet verified against the real
+  database**, that verification pending explicit go-ahead per this repo's confirm-before-real-
+  writes rule.
+- **Key Context**: `yfinance` is a whistleblower, not a peer — `dim_provider.role` is the single
+  source of truth for which providers' data can reach `fact_market_data_1min` (`role =
+  'candidate'`, `ibkr` today) vs. which is only ever compared against (`role = 'whistleblower'`).
+  Tolerance is measured, not configured: `provider_pair_disagreement` tracks
+  `Var(candidate - whistleblower)` per candidate per field group via Welford's algorithm, updated
+  only on Tier 2 (raw agreement) resolutions. `fact_reconciliation_participant` doubles as the
+  provider-reputation record, filtered to `resolution_path = 'manual_override'` only — an
+  algorithmic `--finalize` promotion isn't evidence anyone judged a provider wrong, only an actual
+  person overriding a specific value is. `quant_data._internal.shared.postgres` gained
+  reconcile-facing read/write methods but stays unaware of any reconciliation concept
+  (candidate/whistleblower, tiers) — that domain model lives entirely in `reconcile.algorithm`, so
+  `quant_data._internal` never depends on `reconcile` (rule 8's acyclic dependency graph).
+  `quant-ingest` now writes *only* to staging (never `fact_market_data_1min` directly, as of #22)
+  — `quant-reconcile` is the only path anything reaches fact. Filed but not fixed: #23, the
   per-bar write path (`write_bars`/`write_staging_bars`) being slow at ingest scale (unbatched
   round trips) — batching the insert + caching `dim_time`/`dim_date` in memory is the leading
-  direction, not implemented.
+  direction, not implemented. Two structural gaps found in the 2026-08-03 live test are now fixed
+  mechanically, not by adjusting tolerance logic (see `tasks/quant_reconcile.md`'s "Superseded:
+  volume as an independent field group" section for that distinction): `run_reconciliation`
+  internally repeats its pass over bars until one resolves nothing new (the seeding-lag fix,
+  replacing four manual re-runs with one invocation), and staging-row purging is now lazy —
+  deferred while an adjacent minute is still unresolved, so a promoted bar's raw data survives as
+  long as a future run's Tier-3 boundary-fix check might need it as a neighbor.
+  `promote_bar_to_fact` and the new `purge_staging_bar` are separate `PostgresDatabase` calls now.
+  All three changes (volume removal, seeding-lag fix, lazy purge) are live-verified against the
+  real database now: `migrations/005_remove_volume_field_group.sql` applied, the full 50,318-row
+  backup restored, then a fresh 599-row sample (09:30-09:39 ET, the market open, all 6 tickers/5
+  sessions) run
+  through `quant-reconcile` cleanly — 299/299 resolved via agreement, 0 stuck, on a single
+  invocation. A full 50,318-row run (1,235s) then found `DOG` disagreeing at a real 25.9% stuck
+  rate — see `tasks/per_ticker_disagreement.md` and `tasks/inverse_pair_cross_check.md`.
+  **`migrations/006_add_pending_manual_resolution.sql`** (applied to the real database and
+  live-verified — [issue #25](https://github.com/croicu/quant-data/issues/25),
+  `status:ready-to-submit`) adds `fact_pending_manual_resolution` (same "presence of a row is the
+  status" convention as `fact_reconciliation`), making "stuck" an explicit, queryable state: a
+  plain `quant-reconcile` run now skips any (bar, group) with a row here entirely instead of
+  re-fetching/re-evaluating it every time, and `--finalize` fetches *only* what has a row here (no
+  longer a superset of the plain pass) — fixes a real compounding cost under a realistic cadence
+  (e.g. plain run daily, `--finalize` weekly), independent of whether/when per-ticker stats ever
+  land. `run_reconciliation` now dispatches to `_run_automatic_pass`/`_run_finalize_pass` instead
+  of one shared function. Live-flagged the real backlog: 622 bars (`DOG` 499/`PSQ` 66/`SH` 54/`SPY`
+  3) now sitting in `fact_pending_manual_resolution`, confirmed skipped by a follow-up run. Code
+  itself is still uncommitted.
+
+- **File**: [Volume reconciliation](tasks/volume_reconciliation.md)
+- **Status**: Design converged, code done, folded into `quant-reconcile`'s still-uncommitted work
+  (no separate issue). Migration applied to the real database and live-verified (see above).
+  Prompted by `quant-reconcile`'s first live test showing volume's independent Tier 1-4
+  reconciliation leaving a real, ticker-dependent stuck rate that tuning the tolerance logic to fit
+  would only paper over.
+
+- **File**: [Per-ticker disagreement stats](tasks/per_ticker_disagreement.md)
+- **Status**: Brainstorm, design converged (training/graduation mechanism, no artificial seeds,
+  new tickers bootstrap via real `quant-ingest` backfill not a statistical shortcut), not yet
+  implemented.
+- **Key Context**: the first full-dataset `quant-reconcile` run (2026-08-03, one week, 6 tickers)
+  found `DOG`'s true stuck rate at 25.9% vs. `PSQ`/`SH`'s ~1.8% and `QQQ`/`DIA`/`SPY`'s ~0% — a
+  categorical outlier, not a smooth gradient, and not explained by volume (ticker-average or
+  per-bar) or price level, both tested directly and disproven. `provider_pair_disagreement`
+  currently pools all tickers into one `stddev`, dominated by `QQQ`/`SPY`/`DIA`'s much larger
+  volume of tight agreements — squeezing tickers whose normal noise band is genuinely wider. Fix:
+  give `provider_pair_disagreement` a `ticker_id` dimension; a ticker with fewer than a
+  sample-count threshold (~100, still open) of real observations is "in training" and promotes
+  nothing at all (no exceptions, including completeness) until it graduates; during training every
+  matched real-vs-real bar unconditionally feeds the Welford update (no established baseline yet
+  to protect from drift) since Tier 2 could otherwise never produce its first observation.
+
+- **File**: [--finalize targeted promotion](tasks/finalize_targeted_promotion.md)
+- **Status**: Brainstorm, not converged — several open questions (date/time input format
+  especially, given the UTC-vs-ET confusion earlier this session) need resolving before
+  implementation.
+- **Key Context**: prompted by reviewing the 3 pending `SPY` bars and judging `yfinance`'s value
+  correct for all three — currently the only way to promote that judgment is hand-writing SQL
+  against three tables (`tasks/quant_reconcile.md`'s "Manual correction" section, "no dedicated
+  tooling implied"). Proposed: new `--finalize` arguments (ticker, date/time, field group, winner)
+  for targeted single-bar promotion, always recorded as `resolution_path = 'manual_override'`
+  regardless of which provider wins — the first *tooled* path for `yfinance` to ever reach
+  `fact_market_data_1min`, correctly feeding `fact_reconciliation_participant`'s existing
+  reputation tracking with no changes needed there.
+- **Key Context**: volume stops being an independently reconciled field group — it isn't used
+  downstream as a cross-provider-verified absolute value (it's a relative, provider-tied confidence
+  signal), and `yfinance` has no pre-market volume at all, which is exactly the window this project
+  trades in, so the whistleblower comparison was never meaningful there. Once `ohlc` resolves for a
+  bar, its winning provider's own `volume` value (already on the same staging row) rides along —
+  no separate tier logic, no `provider_pair_disagreement` tracking for volume anymore.
+  `tasks/index_composite_check.md` is the leading candidate for a real volume anomaly signal later.
+  Needs a new migration to drop `dim_field_group`'s `'volume'` row and the reconciliation rows tied
+  to it (including the small 2026-08-03 live-test sample) — not yet applied, per this repo's
+  confirm-before-real-writes rule.
 
 ## Pending Tasks
 
@@ -372,6 +448,19 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   shipped: Yahoo-Finance-sourced fetch failures are tagged with their own `yfinance` log category,
   separate from Postgres write failures — but the exit code itself is deliberately unchanged
   until the expected-vs-unexpected design converges.
+
+- **File**: [Inverse-pair cross-check](tasks/inverse_pair_cross_check.md)
+- **Status**: Brainstorm, postponed — deprioritized, not actively worked
+- **Key Context**: `tasks/per_ticker_disagreement.md`'s per-ticker tolerance fixes false positives
+  but risks masking real DOG-specific data errors by training DOG's own checker on DOG's own
+  (currently unexplained, 25.9% stuck) history. `DOG`/`SH`/`PSQ` are inverse ETFs that track
+  intraday tightly to -1× their long counterpart (`DIA`/`SPY`/`QQQ`, which already agree between
+  providers essentially perfectly) — a trusted third reference for validating which provider is
+  right, without needing `tasks/index_composite_check.md`'s full constituent-weight data. Explicitly
+  postponed: for signal-research (not yet live trading), a signal in `QQQ` exists equally in `PSQ`
+  sign-flipped, so the inverse tickers' own data quality isn't currently load-bearing — a known,
+  accepted tradeoff, not a solved problem. `tasks/per_ticker_disagreement.md` proceeds without this
+  as a prerequisite.
 
 ## Completed Tasks
 - **Auto-manage the SSH tunnel via a `ConnectionTransport` abstraction** — closed issue #17.

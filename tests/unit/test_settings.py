@@ -246,6 +246,38 @@ def test_load_raises_when_ibkr_settings_is_not_an_object(tmp_path):
         Settings.load(path=settings_path)
 
 
+def test_load_defaults_reconcile_settings(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.reconcile.preferred_provider == "ibkr"
+    assert settings.reconcile.k == 3.0
+
+
+def test_load_parses_reconcile_settings_overrides(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"reconcile": {"preferredProvider": "IBKR", "k": 2.5}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.reconcile.preferred_provider == "ibkr"
+    assert settings.reconcile.k == 2.5
+
+
+def test_load_raises_when_reconcile_settings_is_not_an_object(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"reconcile": "not-an-object"})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_raises_when_reconcile_k_is_not_positive(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"reconcile": {"k": 0}})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
 def test_load_local_path_is_scoped_to_given_path_directory(tmp_path):
     # Regression guard: local_path used to default relative to the process's cwd regardless of
     # which `path` was passed, so loading a fixture elsewhere could silently pick up whatever

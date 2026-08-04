@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from quant_data._internal.shared.errors import AppError, DateOutOfRangeError
-from quant_data._internal.shared.postgres import PostgresDatabase
+from quant_data._internal.shared.postgres import DisagreementStatsRow, FieldGroupRow, PostgresDatabase, ProviderRow, StagingRow
 from quant_data.protocols import OHLCV
 
 
@@ -257,3 +257,264 @@ def test_write_staging_bars_reports_perf_to_injected_logger(mock_psycopg):
 
     perf_descriptions = [description for description, _ in logger.perf_calls]
     assert "write_staging_bars(ibkr, 1 bars)" in perf_descriptions
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_dim_providers_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        (1, "yfinance", "whistleblower"),
+        (2, "ibkr", "candidate"),
+    ]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    providers = database.fetch_dim_providers()
+
+    assert providers == [
+        ProviderRow(provider_id=1, name="yfinance", role="whistleblower"),
+        ProviderRow(provider_id=2, name="ibkr", role="candidate"),
+    ]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_dim_field_groups_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(1, "ohlc"), (2, "volume")]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    field_groups = database.fetch_dim_field_groups()
+
+    assert field_groups == [
+        FieldGroupRow(field_group_id=1, name="ohlc"),
+        FieldGroupRow(field_group_id=2, name="volume"),
+    ]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_provider_pair_disagreement_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(2, 1, 100, 0.0, 0.000064)]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    stats = database.fetch_provider_pair_disagreement()
+
+    assert stats == [DisagreementStatsRow(provider_id=2, field_group_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_staging_rows_for_reconciliation_scopes_by_provider_names(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, False),
+    ]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    rows = database.fetch_staging_rows_for_reconciliation(["yfinance", "ibkr"])
+
+    assert rows == [
+        StagingRow(
+            ticker_id=1,
+            date_id=10,
+            time_id=20,
+            timestamp=datetime(2026, 7, 24, 13, 30),
+            provider_id=2,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=1000,
+            incomplete=False,
+        )
+    ]
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    call_args = mock_cursor.execute.call_args
+    assert call_args.args[1]["names"] == ["yfinance", "ibkr"]
+    assert call_args.args[1]["expected_count"] == 2
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_resolved_field_groups_returns_winning_provider_by_bar(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(1, 10, 20, 1, 2)]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    resolved = database.fetch_resolved_field_groups()
+
+    assert resolved == {(1, 10, 20, 1): 2}
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_record_reconciliation_inserts_fact_and_participant_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.record_reconciliation(1, 10, 20, 1, 2, "agreement", [(2, True), (1, False)])
+
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    assert mock_cursor.execute.call_count == 3  # 1 fact_reconciliation insert + 2 participant inserts
+    mock_connection.commit.assert_called_once()
+    mock_connection.rollback.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_record_reconciliation_rolls_back_on_error(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_psycopg.Error = Exception
+    mock_connection.cursor.return_value.__enter__.return_value.execute.side_effect = mock_psycopg.Error("boom")
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    with pytest.raises(AppError):
+        database.record_reconciliation(1, 10, 20, 1, 2, "agreement", [(2, True)])
+
+    mock_connection.rollback.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_promote_bar_to_fact_upserts_fact_only(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.promote_bar_to_fact(1, 10, 20, datetime(2026, 7, 24, 13, 30), 100.0, 101.0, 99.0, 100.5, 1000, False)
+
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    assert mock_cursor.execute.call_count == 1  # fact upsert only -- purge is a separate call
+    mock_connection.commit.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_purge_staging_bar_deletes_staging_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.purge_staging_bar(1, 10, 20)
+
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.execute.assert_called_once()
+    mock_connection.commit.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_purge_staging_bar_rolls_back_on_error(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_psycopg.Error = Exception
+    mock_connection.cursor.return_value.__enter__.return_value.execute.side_effect = mock_psycopg.Error("boom")
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    with pytest.raises(AppError):
+        database.purge_staging_bar(1, 10, 20)
+
+    mock_connection.rollback.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_save_provider_pair_disagreement_upserts(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.save_provider_pair_disagreement(2, 1, 101, 0.001, 0.00007, 0.00083)
+
+    mock_connection.commit.assert_called_once()
+    mock_connection.rollback.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_pending_manual_resolution_staging_rows_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, False),
+    ]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    rows = database.fetch_pending_manual_resolution_staging_rows()
+
+    assert rows == [
+        StagingRow(
+            ticker_id=1,
+            date_id=10,
+            time_id=20,
+            timestamp=datetime(2026, 7, 24, 13, 30),
+            provider_id=2,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=1000,
+            incomplete=False,
+        )
+    ]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_pending_manual_resolution_keys_returns_keys(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(1, 10, 20, 1), (1, 10, 21, 1)]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    keys = database.fetch_pending_manual_resolution_keys()
+
+    assert keys == {(1, 10, 20, 1), (1, 10, 21, 1)}
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_mark_pending_manual_resolution_inserts(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.mark_pending_manual_resolution(1, 10, 20, 1)
+
+    mock_connection.commit.assert_called_once()
+    mock_connection.rollback.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_mark_pending_manual_resolution_rolls_back_on_error(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_psycopg.Error = Exception
+    mock_connection.cursor.return_value.__enter__.return_value.execute.side_effect = mock_psycopg.Error("boom")
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    with pytest.raises(AppError):
+        database.mark_pending_manual_resolution(1, 10, 20, 1)
+
+    mock_connection.rollback.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_clear_pending_manual_resolution_deletes(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.clear_pending_manual_resolution(1, 10, 20, 1)
+
+    mock_connection.commit.assert_called_once()
+    mock_connection.rollback.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_clear_pending_manual_resolution_rolls_back_on_error(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_psycopg.Error = Exception
+    mock_connection.cursor.return_value.__enter__.return_value.execute.side_effect = mock_psycopg.Error("boom")
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    with pytest.raises(AppError):
+        database.clear_pending_manual_resolution(1, 10, 20, 1)
+
+    mock_connection.rollback.assert_called_once()
