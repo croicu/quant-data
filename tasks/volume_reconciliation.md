@@ -1,13 +1,13 @@
 # Volume Reconciliation
 
-## Status: Implementation — code done, folded into `quant-reconcile`'s still-uncommitted work (no
-separate GitHub issue; see "Relationship to the still-uncommitted `quant-reconcile` CLI work"
-below). Migration applied to the real database (2026-08-03) and live-verified — see Test results.
+## Status: Done — code committed as part of `quant-reconcile`'s implementation (`f5b192f`, issue
+#25; no separate issue of its own — see "Relationship to `quant-reconcile`'s CLI work" below).
+Migration applied to the real database (2026-08-03) and live-verified — see Test results.
 
 ## Problem statement
 
-`tasks/quant_reconcile.md`'s design (schema #24, closed; CLI implemented but not yet committed —
-see that file) treats `volume` as its own independent field consistency group: it goes through
+`tasks/quant_reconcile.md`'s design (schema #24, closed; CLI now implemented and committed — see
+that file) treats `volume` as its own independent field consistency group: it goes through
 the same Tier 1-4 automatic pass as `ohlc` (completeness, raw agreement against `yfinance` within
 a measured tolerance, boundary-fix, else stuck), with its own `provider_pair_disagreement` row and
 its own `fact_reconciliation` rows, separate from whatever happens to `ohlc` for the same bar.
@@ -69,11 +69,11 @@ None remaining:
 - **Migration number/timing** — resolved: `migrations/005_remove_volume_field_group.sql` drafted
   (deletes volume rows from `fact_reconciliation_participant` → `fact_reconciliation` →
   `provider_pair_disagreement` → `dim_field_group`, in FK-safe order) and, with explicit go-ahead,
-  applied against the real CroicuWS1 database on 2026-08-03.
-- **Relationship to the still-uncommitted `quant-reconcile` CLI work** — resolved: this mechanism
-  change is just part of finishing `quant-reconcile` before its first commit, not a separate
-  follow-up. This task file exists to document the specific design/reasoning; it doesn't get its
-  own GitHub issue or commit.
+  applied against the real database on 2026-08-03.
+- **Relationship to `quant-reconcile`'s CLI work** — resolved: this mechanism change shipped as
+  part of `quant-reconcile`'s own commit (`f5b192f`, issue #25), not a separate follow-up. This
+  task file exists to document the specific design/reasoning; it never got its own GitHub issue or
+  commit.
 - **Downstream provenance concern** — resolved, not a real issue: `fact_market_data_1min` has never
   exposed per-field provenance to consumers, so volume implicitly following the `ohlc` winner
   changes nothing observable from `quant_data.MarketData`'s side.

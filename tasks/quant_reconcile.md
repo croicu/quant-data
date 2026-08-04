@@ -1,10 +1,11 @@
 # quant-reconcile
 
-## Status: Brainstorm overall (design converged, no open questions remaining) — schema-only slice
-done, applied to the real database, verified — issue #24, closed. `quant-reconcile` itself
-(`src/reconcile/`: `algorithm.py`'s Tiers 1-3 + Welford stats, `cli.py`'s orchestration and
-`--finalize`) is implemented and unit-tested; manual correction needs no code (direct hand-edit,
-per design). Not yet verified against the real database.
+## Status: Done — schema slice closed (issue #24), CLI implemented, unit-tested, live-verified at
+full scale, and committed (`f5b192f`, issue #25, `status:ready-to-submit`). Manual correction
+itself needs no code (direct hand-edit, per design) — though see `tasks/finalize_targeted_promotion.md`
+for a proposed CLI-tooled alternative to that hand-editing. Follow-up work continues in
+`tasks/per_ticker_disagreement.md`, `tasks/inverse_pair_cross_check.md`, and
+`tasks/finalize_targeted_promotion.md`.
 
 ## Problem statement
 
@@ -293,8 +294,8 @@ production data, not just the unit tests. `staging_market_data_1min` still holds
 (marking pending doesn't purge — only `--finalize` or manual correction resolving a bar does).
 
 Tracked as [issue #25](https://github.com/croicu/quant-data/issues/25), `status:ready-to-submit`
-— implemented, tested, live-verified; the code itself is still uncommitted alongside the rest of
-`quant-reconcile`'s still-uncommitted work.
+— implemented, tested, live-verified, and committed (`f5b192f`) alongside the rest of
+`quant-reconcile`'s implementation.
 
 **Noise-source coverage** — what the above actually handles vs. defers:
 
