@@ -555,5 +555,6 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   CroicuWS1, not run by Claude (paste-and-run convention for privileged DB ops). Live-verified
   end-to-end against the real database: row counts matched the known 2026-08-03 pending backlog
   exactly on every ticker with a backlog (SPY 6, DOG 998, SH 108, PSQ 132 — each pending bar's
-  count doubled, one row per reporting provider). **Cross-repo announcement to `quant-scratch` not
-  yet opened** — deliberately deferred until after this shipped; still outstanding.
+  count doubled, one row per reporting provider). Announced to `quant-scratch` via
+  [croicu/quant-scratch#15](https://github.com/croicu/quant-scratch/issues/15) (additive, so
+  informational/opt-in rather than a forced migration — same pattern as issue #17's announcement).
