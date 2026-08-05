@@ -31,3 +31,8 @@ settings.local.json
 
 # Local DB backups (real data snapshots, personal-machine artifacts)
 backups/
+
+# Artifacts that go to the secondary (non-GitHub) git remote only. A dedicated
+# local branch, never pushed to GitHub, has its own .gitignore that omits this
+# line so the same path is tracked there.
+/local/
