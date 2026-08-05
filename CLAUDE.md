@@ -299,21 +299,23 @@ pytest tests/unit/test_foo.py::test_bar   # single test
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
-- **File**: [Per-ticker disagreement stats](tasks/per_ticker_disagreement.md)
-- **Status**: Brainstorm, design converged (training/graduation mechanism, no artificial seeds,
-  new tickers bootstrap via real `quant-ingest` backfill not a statistical shortcut), not yet
-  implemented.
-- **Key Context**: the first full-dataset `quant-reconcile` run (2026-08-03, one week, 6 tickers)
-  found `DOG`'s true stuck rate at 25.9% vs. `PSQ`/`SH`'s ~1.8% and `QQQ`/`DIA`/`SPY`'s ~0% — a
-  categorical outlier, not a smooth gradient, and not explained by volume (ticker-average or
-  per-bar) or price level, both tested directly and disproven. `provider_pair_disagreement`
-  currently pools all tickers into one `stddev`, dominated by `QQQ`/`SPY`/`DIA`'s much larger
-  volume of tight agreements — squeezing tickers whose normal noise band is genuinely wider. Fix:
-  give `provider_pair_disagreement` a `ticker_id` dimension; a ticker with fewer than a
-  sample-count threshold (~100, still open) of real observations is "in training" and promotes
-  nothing at all (no exceptions, including completeness) until it graduates; during training every
-  matched real-vs-real bar unconditionally feeds the Welford update (no established baseline yet
-  to protect from drift) since Tier 2 could otherwise never produce its first observation.
+- **File**: [Pipeline accuracy hardening](tasks/pipeline_accuracy_hardening.md) (supersedes
+  [Per-ticker disagreement stats](tasks/per_ticker_disagreement.md) — that file's motivating
+  evidence/ticker concentration data still stand and were carried forward, but its
+  sample-count/graduation-threshold design was replaced)
+- **Status**: Slice 1 (schema-only: `dim_field`, `provider_pair_disagreement` re-keyed to
+  `(provider_id, ticker_id, field_id)`, `dataset_inception`) shipped and closed —
+  [croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28), see Completed Tasks
+  below. Slice 2 (algorithm + CLI: per-field Tier 2/3 tolerance, per-ticker graduation at 2,000
+  matched bars, `--backfill` + round-robin chunking, internal rate limiting, `yfinance` lazy-purge
+  exemption) not yet started — its full converged design is carried in #28's body, ready to become
+  its own `status:implementation` issue.
+- **Key Context**: fixes two compounding pooling problems in `provider_pair_disagreement`, both
+  traced to a single measured tolerance standing in for a population that isn't homogeneous —
+  pooled across tickers (`DOG`'s true stuck rate 25.9% vs. `SPY`/`QQQ`/`DIA`'s ~0%, from the
+  2026-08-03 full-dataset run) and pooled across fields (`yfinance` noise concentrates in
+  `high`/`low` while `open`/`close` stay stable, so one `ohlc`-group tolerance let the noisy fields
+  set the band for the stable ones).
 
 - **File**: [--finalize targeted promotion](tasks/finalize_targeted_promotion.md)
 - **Status**: Brainstorm, not converged — several open questions (date/time input format
@@ -588,3 +590,23 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   informational/opt-in rather than a forced migration — same pattern as issue #17's announcement);
   its body was edited in place (not left stale) once #27 landed, since #15 was still
   `status:brainstorm`/unintegrated at that point.
+- **Pipeline accuracy hardening, slice 1 (schema only)** — closed issue #28 (commit `1e67718`),
+  opened and closed by Claude mid-task per this file's "Who closes an issue" exception. New
+  `dim_field` dimension (mirrors `dim_provider`'s shape, seeded `open`/`high`/`low`/`close`);
+  `provider_pair_disagreement` re-keyed from `(provider_id, field_group_id)` to `(provider_id,
+  ticker_id, field_id)`, fixing two compounding pooling problems traced to a single global
+  `stddev` standing in for a non-homogeneous population — pooled across tickers (`DOG`'s 25.9%
+  true stuck rate vs. `SPY`/`QQQ`/`DIA`'s ~0%) and pooled across fields (`yfinance` noise
+  concentrates in `high`/`low` while `open`/`close` stay stable, so one `ohlc`-group tolerance let
+  the noisy fields set the band for the stable ones). Existing pooled rows discarded rather than
+  migrated forward, same precedent set by the ticker-only predecessor of this change
+  (`tasks/per_ticker_disagreement.md`) — every `(provider, ticker, field)` starts at zero. New
+  single-row `dataset_inception` table (`CHECK (id = 1)` enforced), left empty — the actual
+  `inception_date` value and the `--backfill` mechanism that consumes it are slice 2's work, not
+  this one's. Schema-only by design: `quant-reconcile` keeps reading/writing the pre-migration
+  shape until slice 2's algorithm/CLI changes land as a follow-up issue (design already converged,
+  carried in #28's body). Migration `007_add_dim_field_and_dataset_inception`, applied by the repo
+  owner directly via `psql` as `quant_data` (the schema-owner role, whose credentials aren't held
+  by Claude or in `settings.local.json`) — Claude verified the result live and read-only via
+  `quant_reader` both before applying (confirmed not yet applied) and after (confirmed the new key
+  shape, seeded `dim_field` rows, and discarded `provider_pair_disagreement` rows).
