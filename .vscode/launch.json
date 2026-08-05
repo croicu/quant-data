@@ -27,6 +27,15 @@
       "args": ["-v", "-s", "-x"],
       "console": "integratedTerminal",
       "justMyCode": false
+    },
+    {
+      "name": "Push Local",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/local/sync_local.py",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": true
     }
   ],
   "inputs": []
