@@ -29,7 +29,12 @@ a fifth dimension (`dim_field_group`), and the `fact_reconciliation`/
 `fact_reconciliation_participant`/`provider_pair_disagreement` tables `quant-reconcile` reads/
 writes — see those sections below and `tasks/quant-reconcile.md`. `006_add_pending_manual_resolution`
 added `fact_pending_manual_resolution`, making "stuck" an explicit, queryable state instead of an
-implicit one — see its own section below. `fact_market_data_1min` itself is unchanged throughout:
+implicit one — see its own section below. `007_add_dim_field_and_dataset_inception` added a sixth
+dimension (`dim_field`), re-keyed `provider_pair_disagreement` to `(provider_id, ticker_id,
+field_id)`, and added `dataset_inception` — schema-only, ahead of the pipeline-accuracy-hardening
+algorithm/CLI changes that consume the new shape (see those sections below and
+[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)). `fact_market_data_1min`
+itself is unchanged throughout:
 it remains the single golden, reconciled dataset every reader (`MarketData`) queries, regardless of
 which provider(s) a bar's value ultimately came from.
 
@@ -198,31 +203,59 @@ separate reputation table needed. For the whistleblower specifically, `won = TRU
 `manual_override`, its only path to winning) are their own signal: how often a person actually
 reached for its value specifically, as opposed to hand-correcting to something else entirely.
 
+## `dim_field`
+
+| Column | Type | Notes |
+|---|---|---|
+| `field_id` | `SERIAL PRIMARY KEY` | |
+| `name` | `TEXT NOT NULL UNIQUE` | Always lowercase — enforced by a `CHECK` constraint. `'open'`/`'high'`/`'low'`/`'close'` |
+| `created_at` | `TIMESTAMP` | Defaults to insert time |
+
+Added in `007_add_dim_field_and_dataset_inception`, mirroring `dim_provider`'s shape. Distinct from
+`dim_field_group`: `dim_field_group` still governs which `fact_market_data_1min` columns
+`quant-reconcile` must promote together as one atomic unit (OHLC from a single winning provider —
+unchanged by this migration); `dim_field` exists solely so `provider_pair_disagreement` can measure
+each field's tolerance independently. `yfinance`'s noise concentrates in `high`/`low` while
+`open`/`close` stay comparatively stable — a single `'ohlc'`-group tolerance let the noisy fields
+set (or blow) the band for the stable ones. `provider_pair_disagreement` is currently the only
+consumer.
+
 ## `provider_pair_disagreement`
 
 | Column | Type | Notes |
 |---|---|---|
 | `provider_id` | `INT NOT NULL` | FK → `dim_provider` — always a `role = 'candidate'` provider, never the whistleblower |
-| `field_group_id` | `INT NOT NULL` | FK → `dim_field_group` |
+| `ticker_id` | `INT NOT NULL` | FK → `dim_ticker`. Added in `007_add_dim_field_and_dataset_inception`, replacing the table's ticker-agnostic pooling |
+| `field_id` | `INT NOT NULL` | FK → `dim_field`. Added in `007_add_dim_field_and_dataset_inception`, replacing `field_group_id` |
 | `sample_count` | `BIGINT NOT NULL DEFAULT 0` | `>= 0` |
 | `running_mean` | `NUMERIC NOT NULL DEFAULT 0` | Signed: `candidate_value - whistleblower_value`, not the reverse |
 | `running_m2` | `NUMERIC NOT NULL DEFAULT 0` | Welford's algorithm accumulator |
 | `stddev` | `NUMERIC` | Denormalized from `running_m2`/`sample_count` for fast reads |
 | `updated_at` | `TIMESTAMP` | Defaults to insert time |
 
-Primary key: `(provider_id, field_group_id)`. Added in `004_add_reconciliation_tables`. Running
-variance of each candidate provider's disagreement against the fixed whistleblower (`yfinance`
-today), per field group — measured directly rather than reconstructed from two
-individually-unmeasurable per-provider "precision" figures (no ground-truth reference exists to
-attribute disagreement to one side or the other). No ticker dimension — noise is a property of
-methodology, not of individual tickers. `stddev` is relative/fractional, scaled against an actual
-reference value at comparison time to get `quant-reconcile`'s bar-specific absolute tolerance
-(`tolerance = k * stddev * reference_value`, `k = 3`). Since `005_remove_volume_field_group`, only
-ever has rows for the `'ohlc'` field group — volume no longer has its own measured tolerance (see
-`tasks/volume_reconciliation.md`). Only in-band (raw-agreement) observations
-update this — `finalized`/`manual_override` resolutions are excluded so outliers can't gradually
-widen "normal." Seeded with an illustrative starting value per field group at migration time (not
-measured data), pseudo-count 100 so it fades slowly as real observations accumulate.
+Primary key: `(provider_id, ticker_id, field_id)`. Added in `004_add_reconciliation_tables`,
+re-keyed in `007_add_dim_field_and_dataset_inception` (see
+[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)) — this is schema-only:
+`quant-reconcile` still reads/writes the pre-`007` shape until a follow-up implementation issue
+lands the algorithm/CLI changes that consume the new key. Running variance of each candidate
+provider's disagreement against the fixed whistleblower (`yfinance` today), per ticker per field —
+measured directly rather than reconstructed from two individually-unmeasurable per-provider
+"precision" figures (no ground-truth reference exists to attribute disagreement to one side or the
+other). Keyed per-ticker and per-field, not pooled, because noise isn't homogeneous across either
+dimension: `DOG`'s real disagreement band is wider than `SPY`/`QQQ`/`DIA`'s (traced to one global
+`stddev` dominated by the tight-agreement tickers), and `yfinance`'s noise concentrates in
+`high`/`low` while `open`/`close` stay comparatively stable (traced to one `'ohlc'`-group tolerance
+letting the noisy fields set the band for the stable ones). `stddev` is relative/fractional, scaled
+against an actual reference value at comparison time to get `quant-reconcile`'s bar-specific
+absolute tolerance (`tolerance = k * stddev * reference_value`, `k = 3`). Only in-band
+(raw-agreement) observations update this — `finalized`/`manual_override` resolutions are excluded
+so outliers can't gradually widen "normal." `007` discards the table's pre-existing pooled rows
+rather than migrating them forward — every `(provider, ticker, field)` starts at zero and earns its
+own real history; no seed value this time (contrast with `004`'s illustrative seed), since a
+ticker's first real stats computation only ever happens over a full batch of actually-observed
+matched bars (see the per-ticker graduation design in
+[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)), so there's no cold-start
+gap to seed in the first place.
 
 ## `fact_pending_manual_resolution`
 
@@ -255,6 +288,24 @@ provider's raw value *and* whether it's the candidate or whistleblower, rather t
 that a bar is stuck. Requires `quant_reader` to have `SELECT` on `staging_market_data_1min`,
 `dim_field_group`, and `dim_provider` in addition to this table — see `docs/DATABASE.md`'s
 "Granting quant_reader access to new tables".
+
+## `dataset_inception`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INT PRIMARY KEY DEFAULT 1` | `CHECK (id = 1)` |
+| `inception_date` | `DATE NOT NULL` | |
+
+Added in `007_add_dim_field_and_dataset_inception`, currently empty (no consuming code yet — see
+[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)). Single-row table recording
+the date the dataset is meant to start from — a fact about the dataset's own properties, not
+tunable process behavior, so it lives here rather than `settings.json`. The `CHECK (id = 1)`
+enforces the single-row invariant at the DB level rather than relying on convention (contrast with
+`schema_migrations`, which legitimately has one row per migration). Moving `inception_date`
+backward is an operational trigger, not just a value update: a future `--backfill` implementation
+must re-run for every configured ticker from the new `inception_date` to that ticker's own current
+earliest covered date — not a single shared date, since tickers may already have different amounts
+of history.
 
 ## Indexes
 
