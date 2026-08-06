@@ -31,3 +31,6 @@ settings.local.json
 
 # Local DB backups (real data snapshots, personal-machine artifacts)
 backups/
+
+# Artifacts that go to the secondary (non-GitHub) git remote only.
+/local/
