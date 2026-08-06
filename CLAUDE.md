@@ -245,6 +245,50 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   from `quant_data.create_postgres_provider` (defaults to `quant_reader`), not `PostgresDatabase`
   directly.
 
+## Git Remotes
+
+Two remotes exist for this repo, serving different purposes:
+
+- **`origin`** (`https://github.com/croicu/quant-data.git`) — the public GitHub repo. `main`
+  tracks `origin/main`; a plain `git push`/`git pull` targets this one.
+- **`croicuws1`** (`ssh://alex@CroicuWS1/storage/Git/quant-data.git`) — a bare repo on the
+  database box itself, referred to as "the local/secondary remote" in conversation. Not the
+  tracked upstream, so it needs an explicit `git push croicuws1 main` — it does not receive a
+  plain `git push` automatically. Its main use: keeping `~/quant-data` (the working checkout +
+  venv on CroicuWS1, set up to run `quant-ingest`/`quant-reconcile` directly on the box without
+  SSH-tunnel latency — see `docs/DATABASE.md`) in sync via `git pull` there, instead of the
+  slower/error-prone `tar`-over-`ssh` workaround this repo used before code landing here was
+  actually committed.
+
+**After any local commit that should reach the box, push to both**:
+```bash
+git push origin main
+git push croicuws1 main
+```
+If the second push is rejected as non-fast-forward, `croicuws1` has a commit `origin`/local
+doesn't (see the `/local/` procedure below for the most common cause) — `git fetch croicuws1`
+and inspect (`git log --oneline main..croicuws1/main`) before merging or force-pushing; never
+force-push without confirming what would be discarded (see `.gitignore`'s `# Artifacts that go
+to the secondary (non-GitHub) git remote only.` comment — anything under `/local/` only ever
+exists tracked on `croicuws1`, so it's the one place a force-push could genuinely lose data
+that isn't recoverable from GitHub).
+
+**The `/local/` switch-to-local / push / switch-back procedure**: `/local/` is where
+machine-specific or investigation-only artifacts (ad-hoc candlestick PNGs, CSV pulls from a
+paid data source, one-off sync scripts — see `croicu/quant-data#28`-adjacent investigations
+for an example) live when they're worth persisting *somewhere* but don't belong in the public
+GitHub history. Normally gitignored (`/local/` in `.gitignore`). To actually push something
+under `/local/` to the box:
+1. **Switch to local**: remove the `/local/` line from `.gitignore` (temporarily).
+2. **Push**: `git add local/ .gitignore`, commit, then `git push croicuws1 main` — deliberately
+   *not* `git push origin main`, since this content is meant for the secondary remote only.
+3. **Switch back**: restore the `/local/` line to `.gitignore`, `git rm -r --cached local/`
+   (untracks without deleting the working-tree files), commit, then push that commit to *both*
+   remotes so history stays in sync and `/local/` goes back to being ignored everywhere. This
+   step is what keeps the cycle from leaving `croicuws1` permanently diverged — skipping it is
+   exactly what caused a non-fast-forward rejection once already (commit `b35fe43`, merged back
+   in and properly closed out in the commit right after this section was written).
+
 ## Architecture conventions
 
 1. Internal processing uses strongly typed dataclasses.
