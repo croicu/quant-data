@@ -70,6 +70,22 @@ outlier pattern from the original 3-bar case remains the actual motivating evide
   (c) plain shorthand for "stop it from blocking reconciliation," i.e. the existing
   `incomplete=True` disposition already satisfies the actual intent. Carry this ambiguity into the
   GitHub issue rather than assuming which one was meant.
+- **Direct dependency on `ingestion_coverage` discovered (2026-08-06), depends on how the "remove
+  vs. keep" tension above resolves**: "mark incomplete, keep the row" has no dependency — the row
+  still exists in staging, so it flows through the *existing* Tier 1 completeness path
+  (`_resolve_completeness`), which already auto-promotes on an incomplete whistleblower value.
+  "Remove the row entirely" is different: a deleted yfinance row makes that minute
+  whistleblower-*absent*, indistinguishable from "not yet ingested" without `ingestion_coverage`
+  confirming the date range really was covered (see `tasks/`'s pipeline-accuracy-hardening
+  context — `ingestion_coverage`'s write path is still unfinished; `quant-ingest` never writes to
+  it, only migration 008's one-time backfill ever populated it). Without that, every removed
+  outlier just becomes a *new* orphaned/unaccounted bar (confirmed live: 12,061 `ibkr` rows
+  currently stuck this exact way from ordinary `yfinance` coverage gaps, ~20% of all
+  `staging_market_data_1min`) — relocating the problem, not fixing it. So picking "remove"
+  implicitly commits to finishing `ingestion_coverage`'s write path first or alongside; "mark
+  incomplete" has no such prerequisite and could ship independently, sooner. Surface this
+  explicitly before the DV team picks a direction — it changes the actual tradeoff, not just the
+  wording.
 
 ## Open questions
 

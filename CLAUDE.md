@@ -388,7 +388,11 @@ under `/local/` to the box:
   reusing Tier 1/`_resolve_completeness` rather than discarding at ingest or building a new tier)
   **re-opened for discussion 2026-08-05**: the DV team framing of this as "remove the outliers"
   is in tension with "keep the row, just flag it" — needs explicit reconciling before filing the
-  GitHub issue. Outlier-detection rule also still open.
+  GitHub issue. Outlier-detection rule also still open. **Direct dependency on `ingestion_coverage`
+  found 2026-08-06**: "remove the row" (not "mark incomplete") only works safely once
+  `ingestion_coverage`'s still-unfinished write path exists — otherwise every removed outlier just
+  becomes a new orphaned/unaccounted bar, the same problem already confirmed live at scale
+  (12,061 `ibkr` rows, ~20% of `staging_market_data_1min`). See the task file's Design decisions.
 - **Key Context**: spawned from the same `SPY` investigation above. `yfinance`'s raw feed shows
   sporadic single-field spikes (confirmed via 3-day candlestick comparison against `ibkr`'s smooth
   curve) that drag an otherwise-agreeing bar's whole `field_group` comparison outside tolerance
