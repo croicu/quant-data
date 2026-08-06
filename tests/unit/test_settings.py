@@ -86,6 +86,29 @@ def test_load_raises_on_non_positive_catch_up_lookback_days(tmp_path):
         Settings.load(path=settings_path)
 
 
+def test_load_defaults_backfill_chunk_days_to_one(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.backfill_chunk_days == 1
+
+
+def test_load_parses_backfill_chunk_days(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"backfillChunkDays": 5})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.backfill_chunk_days == 5
+
+
+def test_load_raises_on_non_positive_backfill_chunk_days(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"backfillChunkDays": 0})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
 def test_load_default_debug_false_no_log_level_restricts_to_general(tmp_path):
     settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
 
@@ -241,6 +264,67 @@ def test_load_parses_ibkr_settings_overrides(tmp_path):
 
 def test_load_raises_when_ibkr_settings_is_not_an_object(tmp_path):
     settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": "not-an-object"})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_defaults_ibkr_rate_limit_even_when_ibkr_block_omitted(tmp_path):
+    # Unlike other providers, "unspecified" for IBKR does not mean unlimited -- it has a known
+    # real ceiling that always applies (croicu/quant-data#28).
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.ibkr.rate_limit is not None
+    assert settings.ibkr.rate_limit.requests_per_window == 50
+    assert settings.ibkr.rate_limit.window_seconds == 600
+
+
+def test_load_defaults_ibkr_rate_limit_when_ibkr_block_present_but_rate_limit_omitted(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": {"host": "10.0.0.5"}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.ibkr.rate_limit.requests_per_window == 50
+    assert settings.ibkr.rate_limit.window_seconds == 600
+
+
+def test_load_parses_ibkr_rate_limit_override(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": {"rateLimit": {"requestsPerWindow": 30, "windowSeconds": 300}}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.ibkr.rate_limit.requests_per_window == 30
+    assert settings.ibkr.rate_limit.window_seconds == 300
+
+
+def test_load_raises_when_ibkr_rate_limit_is_missing_a_key(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": {"rateLimit": {"requestsPerWindow": 30}}})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_defaults_yfinance_rate_limit_to_unlimited(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.yfinance.rate_limit is None
+
+
+def test_load_parses_yfinance_rate_limit_override(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"yfinance": {"rateLimit": {"requestsPerWindow": 100, "windowSeconds": 60}}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.yfinance.rate_limit.requests_per_window == 100
+    assert settings.yfinance.rate_limit.window_seconds == 60
+
+
+def test_load_raises_when_yfinance_settings_is_not_an_object(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"yfinance": "not-an-object"})
 
     with pytest.raises(TaskError):
         Settings.load(path=settings_path)

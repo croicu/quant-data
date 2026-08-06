@@ -24,6 +24,18 @@ def _default_providers() -> list[str]:
     return list(DEFAULT_PROVIDERS)
 
 
+def _parse_rate_limit_payload(rate_limit_payload: dict, settings_key: str) -> RateLimitSettings:
+    if "requestsPerWindow" not in rate_limit_payload or "windowSeconds" not in rate_limit_payload:
+        raise TaskError(f"'{settings_key}.rateLimit' must set both 'requestsPerWindow' and 'windowSeconds'.")
+    requests_per_window = int(rate_limit_payload["requestsPerWindow"])
+    window_seconds = int(rate_limit_payload["windowSeconds"])
+    if requests_per_window < 1:
+        raise TaskError(f"'{settings_key}.rateLimit.requestsPerWindow' must be at least 1, got {requests_per_window}.")
+    if window_seconds < 1:
+        raise TaskError(f"'{settings_key}.rateLimit.windowSeconds' must be at least 1, got {window_seconds}.")
+    return RateLimitSettings(requests_per_window=requests_per_window, window_seconds=window_seconds)
+
+
 @dataclass
 class PostgresSettings:
     host: str
@@ -36,10 +48,32 @@ class PostgresSettings:
 
 
 @dataclass
+class RateLimitSettings:
+    requests_per_window: int
+    window_seconds: int
+
+
+def _default_ibkr_rate_limit() -> RateLimitSettings:
+    # Deliberately under IBKR's documented ceiling (60/600), not exactly at it -- margin against
+    # clock skew or concurrent connections (croicu/quant-data#28). Unlike other providers,
+    # "unspecified" for IBKR does not mean unlimited: it has a known real ceiling that should
+    # always apply, so this is the dataclass default even when settings.json omits ibkr.rateLimit
+    # entirely, not just the "if present" parsed value.
+    return RateLimitSettings(requests_per_window=50, window_seconds=600)
+
+
+@dataclass
 class IbkrSettings:
     host: str = IBKR_DEFAULT_HOST
     port: int = IBKR_DEFAULT_PORT
     client_id: int = IBKR_DEFAULT_CLIENT_ID
+    rate_limit: RateLimitSettings | None = field(default_factory=_default_ibkr_rate_limit)
+
+
+@dataclass
+class YfinanceSettings:
+    # None (the default) means unlimited -- yfinance has no known ceiling, unlike IBKR above.
+    rate_limit: RateLimitSettings | None = None
 
 
 @dataclass
@@ -61,7 +95,9 @@ class Settings:
     catch_up_lookback_days: int = 7
     providers: list[str] = field(default_factory=_default_providers)
     ibkr: IbkrSettings = field(default_factory=IbkrSettings)
+    yfinance: YfinanceSettings = field(default_factory=YfinanceSettings)
     reconcile: ReconcileSettings = field(default_factory=ReconcileSettings)
+    backfill_chunk_days: int = 1
 
     _instance: ClassVar[Settings | None] = None
 
@@ -210,6 +246,10 @@ class Settings:
         if catch_up_lookback_days < 1:
             raise TaskError(f"'settings.catchUpLookbackDays' must be at least 1, got {catch_up_lookback_days}.")
 
+        backfill_chunk_days = int(settings_payload.get("backfillChunkDays", 1))
+        if backfill_chunk_days < 1:
+            raise TaskError(f"'settings.backfillChunkDays' must be at least 1, got {backfill_chunk_days}.")
+
         providers_payload = settings_payload.get("providers", list(DEFAULT_PROVIDERS))
         if not isinstance(providers_payload, list):
             raise TaskError("'settings.providers' must be an array of strings.")
@@ -225,11 +265,31 @@ class Settings:
         if ibkr_payload is not None:
             if not isinstance(ibkr_payload, dict):
                 raise TaskError("'settings.ibkr' must be a JSON object.")
+            ibkr_rate_limit = _default_ibkr_rate_limit()
+            ibkr_rate_limit_payload = ibkr_payload.get("rateLimit")
+            if ibkr_rate_limit_payload is not None:
+                if not isinstance(ibkr_rate_limit_payload, dict):
+                    raise TaskError("'settings.ibkr.rateLimit' must be a JSON object.")
+                ibkr_rate_limit = _parse_rate_limit_payload(ibkr_rate_limit_payload, "settings.ibkr")
             ibkr_settings = IbkrSettings(
                 host=str(ibkr_payload.get("host", IBKR_DEFAULT_HOST)),
                 port=int(ibkr_payload.get("port", IBKR_DEFAULT_PORT)),
                 client_id=int(ibkr_payload.get("clientId", IBKR_DEFAULT_CLIENT_ID)),
+                rate_limit=ibkr_rate_limit,
             )
+
+        yfinance_settings = YfinanceSettings()
+        yfinance_payload = settings_payload.get("yfinance")
+        if yfinance_payload is not None:
+            if not isinstance(yfinance_payload, dict):
+                raise TaskError("'settings.yfinance' must be a JSON object.")
+            yfinance_rate_limit: RateLimitSettings | None = None
+            yfinance_rate_limit_payload = yfinance_payload.get("rateLimit")
+            if yfinance_rate_limit_payload is not None:
+                if not isinstance(yfinance_rate_limit_payload, dict):
+                    raise TaskError("'settings.yfinance.rateLimit' must be a JSON object.")
+                yfinance_rate_limit = _parse_rate_limit_payload(yfinance_rate_limit_payload, "settings.yfinance")
+            yfinance_settings = YfinanceSettings(rate_limit=yfinance_rate_limit)
 
         reconcile_settings = ReconcileSettings()
         reconcile_payload = settings_payload.get("reconcile")
@@ -256,7 +316,9 @@ class Settings:
             catch_up_lookback_days=catch_up_lookback_days,
             providers=providers,
             ibkr=ibkr_settings,
+            yfinance=yfinance_settings,
             reconcile=reconcile_settings,
+            backfill_chunk_days=backfill_chunk_days,
         )
 
         return cls._instance

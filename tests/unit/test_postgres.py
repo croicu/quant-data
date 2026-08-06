@@ -6,7 +6,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from quant_data._internal.shared.errors import AppError, DateOutOfRangeError
-from quant_data._internal.shared.postgres import DisagreementStatsRow, FieldGroupRow, PostgresDatabase, ProviderRow, StagingRow
+from quant_data._internal.shared.postgres import (
+    DisagreementStatsRow,
+    FieldGroupRow,
+    FieldRow,
+    IngestionCoverageRow,
+    PostgresDatabase,
+    ProviderRow,
+    StagingRow,
+)
 from quant_data.protocols import OHLCV, PendingResolutionBar, ProviderRole
 
 
@@ -293,15 +301,49 @@ def test_fetch_dim_field_groups_returns_rows(mock_psycopg):
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_dim_fields_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        (1, "open"),
+        (2, "high"),
+        (3, "low"),
+        (4, "close"),
+    ]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    fields = database.fetch_dim_fields()
+
+    assert fields == [
+        FieldRow(field_id=1, name="open"),
+        FieldRow(field_id=2, name="high"),
+        FieldRow(field_id=3, name="low"),
+        FieldRow(field_id=4, name="close"),
+    ]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
 def test_fetch_provider_pair_disagreement_returns_rows(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
-    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(2, 1, 100, 0.0, 0.000064)]
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(2, 1, 3, 100, 0.0, 0.000064)]
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
 
     stats = database.fetch_provider_pair_disagreement()
 
-    assert stats == [DisagreementStatsRow(provider_id=2, field_group_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)]
+    assert stats == [DisagreementStatsRow(provider_id=2, ticker_id=1, field_id=3, sample_count=100, running_mean=0.0, running_m2=0.000064)]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_ingestion_coverage_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(1, 2, 10, 14)]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    coverage = database.fetch_ingestion_coverage()
+
+    assert coverage == [IngestionCoverageRow(ticker_id=1, provider_id=2, start_date_id=10, end_date_id=14)]
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
@@ -313,7 +355,7 @@ def test_fetch_staging_rows_for_reconciliation_scopes_by_provider_names(mock_psy
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
 
-    rows = database.fetch_staging_rows_for_reconciliation(["yfinance", "ibkr"])
+    rows = database.fetch_staging_rows_for_reconciliation(["yfinance", "ibkr"], ["ibkr"])
 
     assert rows == [
         StagingRow(
@@ -333,7 +375,8 @@ def test_fetch_staging_rows_for_reconciliation_scopes_by_provider_names(mock_psy
     mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
     call_args = mock_cursor.execute.call_args
     assert call_args.args[1]["names"] == ["yfinance", "ibkr"]
-    assert call_args.args[1]["expected_count"] == 2
+    assert call_args.args[1]["required_names"] == ["ibkr"]
+    assert call_args.args[1]["required_count"] == 1
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
@@ -401,6 +444,11 @@ def test_purge_staging_bar_deletes_staging_rows(mock_psycopg):
     mock_cursor.execute.assert_called_once()
     mock_connection.commit.assert_called_once()
 
+    # Whistleblower-role providers must be excluded from the delete (croicu/quant-data#28) --
+    # guards against an accidental revert to an unconditional delete.
+    call_args = mock_cursor.execute.call_args
+    assert call_args.args[1] == (1, 10, 20, ProviderRole.WHISTLEBLOWER.value)
+
 
 @patch("quant_data._internal.shared.postgres.psycopg")
 def test_purge_staging_bar_rolls_back_on_error(mock_psycopg):
@@ -417,15 +465,91 @@ def test_purge_staging_bar_rolls_back_on_error(mock_psycopg):
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
-def test_save_provider_pair_disagreement_upserts(mock_psycopg):
+def test_save_provider_pair_disagreement_batch_upserts(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
 
-    database.save_provider_pair_disagreement(2, 1, 101, 0.001, 0.00007, 0.00083)
+    database.save_provider_pair_disagreement_batch([(2, 1, 3, 101, 0.001, 0.00007, 0.00083)])
 
     mock_connection.commit.assert_called_once()
     mock_connection.rollback.assert_not_called()
+
+    call_args = mock_connection.cursor.return_value.__enter__.return_value.execute.call_args
+    assert call_args.args[1] == (2, 1, 3, 101, 0.001, 0.00007, 0.00083)
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_save_provider_pair_disagreement_batch_commits_once_for_multiple_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.save_provider_pair_disagreement_batch(
+        [
+            (2, 1, 3, 101, 0.001, 0.00007, 0.00083),
+            (2, 1, 4, 101, 0.002, 0.00008, 0.00091),
+            (2, 1, 5, 101, 0.003, 0.00009, 0.00095),
+            (2, 1, 6, 101, 0.004, 0.00010, 0.00100),
+        ]
+    )
+
+    mock_connection.commit.assert_called_once()
+    mock_connection.rollback.assert_not_called()
+    assert mock_connection.cursor.return_value.__enter__.return_value.execute.call_count == 4
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_save_provider_pair_disagreement_batch_empty_rows_is_a_noop(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.save_provider_pair_disagreement_batch([])
+
+    mock_connection.commit.assert_not_called()
+    mock_connection.cursor.return_value.__enter__.return_value.execute.assert_not_called()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_dataset_inception_date_returns_the_date(mock_psycopg):
+    _connect(mock_psycopg, [(date(2020, 1, 1),)])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    assert database.fetch_dataset_inception_date() == date(2020, 1, 1)
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_dataset_inception_date_raises_when_table_is_empty(mock_psycopg):
+    _connect(mock_psycopg, [None])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    with pytest.raises(AppError):
+        database.fetch_dataset_inception_date()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_earliest_covered_date_returns_the_date(mock_psycopg):
+    _connect(mock_psycopg, [(date(2026, 1, 15),)])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    assert database.fetch_earliest_covered_date("aapl") == date(2026, 1, 15)
+
+    mock_cursor = mock_psycopg.connect.return_value.cursor.return_value.__enter__.return_value
+    call_args = mock_cursor.execute.call_args
+    assert call_args.args[1] == ("AAPL", "AAPL")
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_earliest_covered_date_returns_none_for_a_never_ingested_ticker(mock_psycopg):
+    _connect(mock_psycopg, [(None,)])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    assert database.fetch_earliest_covered_date("aapl") is None
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")

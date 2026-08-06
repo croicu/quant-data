@@ -33,6 +33,25 @@ cleanly via Tier 2 (agreement) if not for `yfinance`'s single bad field dragging
 fields — one bad field poisons the whole group's comparison). This is very likely contributing to
 backlog noise beyond just these 3 `SPY` bars (not yet quantified against the full 622-bar backlog).
 
+**Second independent occurrence (2026-08-05), `SPY` 2026-07-27 09:50/09:51 ET** — one of the
+`tasks/finalize_targeted_promotion.md` "New pending-bar review candidates" bullets
+(`close`@09:50 `ibkr` 743.95 vs. `yfinance` 743.919982910156; `open`@09:51 `ibkr` 743.91 vs.
+`yfinance` 743.950012207031). Initially looked from a candlestick plot (`tasks/Conflict -
+2026-07-27.png`) like it might be a timestamp/off-by-one bug — `yfinance`'s bar shape appeared
+shifted one minute from `ibkr`'s. Verified directly against `staging_market_data_1min`: both
+providers' `date_id`/`time_id`/`timestamp` are internally consistent for both minutes, so it's
+not a keying bug. Two things combined to create the visual illusion: (1) `ibkr`'s 09:50 `close`
+(743.95) is nearly identical to `yfinance`'s 09:51 `open` (743.950012...), an ordinary
+price-continuity coincidence across the minute boundary; (2) `purge_staging_bar` only ever
+purges candidate (`ibkr`) rows, never the whistleblower's, so in the surrounding window `ibkr`
+had staging rows *only* at the two still-pending minutes while `yfinance` had one every minute —
+a sparse-vs-dense series mismatch that likely misaligned whatever plotting script built that PNG
+(outside this repo). Net effect: this specific bar is **not** a sanitization case (no single
+implausible extreme field the way the original 3-bar pattern showed) — flagged here only because
+it's the same investigative thread, and because ruling out "timestamp bug" was itself worth
+recording before this was mistaken for evidence of an ingest-time defect. The DataBento-verified
+outlier pattern from the original 3-bar case remains the actual motivating evidence for this task.
+
 ## Design decisions
 
 - **Disposition: mark the outlier bar `incomplete=True` and keep the row, don't discard at
@@ -43,6 +62,14 @@ backlog noise beyond just these 3 `SPY` bars (not yet quantified against the ful
   in `reconcile/algorithm.py`), which already auto-promotes a candidate when the whistleblower's bar
   is `incomplete` — so a detected bad tick resolves automatically via existing machinery, with zero
   changes needed to comparison/promotion logic or the atomic-field-group model.
+- **Re-opened for discussion (2026-08-05)**: framed with the DV team as "remove the outliers,"
+  which reads as discarding the bad value outright — in tension with the disposition above (keep
+  the row, just flag it). Worth explicitly reconciling before implementation: "remove" could mean
+  (a) literally drop the row at ingest (the option already considered and rejected, for the audit-
+  trail reason above), (b) null out just the offending field while keeping the row/other fields, or
+  (c) plain shorthand for "stop it from blocking reconciliation," i.e. the existing
+  `incomplete=True` disposition already satisfies the actual intent. Carry this ambiguity into the
+  GitHub issue rather than assuming which one was meant.
 
 ## Open questions
 

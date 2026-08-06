@@ -34,6 +34,20 @@ class FieldGroupRow:
 
 
 @dataclass
+class FieldRow:
+    field_id: int
+    name: str
+
+
+@dataclass
+class IngestionCoverageRow:
+    ticker_id: int
+    provider_id: int
+    start_date_id: int
+    end_date_id: int
+
+
+@dataclass
 class StagingRow:
     ticker_id: int
     date_id: int
@@ -51,7 +65,8 @@ class StagingRow:
 @dataclass
 class DisagreementStatsRow:
     provider_id: int
-    field_group_id: int
+    ticker_id: int
+    field_id: int
     sample_count: int
     running_mean: float
     running_m2: float
@@ -334,6 +349,55 @@ class PostgresDatabase:
         self._logger.perf(f"write_staging_bars({normalized_provider_name}, {written} bars)", time.perf_counter() - started)
         return written
 
+    def fetch_dataset_inception_date(self) -> date:
+        """The date the dataset is meant to start from -- --backfill's target. Raises rather than
+        returning None when the table is empty (croicu/quant-data#28's schema-only slice
+        deliberately left it that way): a missing inception_date is a real configuration gap
+        --backfill cannot proceed past, not a value to silently default around."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT inception_date FROM dataset_inception WHERE id = 1")
+                row = cursor.fetchone()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch dataset_inception: {error}") from error
+
+        if row is None:
+            raise AppError(
+                "dataset_inception is empty -- insert the dataset's actual inception_date before running "
+                "--backfill (see migrations/007_add_dim_field_and_dataset_inception.sql)."
+            )
+        return row[0]
+
+    def fetch_earliest_covered_date(self, ticker: str) -> date | None:
+        """MIN(date) for this ticker across staging_market_data_1min and fact_market_data_1min
+        combined -- --backfill's "how far back does this ticker already reach" query. None means
+        the ticker has never been ingested at all (--backfill auto-bootstraps from today in that
+        case; see ingest/cli.py's --backfill branch)."""
+        normalized_ticker = ticker.upper()
+        query = """
+            SELECT MIN(d.date)
+            FROM dim_date d
+            WHERE d.date_id IN (
+                SELECT s.date_id FROM staging_market_data_1min s
+                JOIN dim_ticker t ON t.ticker_id = s.ticker_id
+                WHERE t.ticker = %s
+                UNION
+                SELECT f.date_id FROM fact_market_data_1min f
+                JOIN dim_ticker t ON t.ticker_id = f.ticker_id
+                WHERE t.ticker = %s
+            )
+        """
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(query, (normalized_ticker, normalized_ticker))
+                row = cursor.fetchone()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch earliest covered date for '{normalized_ticker}': {error}") from error
+
+        if row is None or row[0] is None:
+            return None
+        return row[0]
+
     # -- Reconcile-facing reads/writes below. quant-reconcile is the only caller; PostgresDatabase
     # stays the single connection-owning class for every internal purpose (MarketDataProvider
     # reads, ingest's writes, reconcile's reads/writes) rather than introducing a second
@@ -365,20 +429,34 @@ class PostgresDatabase:
             result.append(FieldGroupRow(field_group_id=field_group_id, name=name))
         return result
 
+    def fetch_dim_fields(self) -> list[FieldRow]:
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT field_id, name FROM dim_field")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch dim_field: {error}") from error
+
+        result: list[FieldRow] = []
+        for field_id, name in rows:
+            result.append(FieldRow(field_id=field_id, name=name))
+        return result
+
     def fetch_provider_pair_disagreement(self) -> list[DisagreementStatsRow]:
         try:
             with self._connection.cursor() as cursor:
-                cursor.execute("SELECT provider_id, field_group_id, sample_count, running_mean, running_m2 FROM provider_pair_disagreement")
+                cursor.execute("SELECT provider_id, ticker_id, field_id, sample_count, running_mean, running_m2 FROM provider_pair_disagreement")
                 rows = cursor.fetchall()
         except psycopg.Error as error:
             raise AppError(f"Failed to fetch provider_pair_disagreement: {error}") from error
 
         result: list[DisagreementStatsRow] = []
-        for provider_id, field_group_id, sample_count, running_mean, running_m2 in rows:
+        for provider_id, ticker_id, field_id, sample_count, running_mean, running_m2 in rows:
             result.append(
                 DisagreementStatsRow(
                     provider_id=provider_id,
-                    field_group_id=field_group_id,
+                    ticker_id=ticker_id,
+                    field_id=field_id,
                     sample_count=sample_count,
                     running_mean=float(running_mean),
                     running_m2=float(running_m2),
@@ -386,13 +464,34 @@ class PostgresDatabase:
             )
         return result
 
-    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str]) -> list[StagingRow]:
+    def fetch_ingestion_coverage(self) -> list[IngestionCoverageRow]:
+        """Every contiguous ingested date range for every (ticker, provider) pair
+        (croicu/quant-data#31) -- small, bulk-fetched once per reconcile run (no round trip per
+        bar), used to decide whether a bar's missing whistleblower row means "confirmed absent"
+        (its date range was ingested) or "not ingested yet" (must still wait)."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT ticker_id, provider_id, start_date_id, end_date_id FROM ingestion_coverage")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch ingestion_coverage: {error}") from error
+
+        result: list[IngestionCoverageRow] = []
+        for ticker_id, provider_id, start_date_id, end_date_id in rows:
+            result.append(IngestionCoverageRow(ticker_id=ticker_id, provider_id=provider_id, start_date_id=start_date_id, end_date_id=end_date_id))
+        return result
+
+    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str], required_provider_names: list[str]) -> list[StagingRow]:
         """Every staging_market_data_1min row belonging to a bar where every name in
-        expected_provider_names has a row -- bars missing any expected provider are excluded
-        entirely (tasks/quant-reconcile.md's "wait for every configured provider") -- and where the
-        bar has no fact_pending_manual_resolution row, i.e. it hasn't already exhausted the
-        automatic pass and been handed off to --finalize (tasks/quant_reconcile.md's "Updated
-        (2026-08-03)" section)."""
+        required_provider_names has a row -- eligibility requires only the candidate providers
+        (croicu/quant-data#31: the whistleblower's absence no longer blocks a bar from being
+        fetched at all -- reconcile.cli decides, using ingestion_coverage, whether a missing
+        whistleblower row means "confirmed absent" or "not ingested yet"). expected_provider_names
+        (still the full configured set) controls which providers' rows come back for an eligible
+        bar -- the whistleblower's row is included when it happens to exist. Also excludes any bar
+        with a fact_pending_manual_resolution row, i.e. one that's already exhausted the automatic
+        pass and been handed off to --finalize (tasks/quant_reconcile.md's "Updated (2026-08-03)"
+        section)."""
         started = time.perf_counter()
         try:
             with self._connection.cursor() as cursor:
@@ -407,16 +506,20 @@ class PostgresDatabase:
                           SELECT s2.ticker_id, s2.date_id, s2.time_id
                           FROM staging_market_data_1min s2
                           JOIN dim_provider p2 ON p2.provider_id = s2.provider_id
-                          WHERE p2.name = ANY(%(names)s)
+                          WHERE p2.name = ANY(%(required_names)s)
                           GROUP BY s2.ticker_id, s2.date_id, s2.time_id
-                          HAVING COUNT(DISTINCT s2.provider_id) = %(expected_count)s
+                          HAVING COUNT(DISTINCT s2.provider_id) = %(required_count)s
                       )
                       AND NOT EXISTS (
                           SELECT 1 FROM fact_pending_manual_resolution fpmr
                           WHERE fpmr.ticker_id = s.ticker_id AND fpmr.date_id = s.date_id AND fpmr.time_id = s.time_id
                       )
                     """,
-                    {"names": expected_provider_names, "expected_count": len(expected_provider_names)},
+                    {
+                        "names": expected_provider_names,
+                        "required_names": required_provider_names,
+                        "required_count": len(required_provider_names),
+                    },
                 )
                 rows = cursor.fetchall()
         except psycopg.Error as error:
@@ -638,49 +741,62 @@ class PostgresDatabase:
             raise AppError(f"Failed to promote bar ({ticker_id}, {date_id}, {time_id}) to fact_market_data_1min: {error}") from error
 
     def purge_staging_bar(self, ticker_id: int, date_id: int, time_id: int) -> None:
-        """Deletes a fully-resolved bar's staging rows across every provider. Split out from
-        promote_bar_to_fact so a bar can be promoted immediately while its raw staging data is
-        deliberately kept a little longer if an adjacent bar (t-1/t+1) hasn't resolved yet and
+        """Deletes a fully-resolved bar's staging rows for every candidate provider. Split out
+        from promote_bar_to_fact so a bar can be promoted immediately while its raw staging data
+        is deliberately kept a little longer if an adjacent bar (t-1/t+1) hasn't resolved yet and
         might still need it as a Tier-3 windowed-average neighbor -- purging immediately on
         promotion permanently lost that data for any future run (tasks/quant_reconcile.md's
-        "missing neighbor" gap)."""
+        "missing neighbor" gap).
+
+        Whistleblower-role providers (yfinance today) are permanently exempt -- their rows are
+        never deleted here, unlike candidates' (croicu/quant-data#28). Rationale is irreplaceability,
+        not just audit trail: Yahoo's historical access policy is external and not guaranteed, so
+        whatever's already been fetched may be the only copy that will ever exist. Accepted
+        tradeoff: unbounded storage growth for a provider whose individual bars are never promoted.
+        The orphaned whistleblower row becomes permanently inert for reconcile's purposes once its
+        candidate siblings are gone (fetch_staging_rows_for_reconciliation's expected-provider-count
+        check can never be satisfied again for that bar_key), which needs no compensating logic."""
         try:
             with self._connection.cursor() as cursor:
                 cursor.execute(
-                    "DELETE FROM staging_market_data_1min WHERE ticker_id = %s AND date_id = %s AND time_id = %s",
-                    (ticker_id, date_id, time_id),
+                    """
+                    DELETE FROM staging_market_data_1min
+                    WHERE ticker_id = %s AND date_id = %s AND time_id = %s
+                      AND provider_id NOT IN (SELECT provider_id FROM dim_provider WHERE role = %s)
+                    """,
+                    (ticker_id, date_id, time_id, ProviderRole.WHISTLEBLOWER.value),
                 )
             self._connection.commit()
         except psycopg.Error as error:
             self._connection.rollback()
             raise AppError(f"Failed to purge staging rows for bar ({ticker_id}, {date_id}, {time_id}): {error}") from error
 
-    def save_provider_pair_disagreement(
-        self,
-        provider_id: int,
-        field_group_id: int,
-        sample_count: int,
-        running_mean: float,
-        running_m2: float,
-        stddev: float,
-    ) -> None:
+    def save_provider_pair_disagreement_batch(self, rows: list[tuple[int, int, int, int, float, float, float]]) -> None:
+        """Upserts every (provider_id, ticker_id, field_id, sample_count, running_mean, running_m2,
+        stddev) row in one transaction -- one commit per call regardless of row count, instead of
+        one commit per row. Previously a resolved bar's whole field_group (4 OHLC fields) did 4
+        individual round-trip commits; profiling a full reconcile run found that redundant
+        3-out-of-4 commit overhead was the dominant cost (croicu/quant-data#30)."""
+        if not rows:
+            return
         try:
             with self._connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO provider_pair_disagreement
-                        (provider_id, field_group_id, sample_count, running_mean, running_m2, stddev, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (provider_id, field_group_id) DO UPDATE SET
-                        sample_count = EXCLUDED.sample_count,
-                        running_mean = EXCLUDED.running_mean,
-                        running_m2 = EXCLUDED.running_m2,
-                        stddev = EXCLUDED.stddev,
-                        updated_at = EXCLUDED.updated_at
-                    """,
-                    (provider_id, field_group_id, sample_count, running_mean, running_m2, stddev),
-                )
+                for provider_id, ticker_id, field_id, sample_count, running_mean, running_m2, stddev in rows:
+                    cursor.execute(
+                        """
+                        INSERT INTO provider_pair_disagreement
+                            (provider_id, ticker_id, field_id, sample_count, running_mean, running_m2, stddev, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (provider_id, ticker_id, field_id) DO UPDATE SET
+                            sample_count = EXCLUDED.sample_count,
+                            running_mean = EXCLUDED.running_mean,
+                            running_m2 = EXCLUDED.running_m2,
+                            stddev = EXCLUDED.stddev,
+                            updated_at = EXCLUDED.updated_at
+                        """,
+                        (provider_id, ticker_id, field_id, sample_count, running_mean, running_m2, stddev),
+                    )
             self._connection.commit()
         except psycopg.Error as error:
             self._connection.rollback()
-            raise AppError(f"Failed to save provider_pair_disagreement for provider {provider_id}, group {field_group_id}: {error}") from error
+            raise AppError(f"Failed to save provider_pair_disagreement batch ({len(rows)} row(s)): {error}") from error

@@ -15,6 +15,27 @@ from tests.mocks.yfinance import MockIntraDayProvider
 SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
 
 
+class _RecordingProvider:
+    """Fake IntraDayProvider that records every (ticker, date) it was asked to fetch and always
+    succeeds with no bars -- lets --backfill tests assert exactly which dates were fetched without
+    depending on the yfinance fixture's specific covered dates."""
+
+    def __init__(self) -> None:
+        self.connected = False
+        self.closed = False
+        self.fetch_calls: list[tuple[str, date]] = []
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def fetch_bars(self, ticker: str, target_date: date):
+        self.fetch_calls.append((ticker.upper(), target_date))
+        return []
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _FailingProvider:
     """Fake IntraDayProvider that fails at a chosen lifecycle stage, for testing that one
     provider's failure doesn't sink providers that succeed."""
@@ -75,6 +96,32 @@ def test_main_logs_verbose_start_message_per_chunk(tmp_path, capsys):
 
     captured = capsys.readouterr()
     assert "[VERBOSE][ingest] quant-ingest: starting AAPL on 2026-01-02." in captured.out
+
+
+class _CountingRateLimiter:
+    """Fake RateLimiter that just counts acquire() calls, for asserting it's invoked once per
+    actual fetch_bars call -- not per (ticker, date) pair, not per connect failure."""
+
+    def __init__(self) -> None:
+        self.acquire_calls = 0
+
+    def acquire(self) -> None:
+        self.acquire_calls += 1
+
+
+def test_main_calls_rate_limiter_once_per_fetch_bars_call():
+    database = MockPostgresDatabase()
+    fake_limiter = _CountingRateLimiter()
+
+    cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": MockIntraDayProvider()},
+        database_factory=_use_database(database),
+        rate_limiters={"yfinance": fake_limiter},
+    )
+
+    assert fake_limiter.acquire_calls == 1
 
 
 def test_main_fetches_and_writes_bars_and_returns_zero():
@@ -289,6 +336,119 @@ def test_main_catch_up_excludes_today_and_tolerates_gaps(tmp_path):
 
     assert exit_code == 1
     assert len(database.written_staging_bars) == 3  # 2 bars on 01-02 + 1 bar on 01-05
+
+
+def test_main_exits_two_when_backfill_combined_with_start_date():
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--ticker", "AAPL", "--backfill", "--start-date", "2026-01-02"])
+
+    assert exc_info.value.code == 2
+
+
+def test_main_exits_two_when_backfill_combined_with_catch_up():
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--ticker", "AAPL", "--backfill", "--catch-up"])
+
+    assert exc_info.value.code == 2
+
+
+def test_main_backfill_fetches_one_chunk_walking_backward(tmp_path):
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], backfillChunkDays=3)
+    database = MockPostgresDatabase(
+        inception_date=date(2026, 1, 1),
+        earliest_covered_by_ticker={"AAPL": date(2026, 1, 10)},
+    )
+    provider = _RecordingProvider()
+
+    exit_code = cli.main(
+        ["--backfill"],
+        settings_path=settings_path,
+        providers={"yfinance": provider},
+        database_factory=_use_database(database),
+    )
+
+    assert exit_code == 0
+    assert provider.fetch_calls == [
+        ("AAPL", date(2026, 1, 7)),
+        ("AAPL", date(2026, 1, 8)),
+        ("AAPL", date(2026, 1, 9)),
+    ]
+
+
+def test_main_backfill_is_a_no_op_once_a_ticker_reaches_inception(tmp_path):
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], backfillChunkDays=3)
+    database = MockPostgresDatabase(
+        inception_date=date(2026, 1, 1),
+        earliest_covered_by_ticker={"AAPL": date(2026, 1, 1)},
+    )
+    provider = _RecordingProvider()
+
+    exit_code = cli.main(
+        ["--backfill"],
+        settings_path=settings_path,
+        providers={"yfinance": provider},
+        database_factory=_use_database(database),
+    )
+
+    assert exit_code == 0
+    assert provider.fetch_calls == []
+
+
+def test_main_backfill_bootstraps_from_today_for_a_never_ingested_ticker(tmp_path):
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], backfillChunkDays=2)
+    database = MockPostgresDatabase(inception_date=date(2020, 1, 1), earliest_covered_by_ticker={})
+    provider = _RecordingProvider()
+
+    exit_code = cli.main(
+        ["--backfill"],
+        settings_path=settings_path,
+        providers={"yfinance": provider},
+        database_factory=_use_database(database),
+        today=lambda: date(2026, 1, 10),
+    )
+
+    assert exit_code == 0
+    assert provider.fetch_calls == [
+        ("AAPL", date(2026, 1, 8)),
+        ("AAPL", date(2026, 1, 9)),
+    ]
+
+
+def test_main_backfill_advances_every_ticker_one_chunk_round_robin(tmp_path):
+    settings_path = _custom_settings(tmp_path, tickers=["aapl", "msft"], backfillChunkDays=1)
+    database = MockPostgresDatabase(
+        inception_date=date(2020, 1, 1),
+        earliest_covered_by_ticker={"AAPL": date(2026, 1, 10), "MSFT": date(2026, 2, 1)},
+    )
+    provider = _RecordingProvider()
+
+    exit_code = cli.main(
+        ["--backfill"],
+        settings_path=settings_path,
+        providers={"yfinance": provider},
+        database_factory=_use_database(database),
+    )
+
+    assert exit_code == 0
+    # Each ticker advances exactly one chunk this invocation -- AAPL doesn't get drained toward
+    # inception_date before MSFT is even touched.
+    assert provider.fetch_calls == [("AAPL", date(2026, 1, 9)), ("MSFT", date(2026, 1, 31))]
+
+
+def test_main_backfill_returns_one_when_dataset_inception_is_empty(tmp_path):
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"])
+    database = MockPostgresDatabase(inception_date=None)
+    provider = _RecordingProvider()
+
+    exit_code = cli.main(
+        ["--backfill"],
+        settings_path=settings_path,
+        providers={"yfinance": provider},
+        database_factory=_use_database(database),
+    )
+
+    assert exit_code == 1
+    assert provider.fetch_calls == []
 
 
 def test_main_writes_staging_bars_tagged_with_provider_name():

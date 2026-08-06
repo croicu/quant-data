@@ -13,11 +13,15 @@ from quant_data._internal.shared.postgres import PostgresDatabase, ProviderRow, 
 from quant_data._internal.shared.settings import PostgresSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
 from reconcile.algorithm import (
+    FIELD_GROUP_OHLC,
+    GRADUATION_THRESHOLD_MATCHED_BARS,
     RESOLUTION_AGREEMENT,
     ROLE_CANDIDATE,
     ROLE_WHISTLEBLOWER,
     DisagreementStats,
     ProviderBar,
+    batch_stats,
+    fields_for_group,
     relative_diffs_for_stats_update,
     resolve_automatic,
     resolve_finalize,
@@ -106,6 +110,57 @@ def _find_whistleblower_bar(bars: list[ProviderBar]) -> ProviderBar | None:
         if bar.role == ROLE_WHISTLEBLOWER:
             return bar
     return None
+
+
+def _is_matched_bar(rows: list[StagingRow], expected_provider_count: int) -> bool:
+    """A bar where every currently-configured provider reported real, non-incomplete data --
+    same definition already used for Tier 1/2 eligibility. Used only to gate per-ticker
+    graduation (croicu/quant-data#28); an ungraduated ticker's matched bars still wait for the
+    graduation batch before any Tier 1-4 attempt, so this is deliberately not the same thing as
+    "eligible for completeness". Requires an explicit provider-count check (not just "nothing
+    present is incomplete") since croicu/quant-data#31 relaxed fetch eligibility to admit bars
+    where the whistleblower never reported at all -- rows for those bars only contains the
+    candidate(s), which must not count as "matched" (no real whistleblower value exists to
+    measure disagreement against)."""
+    if len(rows) != expected_provider_count:
+        return False
+    for row in rows:
+        if row.incomplete:
+            return False
+    return True
+
+
+def _synthetic_absent_whistleblower_bar(provider: ProviderRow) -> ProviderBar:
+    """Stands in for a whistleblower that never wrote a staging row at all for this bar, once
+    ingestion_coverage confirms its date range was actually ingested (croicu/quant-data#31).
+    _resolve_completeness already treats an incomplete-flagged bar as "reported but unusable," so
+    this placeholder reuses that exact path with zero changes to algorithm.py -- a confirmed-absent
+    whistleblower behaves identically to one that reported and was flagged incomplete, including
+    the resolution_path ('completeness', not a new label). The dummy field values are never
+    actually compared against: Tier 2/3 measure tolerance using the *candidate's* own reference
+    value, never the whistleblower's, and both tiers fail closed (correctly) if they're ever
+    reached with these placeholder zeros instead of Tier 1 catching it first."""
+    return ProviderBar(
+        provider_id=provider.provider_id,
+        provider_name=provider.name,
+        role=ROLE_WHISTLEBLOWER,
+        open=0.0,
+        high=0.0,
+        low=0.0,
+        close=0.0,
+        volume=0,
+        incomplete=True,
+    )
+
+
+def _is_date_covered(coverage_ranges: dict[tuple[int, int], list[tuple[int, int]]], ticker_id: int, provider_id: int, date_id: int) -> bool:
+    ranges = coverage_ranges.get((ticker_id, provider_id))
+    if ranges is None:
+        return False
+    for start_date_id, end_date_id in ranges:
+        if start_date_id <= date_id <= end_date_id:
+            return True
+    return False
 
 
 def _neighbor_window(
@@ -203,9 +258,22 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
     providers = database.fetch_dim_providers()
     providers_by_id: dict[int, ProviderRow] = {}
     providers_by_name: dict[str, ProviderRow] = {}
+    candidate_provider_names: list[str] = []
+    whistleblower_provider_id: int | None = None
     for provider in providers:
         providers_by_id[provider.provider_id] = provider
         providers_by_name[provider.name] = provider
+        if provider.role == ROLE_CANDIDATE:
+            candidate_provider_names.append(provider.name)
+        elif provider.role == ROLE_WHISTLEBLOWER:
+            whistleblower_provider_id = provider.provider_id
+
+    coverage_ranges: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for coverage_row in database.fetch_ingestion_coverage():
+        coverage_key = (coverage_row.ticker_id, coverage_row.provider_id)
+        if coverage_key not in coverage_ranges:
+            coverage_ranges[coverage_key] = []
+        coverage_ranges[coverage_key].append((coverage_row.start_date_id, coverage_row.end_date_id))
 
     field_groups = database.fetch_dim_field_groups()
     field_group_ids_by_name: dict[str, int] = {}
@@ -213,18 +281,23 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
         field_group_ids_by_name[field_group.name] = field_group.field_group_id
     all_field_group_ids: set[int] = set(field_group_ids_by_name.values())
 
+    fields = database.fetch_dim_fields()
+    field_ids_by_name: dict[str, int] = {}
+    for field in fields:
+        field_ids_by_name[field.name] = field.field_id
+
     preferred_provider = providers_by_name.get(settings.reconcile.preferred_provider)
     preferred_provider_id = preferred_provider.provider_id if preferred_provider is not None else None
 
-    stats_by_key: dict[tuple[int, int], DisagreementStats] = {}
+    stats_by_key: dict[tuple[int, int, int], DisagreementStats] = {}
     for row in database.fetch_provider_pair_disagreement():
-        stats_by_key[(row.provider_id, row.field_group_id)] = DisagreementStats(
+        stats_by_key[(row.provider_id, row.ticker_id, row.field_id)] = DisagreementStats(
             sample_count=row.sample_count,
             running_mean=row.running_mean,
             running_m2=row.running_m2,
         )
 
-    staging_rows = database.fetch_staging_rows_for_reconciliation(settings.providers)
+    staging_rows = database.fetch_staging_rows_for_reconciliation(settings.providers, candidate_provider_names)
 
     bars: dict[tuple[int, int, int], list[StagingRow]] = {}
     rows_by_provider_ticker_timestamp: dict[tuple[int, int, object], StagingRow] = {}
@@ -237,23 +310,135 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
         rows_by_provider_ticker_timestamp[(row.ticker_id, row.provider_id, row.timestamp)] = row
         bar_key_by_ticker_timestamp[(row.ticker_id, row.timestamp)] = bar_key
 
+    # croicu/quant-data#31: fetch_staging_rows_for_reconciliation now admits bar_keys where the
+    # whistleblower never reported at all (only candidates are required). Such a bar_key is only
+    # genuinely ready for evaluation if ingestion_coverage confirms the whistleblower's absence is
+    # a real "nothing here," not "not ingested yet" -- otherwise it must be treated exactly like a
+    # bar missing any other required provider: not evaluated, not marked pending, left alone for a
+    # future run to pick up once coverage resolves the ambiguity. Filtering here (rather than only
+    # deciding whether to synthesize a placeholder later) keeps every downstream step -- graduation
+    # counting, the fixed-point loop, pending-marking -- automatically correct with no special-casing.
+    if whistleblower_provider_id is not None:
+        unready_bar_keys: list[tuple[int, int, int]] = []
+        for bar_key, rows in bars.items():
+            whistleblower_present = False
+            for row in rows:
+                if row.provider_id == whistleblower_provider_id:
+                    whistleblower_present = True
+                    break
+            if whistleblower_present:
+                continue
+            unready_ticker_id, unready_date_id, _unready_time_id = bar_key
+            if not _is_date_covered(coverage_ranges, unready_ticker_id, whistleblower_provider_id, unready_date_id):
+                unready_bar_keys.append(bar_key)
+        for bar_key in unready_bar_keys:
+            del bars[bar_key]
+
+    # Per-ticker graduation gate (croicu/quant-data#28): a ticker with no provider_pair_disagreement
+    # rows yet is "ungraduated" -- its bars sit in staging completely unevaluated (no Tier 1-4
+    # attempt, no partial stats update) until it accumulates GRADUATION_THRESHOLD_MATCHED_BARS
+    # matched bars, at which point its tolerance is computed once from that full batch and the
+    # ticker's entire currently-fetched backlog (matched and unmatched together, so Tier 1
+    # completeness -- which only ever fires on unmatched bars -- isn't stranded) is evaluated
+    # through the standard Tier 1-4 stack below. "Graduated" is derived, not stored separately:
+    # those rows are created only here or by a later Tier-2 update, never before.
+    graduated_ticker_ids: set[int] = set()
+    for stats_provider_id, stats_ticker_id, stats_field_id in stats_by_key:
+        graduated_ticker_ids.add(stats_ticker_id)
+
+    bar_keys_by_ticker: dict[int, list[tuple[int, int, int]]] = {}
+    for bar_key in bars:
+        ticker_id = bar_key[0]
+        if ticker_id not in bar_keys_by_ticker:
+            bar_keys_by_ticker[ticker_id] = []
+        bar_keys_by_ticker[ticker_id].append(bar_key)
+
+    for ticker_id, ticker_bar_keys in bar_keys_by_ticker.items():
+        if ticker_id in graduated_ticker_ids:
+            continue
+
+        matched_bar_keys: list[tuple[int, int, int]] = []
+        for bar_key in ticker_bar_keys:
+            if _is_matched_bar(bars[bar_key], len(settings.providers)):
+                matched_bar_keys.append(bar_key)
+
+        if len(matched_bar_keys) < GRADUATION_THRESHOLD_MATCHED_BARS:
+            continue
+
+        diffs_by_candidate_field: dict[tuple[int, str], list[float]] = {}
+        for bar_key in matched_bar_keys:
+            matched_provider_bars: list[ProviderBar] = []
+            for row in bars[bar_key]:
+                matched_provider_bars.append(_to_provider_bar(row, providers_by_id[row.provider_id]))
+            matched_whistleblower_bar = _find_whistleblower_bar(matched_provider_bars)
+            if matched_whistleblower_bar is None:
+                continue
+            for matched_candidate_bar in matched_provider_bars:
+                if matched_candidate_bar.role != ROLE_CANDIDATE:
+                    continue
+                diffs = relative_diffs_for_stats_update(matched_candidate_bar, matched_whistleblower_bar, FIELD_GROUP_OHLC)
+                for field_name, diff in zip(fields_for_group(FIELD_GROUP_OHLC), diffs):
+                    diff_key = (matched_candidate_bar.provider_id, field_name)
+                    if diff_key not in diffs_by_candidate_field:
+                        diffs_by_candidate_field[diff_key] = []
+                    diffs_by_candidate_field[diff_key].append(diff)
+
+        graduation_rows: list[tuple[int, int, int, int, float, float, float]] = []
+        for (candidate_provider_id, field_name), diffs in diffs_by_candidate_field.items():
+            graduation_stats = batch_stats(diffs)
+            field_id = field_ids_by_name[field_name]
+            stats_by_key[(candidate_provider_id, ticker_id, field_id)] = graduation_stats
+            graduation_rows.append(
+                (
+                    candidate_provider_id,
+                    ticker_id,
+                    field_id,
+                    graduation_stats.sample_count,
+                    graduation_stats.running_mean,
+                    graduation_stats.running_m2,
+                    stddev_from_stats(graduation_stats),
+                )
+            )
+        database.save_provider_pair_disagreement_batch(graduation_rows)
+
+        graduated_ticker_ids.add(ticker_id)
+        Logger.info(f"quant-reconcile: ticker {ticker_id} graduated at {len(matched_bar_keys)} matched bars.", category=CATEGORY_RECONCILE)
+
+    eligible_bars: dict[tuple[int, int, int], list[StagingRow]] = {}
+    for bar_key, rows in bars.items():
+        if bar_key[0] in graduated_ticker_ids:
+            eligible_bars[bar_key] = rows
+
     resolved_by_bar: dict[tuple[int, int, int], dict[int, int]] = {}
     for (ticker_id, date_id, time_id, field_group_id), winning_provider_id in database.fetch_resolved_field_groups().items():
         bar_key = (ticker_id, date_id, time_id)
         if bar_key not in resolved_by_bar:
             resolved_by_bar[bar_key] = {}
         resolved_by_bar[bar_key][field_group_id] = winning_provider_id
-    for bar_key in bars:
+    for bar_key in eligible_bars:
         if bar_key not in resolved_by_bar:
             resolved_by_bar[bar_key] = {}
 
     provider_bars_by_bar_key: dict[tuple[int, int, int], list[ProviderBar]] = {}
     windows_by_bar_key: dict[tuple[int, int, int], dict[int, list[ProviderBar | None]]] = {}
-    for bar_key, rows in bars.items():
+    for bar_key, rows in eligible_bars.items():
         ticker_id, _date_id, _time_id = bar_key
         provider_bars: list[ProviderBar] = []
+        whistleblower_present = False
         for row in rows:
-            provider_bars.append(_to_provider_bar(row, providers_by_id[row.provider_id]))
+            provider_bar = _to_provider_bar(row, providers_by_id[row.provider_id])
+            provider_bars.append(provider_bar)
+            if provider_bar.role == ROLE_WHISTLEBLOWER:
+                whistleblower_present = True
+
+        # croicu/quant-data#31: the whistleblower never wrote a row for this bar at all. The
+        # earlier filtering step already guarantees this only happens when ingestion_coverage
+        # confirms that date was actually scanned (an uncovered candidate-only bar_key never makes
+        # it into `bars` in the first place) -- synthesize a placeholder so Tier 1 completeness
+        # treats "confirmed absent" the same as "reported but incomplete."
+        if not whistleblower_present and whistleblower_provider_id is not None:
+            provider_bars.append(_synthetic_absent_whistleblower_bar(providers_by_id[whistleblower_provider_id]))
+
         provider_bars_by_bar_key[bar_key] = provider_bars
 
         windows: dict[int, list[ProviderBar | None]] = {}
@@ -273,7 +458,7 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
     # longer change and further passes would be identical.
     while True:
         pass_resolved = 0
-        for bar_key, rows in bars.items():
+        for bar_key, rows in eligible_bars.items():
             ticker_id, date_id, time_id = bar_key
             current_bar_resolutions = resolved_by_bar[bar_key]
             provider_bars = provider_bars_by_bar_key[bar_key]
@@ -282,14 +467,19 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
                 if field_group_id in current_bar_resolutions:
                     continue
 
-                tolerances: dict[int, float] = {}
+                tolerances: dict[int, dict[str, float]] = {}
                 for row in rows:
                     provider = providers_by_id[row.provider_id]
                     if provider.role != ROLE_CANDIDATE:
                         continue
-                    stats = stats_by_key.get((provider.provider_id, field_group_id))
-                    if stats is not None:
-                        tolerances[provider.provider_id] = stddev_from_stats(stats)
+                    field_tolerances: dict[str, float] = {}
+                    for field_name in fields_for_group(field_group_name):
+                        field_id = field_ids_by_name[field_name]
+                        stats = stats_by_key.get((provider.provider_id, ticker_id, field_id))
+                        if stats is not None:
+                            field_tolerances[field_name] = stddev_from_stats(stats)
+                    if field_tolerances:
+                        tolerances[provider.provider_id] = field_tolerances
 
                 resolution = resolve_automatic(
                     provider_bars, field_group_name, windows_by_bar_key[bar_key], tolerances, settings.reconcile.k, preferred_provider_id
@@ -318,27 +508,36 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
                     winner_bar = _find_by_provider_id(provider_bars, resolution.winning_provider_id)
                     whistleblower_bar = _find_whistleblower_bar(provider_bars)
                     if winner_bar is not None and whistleblower_bar is not None:
-                        stats = stats_by_key.get((resolution.winning_provider_id, field_group_id))
-                        if stats is None:
-                            stats = DisagreementStats(sample_count=0, running_mean=0.0, running_m2=0.0)
-                        for diff in relative_diffs_for_stats_update(winner_bar, whistleblower_bar, field_group_name):
+                        diffs = relative_diffs_for_stats_update(winner_bar, whistleblower_bar, field_group_name)
+                        field_names = fields_for_group(field_group_name)
+                        disagreement_rows: list[tuple[int, int, int, int, float, float, float]] = []
+                        for field_name, diff in zip(field_names, diffs):
+                            field_id = field_ids_by_name[field_name]
+                            key = (resolution.winning_provider_id, ticker_id, field_id)
+                            stats = stats_by_key.get(key)
+                            if stats is None:
+                                stats = DisagreementStats(sample_count=0, running_mean=0.0, running_m2=0.0)
                             stats = welford_update(stats, diff)
-                        stats_by_key[(resolution.winning_provider_id, field_group_id)] = stats
-                        database.save_provider_pair_disagreement(
-                            resolution.winning_provider_id,
-                            field_group_id,
-                            stats.sample_count,
-                            stats.running_mean,
-                            stats.running_m2,
-                            stddev_from_stats(stats),
-                        )
+                            stats_by_key[key] = stats
+                            disagreement_rows.append(
+                                (
+                                    resolution.winning_provider_id,
+                                    ticker_id,
+                                    field_id,
+                                    stats.sample_count,
+                                    stats.running_mean,
+                                    stats.running_m2,
+                                    stddev_from_stats(stats),
+                                )
+                            )
+                        database.save_provider_pair_disagreement_batch(disagreement_rows)
 
         total_resolved += pass_resolved
         if pass_resolved == 0:
             break
 
     newly_pending = 0
-    for bar_key in bars:
+    for bar_key in eligible_bars:
         ticker_id, date_id, time_id = bar_key
         current_bar_resolutions = resolved_by_bar[bar_key]
         for field_group_id in all_field_group_ids:
@@ -347,7 +546,7 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
             database.mark_pending_manual_resolution(ticker_id, date_id, time_id, field_group_id)
             newly_pending += 1
 
-    _promote_and_lazily_purge(database, bars, resolved_by_bar, bar_key_by_ticker_timestamp, all_field_group_ids, field_group_ids_by_name["ohlc"])
+    _promote_and_lazily_purge(database, eligible_bars, resolved_by_bar, bar_key_by_ticker_timestamp, all_field_group_ids, field_group_ids_by_name["ohlc"])
 
     return total_resolved, newly_pending
 

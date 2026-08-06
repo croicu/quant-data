@@ -23,6 +23,10 @@ IBKR = 1
 YFINANCE = 2
 
 
+def _uniform_tolerance(stddev: float) -> dict[str, float]:
+    return {"open": stddev, "high": stddev, "low": stddev, "close": stddev}
+
+
 def _bar(
     provider_id: int,
     role: str,
@@ -52,7 +56,7 @@ def test_completeness_promotes_candidate_when_whistleblower_incomplete():
         _bar(YFINANCE, ROLE_WHISTLEBLOWER, incomplete=True),
     ]
 
-    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: 0.001}, k=3.0, preferred_provider_id=None)
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: _uniform_tolerance(0.001)}, k=3.0, preferred_provider_id=None)
 
     assert resolution is not None
     assert resolution.winning_provider_id == IBKR
@@ -68,7 +72,7 @@ def test_completeness_does_not_resolve_when_candidate_incomplete():
         _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
     ]
 
-    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: 0.001}, k=3.0, preferred_provider_id=None)
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: _uniform_tolerance(0.001)}, k=3.0, preferred_provider_id=None)
 
     assert resolution is None
 
@@ -79,7 +83,7 @@ def test_agreement_promotes_candidate_within_tolerance():
         _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.01, high=101.01, low=99.01, close=100.51),
     ]
 
-    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: 0.01}, k=3.0, preferred_provider_id=None)
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: _uniform_tolerance(0.01)}, k=3.0, preferred_provider_id=None)
 
     assert resolution is not None
     assert resolution.winning_provider_id == IBKR
@@ -92,7 +96,52 @@ def test_agreement_fails_outside_tolerance_and_falls_through():
         _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=110.0, high=111.0, low=109.0, close=110.5),
     ]
 
-    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: 0.0001}, k=3.0, preferred_provider_id=None)
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: _uniform_tolerance(0.0001)}, k=3.0, preferred_provider_id=None)
+
+    assert resolution is None
+
+
+def test_agreement_fails_when_only_one_field_exceeds_its_own_tolerance():
+    # open/low/close are all within a tight learned tolerance; high alone is well outside its own
+    # (also tight) tolerance -- must fail Tier 2 entirely, since OHLC stays one atomic promotion
+    # unit even though the comparison itself is now per-field (croicu/quant-data#28).
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=105.0, low=99.0, close=100.5),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: _uniform_tolerance(0.001)}, k=3.0, preferred_provider_id=None)
+
+    assert resolution is None
+
+
+def test_agreement_checks_each_field_against_its_own_learned_tolerance():
+    # high/low have a wide learned tolerance (noisy field), open/close have a tight one (stable
+    # field) -- the candidate's high/low diverge more than open/close would tolerate, but agrees
+    # because each field is checked against its own band, not a pooled group-wide one.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=102.0, low=98.0, close=100.5),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    tolerances = {IBKR: {"open": 0.0001, "high": 0.02, "low": 0.02, "close": 0.0001}}
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances=tolerances, k=3.0, preferred_provider_id=None)
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == IBKR
+    assert resolution.resolution_path == RESOLUTION_AGREEMENT
+
+
+def test_agreement_fails_when_a_field_has_no_learned_tolerance_yet():
+    # Only open/high/low have stats so far; close is missing -- must fail closed (no data means
+    # no agreement), not silently skip the ungrounded field.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    tolerances = {IBKR: {"open": 0.01, "high": 0.01, "low": 0.01}}
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances=tolerances, k=3.0, preferred_provider_id=None)
 
     assert resolution is None
 
@@ -116,7 +165,7 @@ def test_boundary_fix_promotes_candidates_raw_value_when_windowed_averages_agree
     ]
     windows = {IBKR: candidate_window, YFINANCE: whistleblower_window}
 
-    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows=windows, tolerances={IBKR: 0.01}, k=3.0, preferred_provider_id=None)
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows=windows, tolerances={IBKR: _uniform_tolerance(0.01)}, k=3.0, preferred_provider_id=None)
 
     assert resolution is not None
     assert resolution.winning_provider_id == IBKR
@@ -139,7 +188,7 @@ def test_boundary_fix_does_not_apply_when_a_neighbor_bar_is_missing():
         ],
     }
 
-    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows=windows, tolerances={IBKR: 0.01}, k=3.0, preferred_provider_id=None)
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows=windows, tolerances={IBKR: _uniform_tolerance(0.01)}, k=3.0, preferred_provider_id=None)
 
     assert resolution is None
 
@@ -168,7 +217,7 @@ def test_agreement_tie_breaks_via_preferred_provider():
         bars,
         FIELD_GROUP_OHLC,
         windows={},
-        tolerances={IBKR: 0.01, other_candidate_id: 0.01},
+        tolerances={IBKR: _uniform_tolerance(0.01), other_candidate_id: _uniform_tolerance(0.01)},
         k=3.0,
         preferred_provider_id=other_candidate_id,
     )

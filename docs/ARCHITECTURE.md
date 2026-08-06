@@ -176,7 +176,7 @@ independent top-level packages.
   read/write methods (`fetch_dim_providers`, `fetch_dim_field_groups`,
   `fetch_provider_pair_disagreement`, `fetch_staging_rows_for_reconciliation`,
   `fetch_resolved_field_groups`, `record_reconciliation`, `promote_bar_to_fact`,
-  `save_provider_pair_disagreement`, `fetch_pending_manual_resolution_staging_rows`,
+  `save_provider_pair_disagreement_batch`, `fetch_pending_manual_resolution_staging_rows`,
   `fetch_pending_manual_resolution_keys`, `mark_pending_manual_resolution`,
   `clear_pending_manual_resolution` — used only by `reconcile`). None of this is part of the
   `MarketDataProvider` Protocol itself — see "Contracts" below on why that's ergonomics, not the
@@ -288,7 +288,7 @@ independent top-level packages.
 
 ### `ingest`
 
-`cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER]`:
+`cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up | --backfill] [--ticker TICKER]`:
 fetches bars over an inclusive date range from every provider named in `settings.providers`
 (default `["yfinance"]`; `IntraDayProvider` instances built by `_build_provider`/
 `_default_providers`, or injected directly via `main`'s `providers: dict[str, IntraDayProvider]`
@@ -343,6 +343,38 @@ this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests
   providers" question). `_build_provider` raises `AppError` for any name that isn't `"yfinance"` or
   `"ibkr"`. `settings.ibkr` (`IbkrSettings`: `host`/`port`/`client_id`, all defaulting to
   `IBKRIntraDay`'s own module-level defaults) is only consulted when `"ibkr"` is configured.
+- **`--backfill`** — a fourth, mutually-exclusive way to pick dates (croicu/quant-data#28), for
+  extending existing coverage backward toward `dataset_inception.inception_date` rather than
+  fetching a caller-specified range. Per invocation, for each configured ticker: fetch that
+  ticker's current earliest covered date (`PostgresDatabase.fetch_earliest_covered_date`, `MIN`
+  over `staging_market_data_1min` ∪ `fact_market_data_1min`; `None` for a never-ingested ticker),
+  then walk backward one `settings.backfillChunkDays`-sized chunk (default `1`) —
+  `end_date = reference_date - 1 day`, `start_date = max(inception_date, end_date - chunkDays +
+  1)`, where `reference_date` is the earliest covered date, or `today` if the ticker has never
+  been ingested at all (auto-bootstrapping its first chunk from the same "excludes today"
+  convention `--catch-up` already uses, via the same injectable `today` callable). A ticker
+  already at `inception_date` is a no-op, symmetric to `--catch-up`'s no-op-on-complete-days
+  behavior. **Round-robin, not sequential-to-completion**: every configured ticker advances
+  exactly one chunk per invocation (never drained to `inception_date` before the next ticker is
+  touched), since `earliest_covered` is recomputed fresh each run — coverage depth grows evenly
+  across the whole configured universe, tolerating being interrupted or resource-capped at any
+  point. No new progress-tracking table — everything above is derived from existing data, same
+  idempotent-upsert guarantee `--catch-up` already relies on. `PostgresDatabase.fetch_dataset_inception_date`
+  raises `AppError` if `dataset_inception` has no row — that table is schema-only as of migration
+  `007`, so `--backfill` cannot run until a real `inception_date` value is inserted by hand.
+- **Internal rate limiting** — `ingest.rate_limiter.RateLimiter` (sliding window: at most
+  `requests_per_window` calls per rolling `window_seconds`, `collections.deque` of recent call
+  timestamps, constructor-injected `clock`/`sleep` per this repo's DI-over-monkeypatching
+  convention) sits between `_ingest_one`'s per-provider loop and `IntraDayProvider.fetch_bars` —
+  not inside any provider implementation, since pacing is a property of reaching a specific
+  external service. Config shape: `settings.<provider>.rateLimit: {requestsPerWindow,
+  windowSeconds}`; a provider with no configured limit gets no `RateLimiter` entry at all
+  (`_default_rate_limiters`) and is never throttled. `IbkrSettings.rate_limit` defaults to `50`
+  requests / `600` seconds even when `settings.ibkr.rateLimit` is entirely absent from
+  `settings.json` — deliberately under IBKR's documented `60`/`600` ceiling for margin, and
+  deliberately *not* "unspecified means unlimited" like every other provider, since IBKR has a
+  known real ceiling that should always apply. `YfinanceSettings.rate_limit` defaults to `None`
+  (unlimited), matching yfinance's current unbounded behavior.
 
 ### `reconcile`
 
@@ -361,24 +393,76 @@ the full design (field consistency groups, the candidate/whistleblower model, th
   reconciliation concept (rule 8's acyclic dependency graph).
   - `resolve_automatic(bars, field_group, windows, tolerances, k, preferred_provider_id)` — Tiers
     1-3 (completeness / agreement / boundary-fix), first one that resolves a group wins. Returns
-    `None` if still stuck (Tier 4) — left in staging for a person to look at.
+    `None` if still stuck (Tier 4) — left in staging for a person to look at. `tolerances` is
+    `dict[int, dict[str, float]]` (`provider_id -> field_name -> stddev`) since
+    croicu/quant-data#28 — every field in the group (`open`/`high`/`low`/`close`) is checked
+    independently against its own learned tolerance (`_agrees_within_tolerance`/`_windowed_agrees`),
+    not "max diff across the group within one pooled tolerance" as before. A candidate missing
+    tolerance data for even one field fails Tier 2/3 entirely for that field group (fails closed,
+    not silently skipped) — OHLC still stays one atomic *promotion* unit; only the comparison is
+    now per-field. `fields_for_group(field_group)` (public — `cli.py` needs it directly for the
+    stats fan-out below and for the graduation batch) is the one place the group→fields mapping
+    lives.
   - `resolve_finalize(bars, preferred_provider_id)` — `--finalize`'s fallback: promotes
     `preferredProvider`'s raw value outright, no tolerance check.
   - `welford_update`/`stddev_from_stats`/`relative_diffs_for_stats_update` — the running-variance
-    machinery behind `provider_pair_disagreement`'s tolerance; population variance (`M2 / n`),
-    matching `004_add_reconciliation_tables`'s seed-value convention. Only called for
-    `RESOLUTION_AGREEMENT` resolutions (see "Design decisions" in the task file for why).
+    machinery behind `provider_pair_disagreement`'s tolerance; population variance (`M2 / n`).
+    Only called for `RESOLUTION_AGREEMENT` resolutions (see "Design decisions" in the task file for
+    why) — `cli.py` fans `relative_diffs_for_stats_update`'s one-diff-per-field result out into 4
+    independent per-`(provider_id, ticker_id, field_id)` Welford buckets instead of one shared
+    per-group bucket, matching `provider_pair_disagreement`'s migration-`007` key. `batch_stats`
+    (new) folds `welford_update` over a whole list of observations in one call — used only by the
+    graduation batch below, mathematically identical to the same observations arriving one at a
+    time (order-independent).
+  - `GRADUATION_THRESHOLD_MATCHED_BARS` (`1400`) — see the per-ticker graduation bullet below.
 - **`cli.py`'s `run_reconciliation(database, settings, finalize)`** dispatches to one of two
   functions — they no longer share one code path, since a plain run and `--finalize` now operate
   on disjoint fetch scopes:
   - **`_run_automatic_pass`** (plain, `finalize=False`) — fetches every dimension/stats table plus
-    every staging row belonging to a bar where every provider in `settings.providers` has reported
-    *and* the bar has no `fact_pending_manual_resolution` row (bars missing an expected provider,
-    or already flagged pending, are skipped entirely, untouched), groups rows by bar, and for each
+    every staging row belonging to a bar where every **candidate** provider in `settings.providers`
+    has reported *and* the bar has no `fact_pending_manual_resolution` row (bars missing an
+    expected candidate, or already flagged pending, are skipped entirely, untouched) — since
+    croicu/quant-data#31, the whistleblower is no longer required at fetch time (see the
+    whistleblower-absence bullet below for what happens next), groups rows by bar, and for each
     not-yet-resolved `(bar, field_group)` calls `resolve_automatic` only — no `resolve_finalize`
     fallback in this path anymore. Whatever's still unresolved once the fixed-point loop below
     converges gets a `fact_pending_manual_resolution` row inserted (a new write; previously nothing
     was recorded for a stuck bar at all) so every future plain run skips it.
+  - **Whistleblower-absence handling** (croicu/quant-data#31) — a candidate-only bar_key (the
+    whistleblower never wrote a row for that minute at all) is only genuinely ready for evaluation
+    once `ingestion_coverage` confirms the whistleblower's date range was actually ingested; if not
+    covered yet, that bar_key is filtered back out of `bars` immediately after fetch, before
+    graduation counting or the fixed-point loop ever see it — behaving exactly like a bar missing
+    any other required provider (not evaluated, and critically **not** marked pending, since "not
+    ingested yet" isn't evidence of anything). For a covered-but-absent bar_key, a placeholder
+    `ProviderBar` (`incomplete=True`, dummy zero field values, `role=WHISTLEBLOWER`) is synthesized
+    when building `provider_bars` for that bar — `_resolve_completeness` already treats an
+    incomplete-flagged bar as "reported but unusable," so this reuses that exact path with **zero
+    changes to `algorithm.py`**: a confirmed-absent whistleblower behaves identically to one that
+    reported and was flagged incomplete, including the resolution_path (`'completeness'`, not a new
+    label). The dummy values are never actually compared against — Tier 2/3 measure tolerance using
+    the *candidate's* own reference value, never the whistleblower's, and both fail closed
+    (correctly) if ever reached with placeholder zeros instead of Tier 1 catching it first. Live
+    motivating case: 6,939 of 7,192 `ibkr` rows stuck in staging on CroicuWS1 were exactly this —
+    `yfinance`'s day was successfully ingested but had no row for that specific minute.
+  - **Per-ticker graduation gate** (croicu/quant-data#28) — before any Tier 1-4 attempt, a ticker
+    must have accumulated `GRADUATION_THRESHOLD_MATCHED_BARS` (`1400`) *matched* bars (every
+    configured provider reported real, non-incomplete data for that minute — same definition
+    already used for Tier 1/2 eligibility). "Graduated" is derived, not stored separately: a ticker
+    is graduated iff `provider_pair_disagreement` already has at least one row for it, since those
+    rows are created only by the one-time graduation batch or by a later Tier-2 update, never
+    before. Below the threshold, a ticker's bars sit in staging completely unevaluated (no partial
+    stats update either — nothing to protect a partial estimate from outlier contamination, since
+    nothing is computed until the full batch is in). At the threshold, `relative_diffs_for_stats_update`
+    is called unconditionally (the one deliberate exception to "only Tier 2 observations update
+    stats" — there's no tolerance yet to gate on) over every matched bar, `batch_stats` computes
+    each field's mean/stddev in one pass, and the ticker's *entire currently-fetched staging
+    backlog* (matched and unmatched together, not just the graduation batch) is evaluated through
+    the standard Tier 1-4 stack in the very same run — required so Tier 1 completeness (which only
+    ever fires on unmatched bars) isn't stranded at exactly the moment a tolerance becomes
+    available. `_run_finalize_pass` needs no equivalent logic: an ungraduated ticker's bars are
+    never Tier-1-4-attempted, so they never reach `fact_pending_manual_resolution` in the first
+    place.
   - **`_run_finalize_pass`** (`--finalize`) — fetches only staging rows for bars that already have
     a `fact_pending_manual_resolution` row, and only the specific `(bar, field_group)` keys that
     are actually pending (`fetch_pending_manual_resolution_keys`). Calls `resolve_finalize`
@@ -425,7 +509,17 @@ the full design (field consistency groups, the candidate/whistleblower model, th
   Tier-3 windowed-average check on its still-stuck neighbor — a real gap found during the
   2026-08-03 live test (`tasks/quant_reconcile.md`). A neighbor that's absent (never existed, or
   already purged) or already fully resolved will never call the windowed check again, so it doesn't
-  block purging.
+  block purging. **Whistleblower-role providers' rows (`yfinance` today) are permanently exempt**
+  (croicu/quant-data#28) — `purge_staging_bar` now excludes `dim_provider.role = 'whistleblower'`
+  rows from the delete entirely, reusing the same `role` mechanism that distinguishes candidates
+  from the whistleblower everywhere else, not a hardcoded provider name. Rationale is
+  irreplaceability, not just audit trail: Yahoo's historical access policy is external and not
+  guaranteed, so whatever's already been fetched may be the only copy that will ever exist.
+  Accepted tradeoff: unbounded storage growth for a provider whose individual bars are never
+  promoted. Once a bar's candidate rows are gone, its orphaned whistleblower row becomes
+  permanently inert for reconcile's purposes — `fetch_staging_rows_for_reconciliation`'s
+  every-configured-provider-reported check can never be satisfied again for that bar_key, so it
+  never resurfaces, needing no compensating logic.
 - `settings.reconcile.preferredProvider` (default `"ibkr"`) and `settings.reconcile.k` (default
   `3.0`, must be positive) are the only two tunables — see `ReconcileSettings` above.
 

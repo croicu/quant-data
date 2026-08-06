@@ -340,15 +340,35 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   reputation tracking with no changes needed there.
 
 - **File**: [Yahoo data sanitization](tasks/yahoo_data_sanitization.md)
-- **Status**: Brainstorm, disposition converged (mark outlier bars `incomplete=True` and keep the
-  row, reusing Tier 1/`_resolve_completeness` rather than discarding at ingest or building a new
-  tier), outlier-detection rule still open.
+- **Status**: Brainstorm — disposition (mark outlier bars `incomplete=True` and keep the row,
+  reusing Tier 1/`_resolve_completeness` rather than discarding at ingest or building a new tier)
+  **re-opened for discussion 2026-08-05**: the DV team framing of this as "remove the outliers"
+  is in tension with "keep the row, just flag it" — needs explicit reconciling before filing the
+  GitHub issue. Outlier-detection rule also still open.
 - **Key Context**: spawned from the same `SPY` investigation above. `yfinance`'s raw feed shows
   sporadic single-field spikes (confirmed via 3-day candlestick comparison against `ibkr`'s smooth
   curve) that drag an otherwise-agreeing bar's whole `field_group` comparison outside tolerance
   (`_max_field_diff` takes the max across all 4 OHLC fields), producing false "stuck" bars needing
   manual review even though `ibkr`'s own value was fine. Not yet quantified how much of the 622-bar
-  backlog (`DOG` especially) this same pattern explains.
+  backlog (`DOG` especially) this same pattern explains. A second, independent occurrence
+  (`SPY` 2026-07-27 09:50/09:51 ET) was investigated 2026-08-05 and ruled out as a timestamp bug
+  (verified directly against `staging_market_data_1min` — `date_id`/`time_id`/`timestamp` all
+  consistent); the apparent "shift" in `tasks/Conflict - 2026-07-27.png` was price-continuity
+  coincidence plus `purge_staging_bar`'s candidate-only purge sparsifying `ibkr`'s staging rows,
+  not an ingest defect. That specific bar isn't itself a sanitization case (no single implausible
+  extreme field).
+
+- **File**: [DataBento stuck-bar verification](tasks/databento_stuck_bar_verification.md)
+- **Status**: Brainstorm, not converged — several open questions (auto-tiebreaker vs.
+  assistive-only, cost/budget, API access model, where a DataBento value would even live given
+  `dim_provider.role`'s closed `candidate`/`whistleblower` `CHECK`) need resolving before
+  implementation.
+- **Key Context**: DV team proposal (2026-08-05) to make DataBento cross-checking of stuck bars
+  an optional `quant-reconcile` flag, scoped only to the pending queue. Revisits
+  `tasks/finalize_targeted_promotion.md`'s earlier explicit decision **not** to adopt DataBento as
+  an ongoing/routine reference (paid source, one-off sanity check only) — narrower in scope
+  (opt-in, stuck-bars-only) so may not actually conflict, but the tension needs to be resolved on
+  purpose in the GitHub issue, not assumed away.
 
 ## Pending Tasks
 

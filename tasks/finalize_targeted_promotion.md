@@ -44,6 +44,30 @@ residual gap, not chased further. **Decision: not adopting DataBento as an ongoi
 reference** — it's a paid data source (even though this one pull was inexpensive), and this was a
 one-off sanity check for this specific investigation, not a new candidate provider.
 
+## New pending-bar review candidates (2026-08-05)
+
+Reviewing the 127-bar backlog left after croicu/quant-data#28/#29/#31's live verification
+(6,939 bars separately unblocked by #31's whistleblower-absence fix are not part of this list —
+those resolved automatically, not stuck). Logging candidates for DataBento cross-check here as
+they're found, rather than re-investigating from scratch later:
+
+- **`SPY`, 2026-07-27, 09:50/09:51 ET (13:50/13:51 UTC)** — `close` at 09:50 differs `ibkr`
+  743.95 vs. `yfinance` 743.919982910156 (~3¢); `open` at 09:51 differs `ibkr` 743.91 vs.
+  `yfinance` 743.950012207031 (~4¢). All other fields at both minutes agree to a fraction of a
+  cent. Correctly failed Tier 2: SPY's own learned tolerance for `open`/`close` is unusually tight
+  (sub-cent, `provider_pair_disagreement` stddev ~3.5e-6/~5.9e-6 relative), so a 3–4¢ gap is a real
+  outlier relative to SPY's normal cross-provider precision, not just visually-small noise. Not
+  boundary-fix-resolved either, since the two adjacent minutes each have their own (different-field)
+  discrepancy, so the 3-bar windowed average doesn't smooth it away. **Ask-DataBento case** — same
+  treatment as the original 3-bar `SPY` investigation above, not yet pulled.
+- **`SPY`, 2026-07-28, 09:30 ET (13:30 UTC — market open)** — `ibkr` O=739.21 H=739.49 L=738.83
+  C=738.83 vs. `yfinance` O=739.190002441406 H=739.47998046875 L=738.830017089844 C=738.830017089844.
+  `low`/`close` agree to a fraction of a cent; `high` differs ~1¢ but SPY's `high` tolerance is wide
+  (~52¢, stddev 2.35e-4) so it passes comfortably; `open` differs ~2¢ against SPY's tightest field
+  tolerance (~0.8¢, stddev 3.5e-6), so `open` alone fails Tier 2. Illustrates the per-field redesign
+  doing its job: same absolute cent-gap means very different things depending on which field it
+  lands in. **Ask-DataBento case.**
+
 ## Design (from initial conversation, not fully converged — see Open questions)
 
 New CLI arguments on `--finalize` for targeted single-bar mode, replacing the bulk sweep for that

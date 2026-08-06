@@ -30,11 +30,17 @@ a fifth dimension (`dim_field_group`), and the `fact_reconciliation`/
 writes — see those sections below and `tasks/quant-reconcile.md`. `006_add_pending_manual_resolution`
 added `fact_pending_manual_resolution`, making "stuck" an explicit, queryable state instead of an
 implicit one — see its own section below. `007_add_dim_field_and_dataset_inception` added a sixth
-dimension (`dim_field`), re-keyed `provider_pair_disagreement` to `(provider_id, ticker_id,
-field_id)`, and added `dataset_inception` — schema-only, ahead of the pipeline-accuracy-hardening
-algorithm/CLI changes that consume the new shape (see those sections below and
-[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)). `fact_market_data_1min`
-itself is unchanged throughout:
+dimension (`dim_field`) and re-keyed `provider_pair_disagreement` to `(provider_id, ticker_id,
+field_id)`; the pipeline-accuracy-hardening algorithm/CLI changes that consume the new shape (a
+per-ticker graduation gate, per-field tolerance, `--backfill`) shipped as a follow-up, no further
+schema change — see those sections below and
+[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)/#29.
+`008_add_ingestion_coverage` added `ingestion_coverage`. `quant-reconcile` now consumes it (a
+candidate can promote via Tier 1 completeness when the whistleblower is confirmed absent for a
+bar, not just when it reported incomplete); `quant-ingest`'s write path (recording + coalescing
+coverage on every successful fetch) is still outstanding — see its own section below and
+[croicu/quant-data#31](https://github.com/croicu/quant-data/issues/31).
+`fact_market_data_1min` itself is unchanged throughout:
 it remains the single golden, reconciled dataset every reader (`MarketData`) queries, regardless of
 which provider(s) a bar's value ultimately came from.
 
@@ -122,6 +128,50 @@ staging, comparing per-field-group against a measured tolerance, promoting agree
 their staging rows once safe — is a separate CLI, `quant-reconcile` (same repo, same `quant-<verb>`
 naming as `quant-ingest`); see `tasks/quant-reconcile.md` and `docs/ARCHITECTURE.md`'s `reconcile`
 section for the full design.
+
+## `ingestion_coverage`
+
+| Column | Type | Notes |
+|---|---|---|
+| `coverage_id` | `SERIAL PRIMARY KEY` | |
+| `ticker_id` | `INT NOT NULL` | FK → `dim_ticker` |
+| `provider_id` | `INT NOT NULL` | FK → `dim_provider` |
+| `start_date_id` | `INT NOT NULL` | FK → `dim_date` |
+| `end_date_id` | `INT NOT NULL` | FK → `dim_date`. `CHECK (start_date_id <= end_date_id)` |
+| `updated_at` | `TIMESTAMP` | Defaults to insert time |
+
+Added in `008_add_ingestion_coverage` ([croicu/quant-data#31](https://github.com/croicu/quant-data/issues/31)).
+One row per *contiguous* date range successfully ingested for a (ticker, provider) pair — explicit
+tracking rather than deriving coverage from `staging_market_data_1min`'s presence/absence, since
+staging rows get purged over time (candidates once resolved; the whistleblower never, per its
+permanent purge exemption) and wouldn't stay a reliable long-term coverage signal. `quant-ingest`'s
+write path (recording a date as covered whenever a provider's fetch completes without raising —
+regardless of resulting bar count, including zero — and coalescing each new date into any existing
+adjacent/overlapping range) is still outstanding; today this table is only ever populated by
+`008`'s one-time backfill from whatever was in staging at migration-apply time. A raised
+`AppError`, including a confirmed-empty whole day (e.g. Yahoo's `history.empty` case for a
+weekend), will not mark coverage once the write path lands — distinguishing that from a genuine
+fetch failure is deliberately left to the postponed `tasks/ingest_error_classification.md`, not
+solved here.
+
+**Motivating case, and consumed by `quant-reconcile` today**: Tier 1 (completeness) could
+previously only promote a candidate's value when the whistleblower reported but was flagged
+`incomplete` — if the whistleblower simply never wrote a row for a minute at all (common: Yahoo
+doesn't emit a row for a real no-trade/no-volume minute), that bar was excluded from reconciliation
+entirely and the candidate's legitimate data sat in staging forever. `_run_automatic_pass` now
+distinguishes "whistleblower confirmed absent for this minute" (its date range was ingested;
+promote the candidate, same `'completeness'` resolution_path, no new path — see
+`docs/ARCHITECTURE.md`'s `reconcile` section for the exact mechanism) from "whistleblower not
+ingested yet" (bar left alone, not even marked pending, exactly as if a required provider were
+simply missing — must wait for a future run) — live-tested against CroicuWS1: 6,939 of 7,192 stuck
+`ibkr` staging rows were exactly the former case.
+
+The initial backfill (baked into `008_add_ingestion_coverage` itself, not a separate script)
+populates this table from whatever was in `staging_market_data_1min` at migration-apply time, using
+a "gaps and islands" contiguous-run query (`dim_date.date_id` increments by exactly 1 per calendar
+day including weekends, so a true gap — a weekend, or a day never ingested — correctly stays a
+separate range rather than being bridged by a naive `MIN`/`MAX`). No-op on a fresh bootstrap
+database with empty staging.
 
 ## `fact_market_data_1min`
 
@@ -234,10 +284,10 @@ consumer.
 | `updated_at` | `TIMESTAMP` | Defaults to insert time |
 
 Primary key: `(provider_id, ticker_id, field_id)`. Added in `004_add_reconciliation_tables`,
-re-keyed in `007_add_dim_field_and_dataset_inception` (see
-[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)) — this is schema-only:
-`quant-reconcile` still reads/writes the pre-`007` shape until a follow-up implementation issue
-lands the algorithm/CLI changes that consume the new key. Running variance of each candidate
+re-keyed in `007_add_dim_field_and_dataset_inception`, consumed by `quant-reconcile`'s per-field
+Tier 2/3 tolerance and per-ticker graduation gate (see
+[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)/#29 and
+`docs/ARCHITECTURE.md`'s `reconcile` section). Running variance of each candidate
 provider's disagreement against the fixed whistleblower (`yfinance` today), per ticker per field —
 measured directly rather than reconstructed from two individually-unmeasurable per-provider
 "precision" figures (no ground-truth reference exists to attribute disagreement to one side or the
@@ -296,16 +346,20 @@ that a bar is stuck. Requires `quant_reader` to have `SELECT` on `staging_market
 | `id` | `INT PRIMARY KEY DEFAULT 1` | `CHECK (id = 1)` |
 | `inception_date` | `DATE NOT NULL` | |
 
-Added in `007_add_dim_field_and_dataset_inception`, currently empty (no consuming code yet — see
-[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)). Single-row table recording
-the date the dataset is meant to start from — a fact about the dataset's own properties, not
-tunable process behavior, so it lives here rather than `settings.json`. The `CHECK (id = 1)`
+Added in `007_add_dim_field_and_dataset_inception`; read by `quant-ingest --backfill`
+(`PostgresDatabase.fetch_dataset_inception_date`, see
+[croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)/#29 and
+`docs/ARCHITECTURE.md`'s `ingest` section) as the backward-walk's target. Single-row table
+recording the date the dataset is meant to start from — a fact about the dataset's own properties,
+not tunable process behavior, so it lives here rather than `settings.json`. The `CHECK (id = 1)`
 enforces the single-row invariant at the DB level rather than relying on convention (contrast with
-`schema_migrations`, which legitimately has one row per migration). Moving `inception_date`
-backward is an operational trigger, not just a value update: a future `--backfill` implementation
-must re-run for every configured ticker from the new `inception_date` to that ticker's own current
-earliest covered date — not a single shared date, since tickers may already have different amounts
-of history.
+`schema_migrations`, which legitimately has one row per migration). **Still empty on the real
+database as of #29** — `fetch_dataset_inception_date` raises `AppError` when no row exists, so
+`--backfill` cannot actually run until a real value is inserted by hand (a manual, one-time data
+decision outside this code's scope, not a bug). Moving `inception_date` backward once populated is
+an operational trigger, not just a value update: `--backfill` must re-run for every configured
+ticker from the new `inception_date` to that ticker's own current earliest covered date — not a
+single shared date, since tickers may already have different amounts of history.
 
 ## Indexes
 

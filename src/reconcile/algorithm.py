@@ -24,6 +24,11 @@ RESOLUTION_BOUNDARY_FIX = "boundary_fix"
 RESOLUTION_FINALIZED = "finalized"
 RESOLUTION_MANUAL_OVERRIDE = "manual_override"
 
+# A ticker below this many matched bars (every configured provider reported real, non-incomplete
+# data for that minute) sits in staging completely unevaluated -- no Tier 1-4 attempt, no partial
+# stats update -- until it graduates in one batch (croicu/quant-data#28).
+GRADUATION_THRESHOLD_MATCHED_BARS = 1400
+
 _GROUP_FIELDS: dict[str, list[str]] = {
     FIELD_GROUP_OHLC: ["open", "high", "low", "close"],
 }
@@ -55,33 +60,40 @@ class DisagreementStats:
     running_m2: float
 
 
-def _fields_for_group(field_group: str) -> list[str]:
+def fields_for_group(field_group: str) -> list[str]:
     return _GROUP_FIELDS[field_group]
 
 
 def _reference_value(bar: ProviderBar, field_group: str) -> float:
-    fields = _fields_for_group(field_group)
+    fields = fields_for_group(field_group)
     total = 0.0
     for field_name in fields:
         total += getattr(bar, field_name)
     return total / len(fields)
 
 
-def _max_field_diff(candidate: ProviderBar, whistleblower: ProviderBar, field_group: str) -> float:
-    max_diff = 0.0
-    for field_name in _fields_for_group(field_group):
-        diff = abs(getattr(candidate, field_name) - getattr(whistleblower, field_name))
-        if diff > max_diff:
-            max_diff = diff
-    return max_diff
-
-
 def _tolerance(candidate: ProviderBar, field_group: str, stddev: float, k: float) -> float:
     return k * stddev * _reference_value(candidate, field_group)
 
 
-def _agrees_within_tolerance(candidate: ProviderBar, whistleblower: ProviderBar, field_group: str, stddev: float, k: float) -> bool:
-    return _max_field_diff(candidate, whistleblower, field_group) <= _tolerance(candidate, field_group, stddev, k)
+def _agrees_within_tolerance(
+    candidate: ProviderBar,
+    whistleblower: ProviderBar,
+    field_group: str,
+    field_tolerances: dict[str, float],
+    k: float,
+) -> bool:
+    """Every field independently within its own tolerance -- not "max diff across the group
+    within one tolerance" (see croicu/quant-data#28's "Pooled across fields" finding). OHLC stays
+    one atomic promotion unit; only this comparison is per-field."""
+    for field_name in fields_for_group(field_group):
+        stddev = field_tolerances.get(field_name)
+        if stddev is None:
+            return False
+        diff = abs(getattr(candidate, field_name) - getattr(whistleblower, field_name))
+        if diff > _tolerance(candidate, field_group, stddev, k):
+            return False
+    return True
 
 
 def _find_whistleblower(bars: list[ProviderBar]) -> ProviderBar | None:
@@ -126,7 +138,7 @@ def _resolve_completeness(bars: list[ProviderBar]) -> Resolution | None:
 def _resolve_agreement(
     bars: list[ProviderBar],
     field_group: str,
-    tolerances: dict[int, float],
+    tolerances: dict[int, dict[str, float]],
     k: float,
     preferred_provider_id: int | None,
 ) -> Resolution | None:
@@ -136,10 +148,10 @@ def _resolve_agreement(
 
     agreeing: list[ProviderBar] = []
     for candidate in _candidates(bars):
-        stddev = tolerances.get(candidate.provider_id)
-        if stddev is None:
+        field_tolerances = tolerances.get(candidate.provider_id)
+        if field_tolerances is None:
             continue
-        if _agrees_within_tolerance(candidate, whistleblower, field_group, stddev, k):
+        if _agrees_within_tolerance(candidate, whistleblower, field_group, field_tolerances, k):
             agreeing.append(candidate)
 
     if not agreeing:
@@ -161,31 +173,33 @@ def _windowed_agrees(
     candidate_window: list[ProviderBar | None],
     whistleblower_window: list[ProviderBar | None],
     field_group: str,
-    stddev: float,
+    field_tolerances: dict[str, float],
     k: float,
 ) -> bool:
     candidate_bar = candidate_window[1]
     if candidate_bar is None:
         return False
 
-    max_diff = 0.0
-    for field_name in _fields_for_group(field_group):
+    for field_name in fields_for_group(field_group):
+        stddev = field_tolerances.get(field_name)
+        if stddev is None:
+            return False
         candidate_avg = _windowed_average(candidate_window, field_name)
         whistleblower_avg = _windowed_average(whistleblower_window, field_name)
         if candidate_avg is None or whistleblower_avg is None:
             return False
         diff = abs(candidate_avg - whistleblower_avg)
-        if diff > max_diff:
-            max_diff = diff
+        if diff > _tolerance(candidate_bar, field_group, stddev, k):
+            return False
 
-    return max_diff <= _tolerance(candidate_bar, field_group, stddev, k)
+    return True
 
 
 def _resolve_boundary_fix(
     bars: list[ProviderBar],
     windows: dict[int, list[ProviderBar | None]],
     field_group: str,
-    tolerances: dict[int, float],
+    tolerances: dict[int, dict[str, float]],
     k: float,
 ) -> Resolution | None:
     whistleblower = _find_whistleblower(bars)
@@ -196,13 +210,13 @@ def _resolve_boundary_fix(
         return None
 
     for candidate in _candidates(bars):
-        stddev = tolerances.get(candidate.provider_id)
-        if stddev is None:
+        field_tolerances = tolerances.get(candidate.provider_id)
+        if field_tolerances is None:
             continue
         candidate_window = windows.get(candidate.provider_id)
         if candidate_window is None:
             continue
-        if _windowed_agrees(candidate_window, whistleblower_window, field_group, stddev, k):
+        if _windowed_agrees(candidate_window, whistleblower_window, field_group, field_tolerances, k):
             return Resolution(winning_provider_id=candidate.provider_id, resolution_path=RESOLUTION_BOUNDARY_FIX)
 
     return None
@@ -212,7 +226,7 @@ def resolve_automatic(
     bars: list[ProviderBar],
     field_group: str,
     windows: dict[int, list[ProviderBar | None]],
-    tolerances: dict[int, float],
+    tolerances: dict[int, dict[str, float]],
     k: float,
     preferred_provider_id: int | None,
 ) -> Resolution | None:
@@ -252,7 +266,7 @@ def relative_diffs_for_stats_update(candidate: ProviderBar, whistleblower: Provi
         return []
 
     diffs: list[float] = []
-    for field_name in _fields_for_group(field_group):
+    for field_name in fields_for_group(field_group):
         diffs.append((getattr(candidate, field_name) - getattr(whistleblower, field_name)) / reference_value)
     return diffs
 
@@ -271,3 +285,15 @@ def stddev_from_stats(stats: DisagreementStats) -> float:
         return 0.0
     variance = stats.running_m2 / stats.sample_count
     return variance**0.5
+
+
+def batch_stats(observations: list[float]) -> DisagreementStats:
+    """Computes mean/variance over a full batch in one pass -- used only at graduation, when a
+    ticker's first stats are a real batch of GRADUATION_THRESHOLD_MATCHED_BARS actually-observed
+    bars rather than an incrementally-seeded value (croicu/quant-data#28's "no seeds, anywhere,
+    ever"). Built on welford_update so the result is identical to updating one observation at a
+    time -- order of arrival doesn't matter."""
+    stats = DisagreementStats(sample_count=0, running_mean=0.0, running_m2=0.0)
+    for observation in observations:
+        stats = welford_update(stats, observation)
+    return stats

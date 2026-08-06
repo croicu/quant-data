@@ -2,15 +2,30 @@ from __future__ import annotations
 
 from datetime import date
 
+from quant_data._internal.shared.errors import AppError
 from quant_data.protocols import OHLCV, PendingResolutionBar
 
 
 class MockPostgresDatabase:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        inception_date: date | None = None,
+        earliest_covered_by_ticker: dict[str, date] | None = None,
+    ) -> None:
         self.written_bars: list[OHLCV] = []
         self.written_staging_bars: list[tuple[str, OHLCV]] = []
         self.pending_resolution_bars: list[PendingResolutionBar] = []
+        self.inception_date = inception_date
+        self.earliest_covered_by_ticker = earliest_covered_by_ticker if earliest_covered_by_ticker is not None else {}
         self.closed = False
+
+    def fetch_dataset_inception_date(self) -> date:
+        if self.inception_date is None:
+            raise AppError("dataset_inception is empty -- insert the dataset's actual inception_date before running --backfill.")
+        return self.inception_date
+
+    def fetch_earliest_covered_date(self, ticker: str) -> date | None:
+        return self.earliest_covered_by_ticker.get(ticker.upper())
 
     def fetch_bars(self, ticker: str, start_date: date, end_date: date) -> list[OHLCV]:
         normalized_ticker = ticker.upper()

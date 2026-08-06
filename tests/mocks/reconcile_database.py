@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from quant_data._internal.shared.postgres import DisagreementStatsRow, FieldGroupRow, ProviderRow, StagingRow
+from quant_data._internal.shared.postgres import DisagreementStatsRow, FieldGroupRow, FieldRow, IngestionCoverageRow, ProviderRow, StagingRow
 
 
 class FakeReconcileDatabase:
@@ -15,15 +15,19 @@ class FakeReconcileDatabase:
         providers: list[ProviderRow],
         field_groups: list[FieldGroupRow],
         staging_rows: list[StagingRow],
+        fields: list[FieldRow] | None = None,
         disagreement_stats: list[DisagreementStatsRow] | None = None,
+        ingestion_coverage: list[IngestionCoverageRow] | None = None,
     ) -> None:
         self.providers = providers
         self.field_groups = field_groups
+        self.fields = fields if fields is not None else []
         self.staging_rows = list(staging_rows)
-        self.disagreement_stats: dict[tuple[int, int], DisagreementStatsRow] = {}
+        self.disagreement_stats: dict[tuple[int, int, int], DisagreementStatsRow] = {}
         if disagreement_stats is not None:
             for stats in disagreement_stats:
-                self.disagreement_stats[(stats.provider_id, stats.field_group_id)] = stats
+                self.disagreement_stats[(stats.provider_id, stats.ticker_id, stats.field_id)] = stats
+        self.ingestion_coverage = ingestion_coverage if ingestion_coverage is not None else []
 
         self.fact_reconciliation: list[tuple[int, int, int, int, int, str]] = []
         self.fact_reconciliation_participant: list[tuple[int, int, int, int, int, bool]] = []
@@ -37,8 +41,14 @@ class FakeReconcileDatabase:
     def fetch_dim_field_groups(self) -> list[FieldGroupRow]:
         return list(self.field_groups)
 
+    def fetch_dim_fields(self) -> list[FieldRow]:
+        return list(self.fields)
+
     def fetch_provider_pair_disagreement(self) -> list[DisagreementStatsRow]:
         return list(self.disagreement_stats.values())
+
+    def fetch_ingestion_coverage(self) -> list[IngestionCoverageRow]:
+        return list(self.ingestion_coverage)
 
     def _pending_bar_keys(self) -> set[tuple[int, int, int]]:
         result: set[tuple[int, int, int]] = set()
@@ -46,7 +56,7 @@ class FakeReconcileDatabase:
             result.add((ticker_id, date_id, time_id))
         return result
 
-    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str]) -> list[StagingRow]:
+    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str], required_provider_names: list[str]) -> list[StagingRow]:
         provider_name_by_id: dict[int, str] = {}
         for provider in self.providers:
             provider_name_by_id[provider.provider_id] = provider.name
@@ -69,7 +79,12 @@ class FakeReconcileDatabase:
             reporting_names: set[str] = set()
             for row in rows:
                 reporting_names.add(provider_name_by_id[row.provider_id])
-            if len(reporting_names) == len(expected_provider_names):
+            has_all_required = True
+            for required_name in required_provider_names:
+                if required_name not in reporting_names:
+                    has_all_required = False
+                    break
+            if has_all_required:
                 result.extend(rows)
         return result
 
@@ -131,29 +146,28 @@ class FakeReconcileDatabase:
         self.fact_market_data[(ticker_id, date_id, time_id)] = (timestamp, open, high, low, close, volume, incomplete)
 
     def purge_staging_bar(self, ticker_id: int, date_id: int, time_id: int) -> None:
+        whistleblower_provider_ids: set[int] = set()
+        for provider in self.providers:
+            if provider.role == "whistleblower":
+                whistleblower_provider_ids.add(provider.provider_id)
+
         remaining: list[StagingRow] = []
         for row in self.staging_rows:
-            if (row.ticker_id, row.date_id, row.time_id) == (ticker_id, date_id, time_id):
+            if (row.ticker_id, row.date_id, row.time_id) == (ticker_id, date_id, time_id) and row.provider_id not in whistleblower_provider_ids:
                 continue
             remaining.append(row)
         self.staging_rows = remaining
 
-    def save_provider_pair_disagreement(
-        self,
-        provider_id: int,
-        field_group_id: int,
-        sample_count: int,
-        running_mean: float,
-        running_m2: float,
-        stddev: float,
-    ) -> None:
-        self.disagreement_stats[(provider_id, field_group_id)] = DisagreementStatsRow(
-            provider_id=provider_id,
-            field_group_id=field_group_id,
-            sample_count=sample_count,
-            running_mean=running_mean,
-            running_m2=running_m2,
-        )
+    def save_provider_pair_disagreement_batch(self, rows: list[tuple[int, int, int, int, float, float, float]]) -> None:
+        for provider_id, ticker_id, field_id, sample_count, running_mean, running_m2, stddev in rows:
+            self.disagreement_stats[(provider_id, ticker_id, field_id)] = DisagreementStatsRow(
+                provider_id=provider_id,
+                ticker_id=ticker_id,
+                field_id=field_id,
+                sample_count=sample_count,
+                running_mean=running_mean,
+                running_m2=running_m2,
+            )
 
     def close(self) -> None:
         self.closed = True

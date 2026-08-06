@@ -14,8 +14,10 @@ from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
 from quant_data._internal.shared.providers.ibkr import CATEGORY_IBKR, IBKRIntraDay
 from quant_data._internal.shared.providers.yfinance import CATEGORY_YFINANCE, YahooFinanceIntraDay
-from quant_data._internal.shared.settings import PostgresSettings, Settings
+from quant_data._internal.shared.settings import PostgresSettings, RateLimitSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
+
+from .rate_limiter import RateLimiter
 
 CATEGORY_INGEST = "ingest"
 
@@ -34,20 +36,23 @@ class CliArguments:
     start_date: date_type | None = None
     end_date: date_type | None = None
     catch_up: bool = False
+    backfill: bool = False
     debug: bool = False
 
 
 def parse_args(argv: list[str]) -> CliArguments:
     parser = argparse.ArgumentParser(
         prog="quant-ingest",
-        usage="quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]",
+        usage="quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up | --backfill] [--ticker TICKER] [--debug]",
         description=(
             "Fetch 1-minute OHLCV bars for one ticker (with --ticker) or every ticker in "
             "settings.tickers (without --ticker), over an inclusive date range (--start-date alone "
             "means a single day; add --end-date for a range; omit both to use "
             "settings.startDate/settings.endDate), and store them in quant-data's warehouse. "
             "--catch-up re-fetches the trailing settings.catchUpLookbackDays days instead, to fill "
-            "in days a prior run only partially ingested."
+            "in days a prior run only partially ingested. --backfill instead walks each ticker "
+            "backward from its current earliest covered date toward dataset_inception, one "
+            "settings.backfillChunkDays chunk per ticker per invocation."
         ),
     )
 
@@ -59,6 +64,12 @@ def parse_args(argv: list[str]) -> CliArguments:
         action="store_true",
         default=False,
         help="re-fetch the trailing settings.catchUpLookbackDays days (excluding today) instead of a date range",
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        default=False,
+        help="walk each ticker backward from its current earliest covered date toward dataset_inception, one settings.backfillChunkDays chunk per invocation",
     )
     parser.add_argument(
         "--debug",
@@ -74,6 +85,12 @@ def parse_args(argv: list[str]) -> CliArguments:
 
     if args.catch_up and (args.start_date is not None or args.end_date is not None):
         parser.error("--catch-up cannot be combined with --start-date/--end-date.")
+
+    if args.backfill and (args.start_date is not None or args.end_date is not None):
+        parser.error("--backfill cannot be combined with --start-date/--end-date.")
+
+    if args.backfill and args.catch_up:
+        parser.error("--backfill cannot be combined with --catch-up.")
 
     start_date: date_type | None = None
     end_date: date_type | None = None
@@ -94,7 +111,7 @@ def parse_args(argv: list[str]) -> CliArguments:
         if end_date < start_date:
             parser.error(f"--end-date ({end_date.isoformat()}) must not be before --start-date ({start_date.isoformat()}).")
 
-    return CliArguments(ticker=args.ticker, start_date=start_date, end_date=end_date, catch_up=args.catch_up, debug=args.debug)
+    return CliArguments(ticker=args.ticker, start_date=start_date, end_date=end_date, catch_up=args.catch_up, backfill=args.backfill, debug=args.debug)
 
 
 def _date_range(start_date: date_type, end_date: date_type) -> list[date_type]:
@@ -136,7 +153,34 @@ def _default_providers(settings: Settings) -> dict[str, IntraDayProvider]:
     return providers
 
 
-def _ingest_one(providers: dict[str, IntraDayProvider], database: PostgresDatabase, ticker: str, target_date: date_type) -> int | None:
+def _rate_limit_for(name: str, settings: Settings) -> RateLimitSettings | None:
+    if name == "ibkr":
+        return settings.ibkr.rate_limit
+    if name == "yfinance":
+        return settings.yfinance.rate_limit
+    return None
+
+
+def _default_rate_limiters(settings: Settings) -> dict[str, RateLimiter]:
+    # Sits between the orchestration loop and IntraDayProvider.fetch_bars, not inside any one
+    # provider implementation -- pacing is a property of reaching a specific external service
+    # (croicu/quant-data#28). Unspecified (None) means unlimited, so a provider with no configured
+    # limit gets no entry here at all.
+    rate_limiters: dict[str, RateLimiter] = {}
+    for name in settings.providers:
+        rate_limit = _rate_limit_for(name, settings)
+        if rate_limit is not None:
+            rate_limiters[name] = RateLimiter(requests_per_window=rate_limit.requests_per_window, window_seconds=rate_limit.window_seconds)
+    return rate_limiters
+
+
+def _ingest_one(
+    providers: dict[str, IntraDayProvider],
+    database: PostgresDatabase,
+    rate_limiters: dict[str, RateLimiter],
+    ticker: str,
+    target_date: date_type,
+) -> int | None:
     # Fetch and write failures are logged separately (rather than one catch-all at the call
     # site) so the log category actually reflects where the failure came from -- both raise the
     # same AppError type, so a single shared catch couldn't tell a fetch problem (e.g. a weekend,
@@ -155,6 +199,10 @@ def _ingest_one(providers: dict[str, IntraDayProvider], database: PostgresDataba
     any_provider_succeeded = False
 
     for provider_name, provider in providers.items():
+        rate_limiter = rate_limiters.get(provider_name)
+        if rate_limiter is not None:
+            rate_limiter.acquire()
+
         try:
             bars = provider.fetch_bars(ticker, target_date)
         except AppError as error:
@@ -196,6 +244,7 @@ def main(
     providers: dict[str, IntraDayProvider] | None = None,
     database_factory: Callable[[PostgresSettings], PostgresDatabase] | None = None,
     today: Callable[[], date_type] | None = None,
+    rate_limiters: dict[str, RateLimiter] | None = None,
 ) -> int:
     arguments = parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -224,28 +273,6 @@ def main(
         if not tickers:
             raise AppError("No ticker given and settings.tickers is empty — pass --ticker or configure settings.tickers.")
 
-        if arguments.catch_up:
-            active_today = date_type.today() if today is None else today()
-            effective_end_date = active_today - timedelta(days=1)
-            effective_start_date = active_today - timedelta(days=settings.catch_up_lookback_days)
-            Logger.info(
-                f"quant-ingest: catch-up mode, re-fetching {effective_start_date.isoformat()} to {effective_end_date.isoformat()}.",
-                category=CATEGORY_INGEST,
-            )
-        elif arguments.start_date is not None and arguments.end_date is not None:
-            effective_start_date = arguments.start_date
-            effective_end_date = arguments.end_date
-        elif settings.start_date is not None and settings.end_date is not None:
-            effective_start_date = settings.start_date
-            effective_end_date = settings.end_date
-        else:
-            raise AppError(
-                "No date range given and settings.startDate/settings.endDate not configured — "
-                "pass --start-date/--end-date, --catch-up, or configure both settings dates."
-            )
-
-        target_dates = _date_range(effective_start_date, effective_end_date)
-
         active_providers = providers if providers is not None else _default_providers(settings)
 
         # Connect once per batch (see IntraDayProvider.connect()'s own docstring) rather than
@@ -268,18 +295,73 @@ def main(
             raise AppError("No configured provider could connect -- check settings.providers and each provider's connection settings.")
 
         active_database_factory = database_factory if database_factory is not None else _default_database_factory
+        active_rate_limiters = rate_limiters if rate_limiters is not None else _default_rate_limiters(settings)
 
         database = active_database_factory(settings.postgres)
         succeeded: list[tuple[str, date_type]] = []
         failed: list[tuple[str, date_type]] = []
         try:
-            for target_date in target_dates:
+            if arguments.backfill:
+                active_today = date_type.today() if today is None else today()
+                inception_date = database.fetch_dataset_inception_date()
+
                 for ticker in tickers:
-                    written = _ingest_one(connected_providers, database, ticker, target_date)
-                    if written is None:
-                        failed.append((ticker, target_date))
-                    else:
-                        succeeded.append((ticker, target_date))
+                    earliest_covered = database.fetch_earliest_covered_date(ticker)
+                    if earliest_covered is not None and earliest_covered <= inception_date:
+                        Logger.info(
+                            f"quant-ingest --backfill: '{ticker.upper()}' already covers back to inception_date ({inception_date.isoformat()}); nothing to do.",
+                            category=CATEGORY_INGEST,
+                        )
+                        continue
+
+                    # A ticker with no existing coverage at all bootstraps from today backward,
+                    # using the same "excludes today" convention as --catch-up above -- this is
+                    # the same formula as the normal case, just with today standing in for
+                    # earliest_covered when there's no prior coverage to walk back from.
+                    reference_date = earliest_covered if earliest_covered is not None else active_today
+                    chunk_end_date = reference_date - timedelta(days=1)
+                    chunk_start_date = max(inception_date, chunk_end_date - timedelta(days=settings.backfill_chunk_days - 1))
+
+                    Logger.info(
+                        f"quant-ingest --backfill: '{ticker.upper()}' fetching {chunk_start_date.isoformat()} to {chunk_end_date.isoformat()}.",
+                        category=CATEGORY_INGEST,
+                    )
+                    for target_date in _date_range(chunk_start_date, chunk_end_date):
+                        written = _ingest_one(connected_providers, database, active_rate_limiters, ticker, target_date)
+                        if written is None:
+                            failed.append((ticker, target_date))
+                        else:
+                            succeeded.append((ticker, target_date))
+            else:
+                if arguments.catch_up:
+                    active_today = date_type.today() if today is None else today()
+                    effective_end_date = active_today - timedelta(days=1)
+                    effective_start_date = active_today - timedelta(days=settings.catch_up_lookback_days)
+                    Logger.info(
+                        f"quant-ingest: catch-up mode, re-fetching {effective_start_date.isoformat()} to {effective_end_date.isoformat()}.",
+                        category=CATEGORY_INGEST,
+                    )
+                elif arguments.start_date is not None and arguments.end_date is not None:
+                    effective_start_date = arguments.start_date
+                    effective_end_date = arguments.end_date
+                elif settings.start_date is not None and settings.end_date is not None:
+                    effective_start_date = settings.start_date
+                    effective_end_date = settings.end_date
+                else:
+                    raise AppError(
+                        "No date range given and settings.startDate/settings.endDate not configured — "
+                        "pass --start-date/--end-date, --catch-up, --backfill, or configure both settings dates."
+                    )
+
+                target_dates = _date_range(effective_start_date, effective_end_date)
+
+                for target_date in target_dates:
+                    for ticker in tickers:
+                        written = _ingest_one(connected_providers, database, active_rate_limiters, ticker, target_date)
+                        if written is None:
+                            failed.append((ticker, target_date))
+                        else:
+                            succeeded.append((ticker, target_date))
         finally:
             database.close()
             for provider_instance in connected_providers.values():

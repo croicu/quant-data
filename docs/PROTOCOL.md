@@ -8,7 +8,7 @@ CLI signature and file format schemas for `quant-data`.
 
 ### `quant-ingest`
 
-- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]`
+- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up | --backfill] [--ticker TICKER] [--debug]`
 - Fetches 1-minute OHLCV bars from every provider in `settings.providers` (default: just
   `yfinance`; add `ibkr` to also run `IBKRIntraDay`) and writes each provider's bars independently
   into `staging_market_data_1min` — **not** `fact_market_data_1min` directly. Promoting agreeing
@@ -21,24 +21,39 @@ CLI signature and file format schemas for `quant-data`.
   Requires `--start-date` — rejected on its own.
 - `--catch-up` — re-fetches the trailing `settings.catchUpLookbackDays` days (default 7),
   excluding today, instead of a `--start-date`/`--end-date` range. Rejected in combination with
-  `--start-date`/`--end-date`. Meant for an unattended nightly run (cron/systemd timer, set up
-  outside this repo — see `tasks/scheduled_jobs.md`) that catches up any day a prior run only
-  partially ingested (e.g. `quant-ingest` run manually mid-session); safe to run against
+  `--start-date`/`--end-date`/`--backfill`. Meant for an unattended nightly run (cron/systemd
+  timer, set up outside this repo — see `tasks/scheduled_jobs.md`) that catches up any day a prior
+  run only partially ingested (e.g. `quant-ingest` run manually mid-session); safe to run against
   already-complete days too, since `write_staging_bars` upserts are idempotent.
+- `--backfill` (croicu/quant-data#28) — walks each configured ticker backward from its current
+  earliest covered date toward `dataset_inception.inception_date`, one `settings.backfillChunkDays`
+  chunk (default `1`) per ticker per invocation (round-robin, not one ticker drained to completion
+  before the next starts). Rejected in combination with `--start-date`/`--end-date`/`--catch-up`. A
+  never-ingested ticker auto-bootstraps its first chunk from today backward; a ticker already at
+  `inception_date` is a no-op. Requires `dataset_inception` to have a row — fails with exit `1` if
+  it's empty (see `docs/DATABASE.md`'s setup notes). See `docs/ARCHITECTURE.md` for the full chunk
+  formula.
 - `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
   instead of printing a one-line error, for upfront failures (settings load, no ticker/date
   configured at all, every configured provider failing to connect).
 - `settings.providers` (array of strings, default `["yfinance"]`) — which providers to run each
   invocation; unrecognized names fail fast at startup. `settings.ibkr` (`host`/`port`/`clientId`,
   all optional — default to `IBKRIntraDay`'s own defaults, IB Gateway's paper port `4002`) — only
-  consulted when `"ibkr"` is in `settings.providers`.
+  consulted when `"ibkr"` is in `settings.providers`. `settings.ibkr.rateLimit`/
+  `settings.yfinance.rateLimit` (each `{requestsPerWindow, windowSeconds}`, both keys required
+  together if the object is present) pace that provider's `fetch_bars` calls via a sliding-window
+  `RateLimiter` — IBKR defaults to `50`/`600` even when omitted (a real external ceiling that
+  always applies); yfinance defaults to unlimited when omitted. `settings.backfillChunkDays`
+  (default `1`, must be `>= 1`) — only consulted by `--backfill`.
 - Exit codes: `0` every (ticker, date) pair had at least one provider succeed; `1` settings load
-  failure, no ticker/date-range configured at all, every configured provider failing to connect, or
-  one or more (ticker, date) pairs where every provider failed (an individual provider failing for
-  one pair — bad ticker on that source, gateway unreachable — logs a warning and the run continues
-  with whatever providers/pairs still work, rather than aborting — `1` here can mean "partial
-  success", not necessarily "nothing happened"); `2` argument parsing error (argparse's default
-  behavior on missing/bad args, e.g. malformed dates or `--end-date` without `--start-date`).
+  failure, no ticker/date-range configured at all, every configured provider failing to connect,
+  `dataset_inception` empty (`--backfill` only), or one or more (ticker, date) pairs where every
+  provider failed (an individual provider failing for one pair — bad ticker on that source, gateway
+  unreachable — logs a warning and the run continues with whatever providers/pairs still work,
+  rather than aborting — `1` here can mean "partial success", not necessarily "nothing happened");
+  `2` argument parsing error (argparse's default behavior on missing/bad args, e.g. malformed dates
+  or `--end-date` without `--start-date`, or combining `--backfill` with another date-selection
+  flag).
 
 ### `quant-reconcile`
 
@@ -48,9 +63,25 @@ CLI signature and file format schemas for `quant-data`.
   provider wins `ohlc` (see `tasks/volume_reconciliation.md`) — against the providers that reported
   for it, and promotes a bar into `fact_market_data_1min` once every field group has resolved.
   Staging rows purge once that's safe — deferred while an adjacent minute is still unresolved, so a
-  future run's boundary-fix check doesn't lose that neighbor's raw data.
+  future run's boundary-fix check doesn't lose that neighbor's raw data. Whistleblower-role
+  providers' rows (`yfinance` today) are never purged at all, even once safe by the rule above —
+  permanently retained for irreplaceability (croicu/quant-data#28), not just this neighbor-safety
+  window.
 - No date-range/ticker flags — processes everything currently eligible in staging each run, unlike
-  `quant-ingest`.
+  `quant-ingest`. "Eligible" now also requires the ticker to have *graduated* (croicu/quant-data#28):
+  a ticker below `GRADUATION_THRESHOLD_MATCHED_BARS` (1,400) matched bars gets no Tier 1-4 attempt
+  at all, regardless of individual bars' own completeness/agreement — see `docs/ARCHITECTURE.md`
+  for the full graduation-batch mechanism.
+- Eligibility only requires **candidate** providers to have reported (croicu/quant-data#31) — a bar
+  where the whistleblower never wrote a row at all can still promote via Tier 1 completeness, but
+  only once `ingestion_coverage` confirms its date was actually ingested (a real "nothing here," not
+  "not scanned yet"); otherwise it's left alone untouched, same as a bar missing any other required
+  provider. See `docs/ARCHITECTURE.md`'s `reconcile` section for the exact mechanism.
+- Tier 2 (agreement)/Tier 3 (boundary-fix) tolerance is now measured **per ticker per field**
+  (`open`/`high`/`low`/`close` independently), not pooled across tickers or across the whole `ohlc`
+  group — fixes two compounding false-positive/false-negative sources found in the pooled design
+  (see `docs/ARCHITECTURE.md`'s `reconcile` section). OHLC still promotes as one atomic unit; only
+  the comparison is per-field.
 - **Without `--finalize`** (the plain, day-to-day invocation): only the automatic tiers run
   (completeness / raw agreement / boundary-misalignment), and only against bars with no
   `fact_pending_manual_resolution` row — anything already flagged pending from an earlier run is

@@ -191,6 +191,32 @@ GRANT SELECT ON staging_market_data_1min, fact_pending_manual_resolution, dim_fi
 Without this, `fetch_pending_resolution_bars` fails with a real Postgres `permission denied`, the
 same enforcement `docs/ARCHITECTURE.md` documents for the write side.
 
+## Granting `quant_writer` access to new tables
+
+Same gap as `quant_reader` above, on the write-role side: `quant_writer` doesn't automatically get
+access to a table created after its own grants were set up, even one `quant-ingest` itself needs to
+query. `quant-ingest --backfill` (croicu/quant-data#28) added `PostgresDatabase.fetch_dataset_inception_date`,
+which reads `dataset_inception` — a table added by migration `007`, after `quant_writer`'s original
+grants. Run this once, connected as the schema-owner role, against each environment that should run
+`--backfill`:
+
+```sql
+GRANT SELECT ON dataset_inception TO quant_writer;
+```
+
+`fetch_earliest_covered_date` needs no new grant — it only reads `staging_market_data_1min`,
+`fact_market_data_1min`, `dim_ticker`, and `dim_date`, all tables `quant_writer` already reads/writes
+via `quant-ingest`'s and `quant-reconcile`'s existing paths.
+
+`dataset_inception` itself is also still empty on the real database as of the migration that added
+it — insert the actual value once decided (connected as the schema-owner role):
+
+```sql
+INSERT INTO dataset_inception (inception_date) VALUES ('2020-01-01');
+```
+
+`quant-ingest --backfill` fails with a clear `AppError` (not a silent no-op) until this row exists.
+
 ## Populating real data
 
 `quant-ingest` fetches bars from Yahoo Finance over an inclusive date range and writes them into
@@ -208,6 +234,15 @@ quant-ingest --start-date 2026-01-15
 
 # Everything from settings (tickers + startDate/endDate) -- no flags at all
 quant-ingest
+
+# Catch up any partially-ingested trailing day (settings.catchUpLookbackDays)
+quant-ingest --catch-up
+
+# Walk every settings.tickers ticker one settings.backfillChunkDays chunk further back toward
+# dataset_inception.inception_date -- requires that table to have a row first (see the "Granting
+# quant_writer access to new tables" section above); run repeatedly (e.g. on a schedule) to walk
+# the whole configured universe back over time.
+quant-ingest --backfill
 ```
 
 `psql` (above) remains useful for direct verification/debugging, but isn't the only way to
