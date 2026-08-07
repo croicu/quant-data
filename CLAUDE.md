@@ -412,36 +412,18 @@ under `/local/` to the box:
   `fact_market_data_1min`, correctly feeding `fact_reconciliation_participant`'s existing
   reputation tracking with no changes needed there.
 
-- **File**: [Yahoo data sanitization](tasks/yahoo_data_sanitization.md)
-- **Status**: Brainstorm — the mechanism is now fully **implemented** (croicu/quant-data#32):
-  `reconcile/outlier_detection.py` (pure, unit-tested MAD-based reversal/trend check, intra-provider
-  only), `migrations/010_add_data_quality_thresholds` (per-(provider, ticker) coefficient overrides,
-  no rows seeded), and `quant-reconcile`'s new outlier-detection pass (runs before Tiers 1-4 so a
-  newly-rejected bar can auto-promote in the same run). Placement question resolved: reconcile time,
-  not ingest, specifically to sweep the existing stuck backlog retroactively. Depends on the
-  `incomplete: bool` → tri-state `data_quality` schema foundation (same #32) — breaking change to
-  public `OHLCV.incomplete`, announced cross-repo via croicu/quant-scratch#16 — plus
-  `MarketData.fetch_rejected_whistleblower_bars` (surfaces a rejected `yfinance` value even when it
-  auto-resolved via Tier 1 and never became pending). Migrations `009`/`010` written but **not yet
-  applied to the real database** (needs the repo owner via `psql` as `quant_data`); mechanism not
-  yet run against real data. Still open: **threshold validation** — the seed coefficients (3/6/4/8)
-  are still unfit gut values, now that the mechanism exists to actually validate them against the
-  622-bar backlog and the DataBento-confirmed cases. The earlier "remove vs. keep" tension is
-  unrelated to this and still unresolved, still depending on `ingestion_coverage`'s unfinished write
-  path if "remove" wins (12,061 `ibkr` rows already stuck the same way from ordinary coverage gaps,
-  ~20% of `staging_market_data_1min`).
-- **Key Context**: spawned from the same `SPY` investigation above. `yfinance`'s raw feed shows
-  sporadic single-field spikes (confirmed via 3-day candlestick comparison against `ibkr`'s smooth
-  curve) that drag an otherwise-agreeing bar's whole `field_group` comparison outside tolerance
-  (`_max_field_diff` takes the max across all 4 OHLC fields), producing false "stuck" bars needing
-  manual review even though `ibkr`'s own value was fine. Not yet quantified how much of the 622-bar
-  backlog (`DOG` especially) this same pattern explains. A second, independent occurrence
-  (`SPY` 2026-07-27 09:50/09:51 ET) was investigated 2026-08-05 and ruled out as a timestamp bug
-  (verified directly against `staging_market_data_1min` — `date_id`/`time_id`/`timestamp` all
-  consistent); the apparent "shift" in `tasks/Conflict - 2026-07-27.png` was price-continuity
-  coincidence plus `purge_staging_bar`'s candidate-only purge sparsifying `ibkr`'s staging rows,
-  not an ingest defect. That specific bar isn't itself a sanitization case (no single implausible
-  extreme field).
+- **File**: [Staging archive before purge](tasks/staging_archive_before_purge.md)
+- **Status**: Brainstorm, direction chosen — archive a `candidate` row to a new, never-pruned table
+  immediately before `purge_staging_bar` deletes it (over the simpler "just stop purging"
+  alternative), so the working `staging_market_data_1min` table stays lean and the existing
+  full-table sweeps (`_run_outlier_detection_pass`/`fetch_staging_rows_for_reconciliation`) don't
+  slow down as history accumulates. Schema/implementation details still open.
+- **Key Context**: direct consequence of `CLAUDE.md`'s own "No information loss during the data
+  processing stage" principle (added 2026-08-07) being violated in practice — investigating whether
+  `quant-reconcile` could be re-run against a "fresh" dataset found only 4,101 of 52,953 resolved
+  bars still had both providers' original staging rows intact; 41,913 had lost the `candidate` side
+  entirely, 6,939 had nothing left at all. The real disagreement evidence behind most already-
+  resolved history is already gone and unrecoverable without this.
 
 - **File**: [DataBento stuck-bar verification](tasks/databento_stuck_bar_verification.md)
 - **Status**: Brainstorm, not converged — several open questions (auto-tiebreaker vs.
@@ -715,3 +697,34 @@ under `/local/` to the box:
   by Claude or in `settings.local.json`) — Claude verified the result live and read-only via
   `quant_reader` both before applying (confirmed not yet applied) and after (confirmed the new key
   shape, seeded `dim_field` rows, and discarded `provider_pair_disagreement` rows).
+- **`yfinance` outlier-detection mechanism** — closed issue #32 (repo owner's call, confirmed
+  explicitly). `reconcile/outlier_detection.py`'s intra-provider MAD-based reversal/trend check
+  (pure, unit-tested, no DB access) plus `data_quality_thresholds` (migration 010, per-(provider,
+  ticker) coefficient overrides, no rows seeded) and `quant-reconcile`'s new outlier-detection pass
+  (runs before Tiers 1-4 so a newly-rejected bar's candidate can auto-promote in the same run).
+  Builds on #32's own tri-state `data_quality` schema foundation (`accepted`/`incomplete`/
+  `rejected` replacing the old boolean `incomplete`).
+
+  The seed coefficients (3/6/4/8) were never validated before real-data testing — the first live
+  run rejected 42.3% of whistleblower bars, confirmed by spot-check to be ordinary price ticks, not
+  outliers. Root cause: the original `± 2`-minute MAD window was self-contaminating (the target's
+  own diffs partly formed the reference scale judging them). Fixed by widening the window to
+  `± BACKGROUND_HALF_WINDOW_MINUTES` (20) and excluding the target from its own reference sample;
+  re-tuned globally on real data (`k_reversal_oc=300, k_trend_oc=600, k_reversal_hl=400,
+  k_trend_hl=800`) — no per-ticker exemption needed once fixed properly, resolving what had looked
+  like a genuine `DOG`-specific noise floor under the broken window.
+
+  A second real bug found live: the literal first/last bar of every session segment (9:30 open,
+  16:00 close) was structurally unevaluable — no legitimate same-segment neighbor on one side by
+  construction. Confirmed via a known-bad SPY 2026-07-29 16:00 ET tick (`high` frozen at 740.4873
+  while the real price fell ~$12) that survived every prior run. Fixed with a frozen, shared
+  reference window per segment tail (instead of shrinking per-bar as the edge approaches) plus a
+  one-sided check against a separately-calibrated `k_boundary_oc`/`k_boundary_hl` for bars with
+  only one usable neighbor — real-data calibration here put the confirmed case at the p99 ratio,
+  with ordinary boundary bars at p97.5 or below.
+
+  Final live result: 188/23,938 whistleblower bars rejected (0.79%), including all 3 original
+  DataBento-confirmed SPY cases, spot-checked clean of false positives after both fixes. Full
+  detail (numbers, methodology, what's explicitly out of scope) was in
+  `tasks/yahoo_data_sanitization.md` before its deletion per this file's "delete once the issue
+  closes" convention — see issue #32's comments for the same summary.
