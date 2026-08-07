@@ -7,6 +7,7 @@ import pytest
 
 from quant_data._internal.shared.errors import AppError, DateOutOfRangeError
 from quant_data._internal.shared.postgres import (
+    DataQualityThresholdRow,
     DisagreementStatsRow,
     FieldGroupRow,
     FieldRow,
@@ -344,6 +345,74 @@ def test_fetch_ingestion_coverage_returns_rows(mock_psycopg):
     coverage = database.fetch_ingestion_coverage()
 
     assert coverage == [IngestionCoverageRow(ticker_id=1, provider_id=2, start_date_id=10, end_date_id=14)]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_data_quality_thresholds_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(2, 1, 3.0, 6.0, 4.0, 8.0)]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    thresholds = database.fetch_data_quality_thresholds()
+
+    assert thresholds == [DataQualityThresholdRow(provider_id=2, ticker_id=1, k_reversal_oc=3.0, k_trend_oc=6.0, k_reversal_hl=4.0, k_trend_hl=8.0)]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_whistleblower_accepted_staging_rows_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, "accepted"),
+    ]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_reader", password="", dbname="quant_data")
+
+    rows = database.fetch_whistleblower_accepted_staging_rows()
+
+    assert rows == [
+        StagingRow(
+            ticker_id=1,
+            date_id=10,
+            time_id=20,
+            timestamp=datetime(2026, 7, 24, 13, 30),
+            provider_id=2,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=1000,
+            data_quality="accepted",
+        )
+    ]
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    call_args = mock_cursor.execute.call_args
+    assert call_args.args[1] == ("whistleblower", "accepted")
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_mark_staging_bars_rejected_commits_once_for_multiple_keys(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.mark_staging_bars_rejected([(2, 1, 10, 20), (2, 1, 10, 21), (2, 1, 10, 22)])
+
+    mock_connection.commit.assert_called_once()
+    mock_connection.rollback.assert_not_called()
+    assert mock_connection.cursor.return_value.__enter__.return_value.execute.call_count == 3
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_mark_staging_bars_rejected_empty_keys_is_a_noop(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.mark_staging_bars_rejected([])
+
+    mock_connection.commit.assert_not_called()
+    mock_connection.cursor.return_value.__enter__.return_value.execute.assert_not_called()
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")

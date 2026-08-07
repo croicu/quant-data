@@ -4,8 +4,10 @@ import argparse
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from datetime import time as time_type
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
@@ -30,6 +32,11 @@ from reconcile.algorithm import (
     stddev_from_stats,
     welford_update,
 )
+from reconcile.outlier_detection import BACKGROUND_HALF_WINDOW_MINUTES, OutlierBar, OutlierThresholds, is_bar_rejected
+
+_EASTERN = ZoneInfo("America/New_York")
+_MARKET_OPEN = time_type(9, 30)
+_MARKET_CLOSE = time_type(16, 0)
 
 CATEGORY_RECONCILE = "reconcile"
 
@@ -250,12 +257,120 @@ def _promote_and_lazily_purge(
         database.purge_staging_bar(ticker_id, date_id, time_id)
 
 
+def _session_segment(timestamp_utc: datetime) -> int:
+    """0 = premarket (before 9:30 ET), 1 = regular hours (9:30-16:00 ET inclusive), 2 =
+    after-hours (after 16:00 ET). staging_market_data_1min.timestamp is stored naive but is UTC
+    (docs/SCHEMA.md) -- must be tagged UTC before converting, or astimezone() would wrongly
+    assume the local system timezone."""
+    eastern_time = timestamp_utc.replace(tzinfo=timezone.utc).astimezone(_EASTERN).time()
+    if eastern_time < _MARKET_OPEN:
+        return 0
+    if eastern_time <= _MARKET_CLOSE:
+        return 1
+    return 2
+
+
+def _build_outlier_window(rows_by_time_id: dict[int, StagingRow], center_time_id: int, target_segment: int) -> dict[int, OutlierBar]:
+    """A +/-BACKGROUND_HALF_WINDOW_MINUTES window of same-session-segment bars centered on
+    center_time_id. Shared by both the normal per-bar (middle-of-session) case and the frozen
+    tail-window case below, which just calls this with an anchor time_id instead of the bar
+    actually being evaluated."""
+    window: dict[int, OutlierBar] = {}
+    for offset in range(-BACKGROUND_HALF_WINDOW_MINUTES, BACKGROUND_HALF_WINDOW_MINUTES + 1):
+        neighbor = rows_by_time_id.get(center_time_id + offset)
+        if neighbor is None:
+            continue
+        if _session_segment(neighbor.timestamp) != target_segment:
+            continue
+        window[neighbor.time_id] = OutlierBar(time_id=neighbor.time_id, open=neighbor.open, high=neighbor.high, low=neighbor.low, close=neighbor.close)
+    return window
+
+
+def _run_outlier_detection_pass(database: PostgresDatabase) -> int:
+    """Runs the intra-provider outlier check (reconcile/outlier_detection.py) over every
+    'accepted' whistleblower staging row, rejecting any bar it flags. Called before the Tier 1-4
+    pass so a newly-rejected bar gets the chance to auto-promote its candidate in the same
+    invocation (Tier 1 treats 'rejected' identically to 'incomplete'). Sweeps the entire staging
+    table every run, not just new data -- the only mechanism that can ever touch the pre-existing
+    stuck backlog, since ingest-time placement was ruled out for exactly that reason. Returns the
+    number of bars newly rejected this run.
+
+    Bars within the last/first BACKGROUND_HALF_WINDOW_MINUTES of a session segment (premarket,
+    regular, afterhours) don't get their own freshly-recentered window -- that would either shrink
+    as the segment edge approaches (a smaller, less trustworthy background sample right where a
+    real spike is most plausible) or need to reach past the segment boundary (never allowed, since
+    that would compare against a different session's regime -- a real step, not noise). Instead,
+    each segment's tail reuses one shared window anchored at the last position where a full
+    +/-BACKGROUND_HALF_WINDOW_MINUTES window still fits entirely inside that segment. The true
+    first/last bar of a segment still only has one usable immediate neighbor even with the frozen
+    window (its other side belongs to a different segment by construction) -- is_bar_rejected's
+    one-sided k_boundary_* path handles that case."""
+    thresholds_by_key: dict[tuple[int, int], OutlierThresholds] = {}
+    for threshold_row in database.fetch_data_quality_thresholds():
+        thresholds_by_key[(threshold_row.provider_id, threshold_row.ticker_id)] = OutlierThresholds(
+            k_reversal_oc=threshold_row.k_reversal_oc,
+            k_trend_oc=threshold_row.k_trend_oc,
+            k_reversal_hl=threshold_row.k_reversal_hl,
+            k_trend_hl=threshold_row.k_trend_hl,
+        )
+
+    rows_by_provider_ticker_date: dict[tuple[int, int, int], list[StagingRow]] = {}
+    for row in database.fetch_whistleblower_accepted_staging_rows():
+        key = (row.provider_id, row.ticker_id, row.date_id)
+        if key not in rows_by_provider_ticker_date:
+            rows_by_provider_ticker_date[key] = []
+        rows_by_provider_ticker_date[key].append(row)
+
+    rejected_keys: list[tuple[int, int, int, int]] = []
+    for (provider_id, ticker_id, date_id), day_rows in rows_by_provider_ticker_date.items():
+        rows_by_time_id: dict[int, StagingRow] = {}
+        for row in day_rows:
+            rows_by_time_id[row.time_id] = row
+
+        thresholds = thresholds_by_key.get((provider_id, ticker_id), OutlierThresholds())
+
+        rows_by_segment: dict[int, list[StagingRow]] = {}
+        for row in day_rows:
+            segment = _session_segment(row.timestamp)
+            if segment not in rows_by_segment:
+                rows_by_segment[segment] = []
+            rows_by_segment[segment].append(row)
+
+        for segment, segment_rows in rows_by_segment.items():
+            segment_time_ids = sorted(row.time_id for row in segment_rows)
+            segment_start = segment_time_ids[0]
+            segment_end = segment_time_ids[-1]
+
+            start_anchor = min(segment_end, segment_start + BACKGROUND_HALF_WINDOW_MINUTES)
+            end_anchor = max(segment_start, segment_end - BACKGROUND_HALF_WINDOW_MINUTES)
+            start_tail_window = _build_outlier_window(rows_by_time_id, start_anchor, segment)
+            end_tail_window = _build_outlier_window(rows_by_time_id, end_anchor, segment)
+
+            for row in segment_rows:
+                if row.time_id <= start_anchor:
+                    window = start_tail_window
+                elif row.time_id >= end_anchor:
+                    window = end_tail_window
+                else:
+                    window = _build_outlier_window(rows_by_time_id, row.time_id, segment)
+
+                if is_bar_rejected(window, target_time_id=row.time_id, thresholds=thresholds):
+                    rejected_keys.append((provider_id, ticker_id, date_id, row.time_id))
+
+    database.mark_staging_bars_rejected(rejected_keys)
+    return len(rejected_keys)
+
+
 def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple[int, int]:
     """Tiers 1-3 only, run per bar per not-yet-resolved field group; fetch_staging_rows_for_reconciliation
     already excludes anything with a fact_pending_manual_resolution row (tasks/quant_reconcile.md's
     "Updated (2026-08-03)" section), so this never re-touches a bar a prior run already gave up on.
     Anything still unresolved once the fixed-point loop below converges gets marked pending -- a
     new write path, since previously nothing was recorded for a stuck bar at all."""
+
+    rejected_count = _run_outlier_detection_pass(database)
+    if rejected_count:
+        Logger.info(f"quant-reconcile: outlier check rejected {rejected_count} whistleblower bar(s).", category=CATEGORY_RECONCILE)
 
     providers = database.fetch_dim_providers()
     providers_by_id: dict[int, ProviderRow] = {}

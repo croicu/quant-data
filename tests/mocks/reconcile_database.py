@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from quant_data._internal.shared.postgres import DisagreementStatsRow, FieldGroupRow, FieldRow, IngestionCoverageRow, ProviderRow, StagingRow
+from quant_data._internal.shared.postgres import (
+    DataQualityThresholdRow,
+    DisagreementStatsRow,
+    FieldGroupRow,
+    FieldRow,
+    IngestionCoverageRow,
+    ProviderRow,
+    StagingRow,
+)
 
 
 class FakeReconcileDatabase:
@@ -18,6 +26,7 @@ class FakeReconcileDatabase:
         fields: list[FieldRow] | None = None,
         disagreement_stats: list[DisagreementStatsRow] | None = None,
         ingestion_coverage: list[IngestionCoverageRow] | None = None,
+        data_quality_thresholds: list[DataQualityThresholdRow] | None = None,
     ) -> None:
         self.providers = providers
         self.field_groups = field_groups
@@ -28,6 +37,7 @@ class FakeReconcileDatabase:
             for stats in disagreement_stats:
                 self.disagreement_stats[(stats.provider_id, stats.ticker_id, stats.field_id)] = stats
         self.ingestion_coverage = ingestion_coverage if ingestion_coverage is not None else []
+        self.data_quality_thresholds = data_quality_thresholds if data_quality_thresholds is not None else []
 
         self.fact_reconciliation: list[tuple[int, int, int, int, int, str]] = []
         self.fact_reconciliation_participant: list[tuple[int, int, int, int, int, bool]] = []
@@ -49,6 +59,27 @@ class FakeReconcileDatabase:
 
     def fetch_ingestion_coverage(self) -> list[IngestionCoverageRow]:
         return list(self.ingestion_coverage)
+
+    def fetch_data_quality_thresholds(self) -> list[DataQualityThresholdRow]:
+        return list(self.data_quality_thresholds)
+
+    def fetch_whistleblower_accepted_staging_rows(self) -> list[StagingRow]:
+        whistleblower_provider_ids: set[int] = set()
+        for provider in self.providers:
+            if provider.role == "whistleblower":
+                whistleblower_provider_ids.add(provider.provider_id)
+
+        result: list[StagingRow] = []
+        for row in self.staging_rows:
+            if row.provider_id in whistleblower_provider_ids and row.data_quality == "accepted":
+                result.append(row)
+        return result
+
+    def mark_staging_bars_rejected(self, keys: list[tuple[int, int, int, int]]) -> None:
+        key_set = set(keys)
+        for row in self.staging_rows:
+            if (row.provider_id, row.ticker_id, row.date_id, row.time_id) in key_set:
+                row.data_quality = "rejected"
 
     def _pending_bar_keys(self) -> set[tuple[int, int, int]]:
         result: set[tuple[int, int, int]] = set()

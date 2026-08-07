@@ -44,8 +44,11 @@ coverage on every successful fetch) is still outstanding — see its own section
 `fact_market_data_1min.incomplete` (boolean) with a tri-state `data_quality` column (`accepted`/
 `incomplete`/`rejected`) — a breaking change to `quant_data`'s public `OHLCV.incomplete` field
 (now `OHLCV.data_quality: DataQuality`), laying the schema foundation for
-`tasks/yahoo_data_sanitization.md`'s per-provider outlier-rejection check (not yet implemented;
-no code path sets `rejected` yet).
+`tasks/yahoo_data_sanitization.md`'s per-provider outlier-rejection check.
+`010_add_data_quality_thresholds` added the per-(provider, ticker) coefficient table that check
+uses (see its own section below); `reconcile/outlier_detection.py` and `quant-reconcile`'s new
+outlier-detection pass (runs before Tiers 1-4, so a newly-rejected bar can auto-promote its
+candidate in the same invocation) are what actually set `data_quality = 'rejected'` now.
 Otherwise `fact_market_data_1min` remains the single golden, reconciled dataset every reader
 (`MarketData`) queries, regardless of which provider(s) a bar's value ultimately came from.
 
@@ -311,6 +314,29 @@ ticker's first real stats computation only ever happens over a full batch of act
 matched bars (see the per-ticker graduation design in
 [croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)), so there's no cold-start
 gap to seed in the first place.
+
+## `data_quality_thresholds`
+
+| Column | Type | Notes |
+|---|---|---|
+| `provider_id` | `INT NOT NULL` | FK → `dim_provider` |
+| `ticker_id` | `INT NOT NULL` | FK → `dim_ticker` |
+| `k_reversal_oc` | `NUMERIC NOT NULL` | MAD multiplier for `open`/`close`, reversal-shaped diffs (tight) |
+| `k_trend_oc` | `NUMERIC NOT NULL` | MAD multiplier for `open`/`close`, trend-shaped diffs (loose) |
+| `k_reversal_hl` | `NUMERIC NOT NULL` | MAD multiplier for `high`/`low`, reversal-shaped diffs (tight, but looser than OC) |
+| `k_trend_hl` | `NUMERIC NOT NULL` | MAD multiplier for `high`/`low`, trend-shaped diffs (loose, but looser than OC) |
+| `updated_at` | `TIMESTAMP` | Defaults to insert time |
+
+Primary key: `(provider_id, ticker_id)`. Added in `010_add_data_quality_thresholds`
+([croicu/quant-data#32](https://github.com/croicu/quant-data/issues/32)), no rows seeded — a
+missing `(provider, ticker)` falls back to `reconcile/outlier_detection.py`'s own
+`DEFAULT_K_*` constants (seed values `3`/`6`/`4`/`8` from the 2026-08-06 design session, not yet
+validated). Deliberately separate from `provider_pair_disagreement`: that table measures
+*cross-provider* disagreement (candidate vs. whistleblower) to set reconciliation tolerance; this
+one holds *intra-provider* plausibility coefficients (is a value implausible relative to its own
+series' recent neighbors) for the outlier-detection check that sets `data_quality = 'rejected'` —
+related concepts, deliberately not unified into one table. Only ever holds deliberately-tuned
+overrides, so this table can (and likely will) stay empty for a long time.
 
 ## `fact_pending_manual_resolution`
 

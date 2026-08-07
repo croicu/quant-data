@@ -447,6 +447,49 @@ the full design (field consistency groups, the candidate/whistleblower model, th
     fallback in this path anymore. Whatever's still unresolved once the fixed-point loop below
     converges gets a `fact_pending_manual_resolution` row inserted (a new write; previously nothing
     was recorded for a stuck bar at all) so every future plain run skips it.
+  - **Outlier-detection pass** (croicu/quant-data#32, `outlier_detection.py`) — runs first, before
+    any Tier 1-4 attempt. Pure logic (`is_bar_rejected`, directly unit-testable, no database
+    access — same split as `algorithm.py`) lives in its own module rather than `algorithm.py`
+    itself, since it's a genuinely different concept (intra-provider plausibility, never comparing
+    against another provider) from the rest of reconciliation. `_run_outlier_detection_pass` in
+    `cli.py` is the orchestration: bulk-fetches every `data_quality='accepted'` whistleblower
+    staging row (`fetch_whistleblower_accepted_staging_rows`) and every tuned
+    `data_quality_thresholds` override, groups by `(provider_id, ticker_id, date_id)`, then by
+    session segment (premarket/regular/afterhours, `_session_segment`, ET-converted from the
+    naive-UTC `timestamp` column) within each day.
+    - **MAD reference window: `± BACKGROUND_HALF_WINDOW_MINUTES` (20 minutes), the target's own
+      diffs excluded from the reference sample.** An earlier `± 2`-minute design (2026-08-06)
+      included the target's own back/forward diffs in the very MAD sample used to judge them —
+      self-contaminating in both directions: a genuinely large target move inflated its own
+      reference scale (masking real spikes), and two coincidentally similar background diffs
+      elsewhere could collapse the scale to near-zero (flagging ordinary noise). Real-data
+      recalibration (2026-08-07) against the confirmed DataBento-verified SPY cases fixed both by
+      widening the window and excluding the two target-touching diffs from the background sample
+      — see `tasks/yahoo_data_sanitization.md`'s recalibration section for the before/after numbers.
+    - **Session-boundary tail handling.** The last/first `BACKGROUND_HALF_WINDOW_MINUTES` of each
+      segment don't get their own freshly-recentered window (which would either shrink as the edge
+      approaches or need to reach past the boundary, comparing across a real regime change). Each
+      segment's tail instead reuses one shared "frozen" window anchored at the last position where
+      a full `± BACKGROUND_HALF_WINDOW_MINUTES` window still fits entirely inside that segment
+      (`_build_outlier_window`, called once per segment edge rather than once per bar). The literal
+      first/last bar of a segment still only has one usable immediate neighbor — its other side
+      belongs to a different segment by construction — which `is_bar_rejected` handles with a
+      one-sided check against a separate, real-data-calibrated `k_boundary_oc`/`k_boundary_hl`
+      threshold instead of skipping the bar outright (fixed 2026-08-07 after a confirmed bad SPY
+      16:00 ET tick was found un-evaluable under the two-sided-only design — see the task file).
+    - A field is flagged if its immediate backward/forward diff (or, at a one-sided boundary bar,
+      the single available diff) is large relative to the background MAD scale — a tight
+      coefficient when both diffs oppose (a reversal/spike shape), a loose one when they agree (a
+      persisting trend), or the dedicated boundary coefficient when only one side exists. A bar is
+      rejected if any of its four fields is flagged. Whatever's flagged gets
+      `mark_staging_bars_rejected` — one commit for the whole run's rejections regardless of count
+      (same batching lesson as croicu/quant-data#30). Sweeps the *entire* staging table every run,
+      not just new data, since this is the only mechanism that can ever touch bars already stuck
+      before the check existed — ingest-time placement was considered and rejected for exactly
+      that reason (see `tasks/yahoo_data_sanitization.md`). Running it first within the same pass
+      matters: `rejected` is treated identically to `incomplete` by `_resolve_completeness`, so a
+      bar newly rejected this run can still auto-promote its candidate in the very same invocation
+      instead of waiting for the next one.
   - **Whistleblower-absence handling** (croicu/quant-data#31) — a candidate-only bar_key (the
     whistleblower never wrote a row for that minute at all) is only genuinely ready for evaluation
     once `ingestion_coverage` confirms the whistleblower's date range was actually ingested; if not

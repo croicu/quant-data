@@ -1,6 +1,9 @@
 # Yahoo Data Sanitization
 
-## Status: Brainstorm
+## Status: Done — mechanism implemented, calibrated against real data, and live-verified
+(2026-08-07). See "Recalibration and session-boundary fix (2026-08-07)" below for the final
+summary. Tracked in croicu/quant-data#32 (opened by the repo owner — left open per `CLAUDE.md`'s
+"Who closes an issue" rule; a summary comment posted there, but closing is the opener's call).
 
 ## Problem statement
 
@@ -187,24 +190,92 @@ outlier pattern from the original 3-bar case remains the actual motivating evide
       never purged. No new `quant_reader` grant needed (reuses tables already granted for
       `fetch_pending_resolution_bars`). 195/195 tests pass.
 
+- **Resolved (2026-08-06): placement is reconcile time, not ingest.** `_run_outlier_detection_pass`
+  runs as the first step of `_run_automatic_pass`, before Tiers 1-4, so a bar rejected this run can
+  still auto-promote its candidate in the same invocation. Chosen specifically because it's the
+  only way to sweep the *existing* stuck backlog retroactively — ingest-time placement would only
+  ever touch new data going forward. (The original "t+1/t+2 doesn't exist yet at ingest time"
+  concern turned out not to actually be a blocker either way — `fetch_bars` returns a whole day at
+  once, so a single day's batch is self-sufficient for the window — but it didn't change the
+  retroactive-sweep conclusion.)
+- **Implemented (2026-08-06), croicu/quant-data#32**: `reconcile/outlier_detection.py` (pure,
+  unit-tested, no DB access — `is_bar_rejected`), `migrations/010_add_data_quality_thresholds.sql`
+  (per-(provider, ticker) coefficient overrides, no rows seeded, falls back to the module's
+  `DEFAULT_K_*` constants), new `PostgresDatabase.fetch_data_quality_thresholds`/
+  `fetch_whistleblower_accepted_staging_rows`/`mark_staging_bars_rejected` (batched, one commit).
+  209/209 tests pass, `ruff` clean. See `docs/ARCHITECTURE.md`'s `reconcile` section for the exact
+  window-building and session-transition-cut mechanics.
+
+## Recalibration and session-boundary fix (2026-08-07)
+
+The seed coefficients (3/6/4/8) were never validated before this session — the first real run
+against production data rejected **10,126 of 23,938 whistleblower bars (42.3%)**, confirmed by
+spot-check (SPY 2026-07-23 13:31-13:45) to be ordinary, internally-consistent price ticks, not
+outliers. Root cause: the `± 2`-minute MAD window was self-contaminating — a genuine target spike
+inflated its own reference scale, and two coincidentally similar background diffs elsewhere could
+collapse the scale to near-zero, producing wild ratio swings unrelated to actual plausibility.
+
+**Fix 1 — wider window, target excluded from its own reference.** Widened the background sample to
+`± BACKGROUND_HALF_WINDOW_MINUTES` (20 minutes) and excluded the two diffs touching the target
+itself from the MAD calculation, using only real *background* consecutive-pair diffs. Re-tuned
+globally on real data: `k_reversal_oc=300, k_trend_oc=600, k_reversal_hl=400, k_trend_hl=800`. This
+alone fixed a real false positive caught by eye (SPY 2026-07-31 10:47 ET, an ordinary uptrend
+candle that scored 87 under the old window purely from a coincidental near-zero MAD — the same
+bar scores ~2.2-2.9 under the new one) *and* resolved what had looked like `DOG`'s "genuine 20%+
+noise floor" under the old per-ticker-override approach — the inflated ratios there were largely
+the same self-contamination artifact, not real signal. No per-ticker exemption needed once fixed
+properly; the `data_quality_thresholds` override table stays empty.
+
+**Fix 2 — session-boundary blind spot.** The literal last/first bar of a session segment (9:30
+open, 16:00 close) was structurally unevaluable: `is_bar_rejected` required *both* immediate
+neighbors present, but a segment's true edge bar has no legitimate same-segment neighbor on one
+side by construction. Confirmed live: SPY 2026-07-29 16:00:00 ET (`high` frozen at 740.4873 while
+the real price fell to ~727) sat `accepted` through multiple runs specifically because 16:01 ET
+either belonged to a different segment or was `incomplete`. Fixed with two changes: (1) each
+segment's last/first `BACKGROUND_HALF_WINDOW_MINUTES` reuse one shared, frozen reference window
+(anchored at the last position a full window still fits) instead of shrinking per-bar as the edge
+approaches; (2) a bar with only one usable immediate neighbor is now evaluated one-sided against a
+dedicated `k_boundary_oc`/`k_boundary_hl` threshold instead of being skipped. Real-data calibration
+of the boundary thresholds (the only bars this path ever applies to) put the confirmed SPY 16:00
+case at the p99 ratio (~40 for `hl`), with ordinary boundary bars at p97.5 (~16) or below —
+`k_boundary_oc=20, k_boundary_hl=20` (`k_boundary_hl` lowered from an initial 25 after a *second*
+confirmed case, SPY 2026-07-28 16:00 ET, scored ~21 — just under 25, independently verified against
+DataBento well before this detector existed).
+
+**Final live result** (full reconstructed staging set, 108,918 whistleblower rows evaluated): 188
+rejected (0.79% of the accepted+rejected pool). All 3 of the original DataBento-confirmed SPY cases
+(07-28, 07-29, 07-30, all 16:00 ET) now correctly caught, plus one new unconfirmed SPY candidate
+(08-05 16:00 ET — flagged, not yet visually verified) and 185 across `DOG`/`RWM`/`SH`, sampled and
+confirmed to be genuine frozen-tick patterns (`open=high=low=close` held across the window). Zero
+false positives found in spot-checks after the fix; `SPY`/`QQQ`/`DIA`/`IWM` sit at 0-0.10%.
+
+Explicitly **not** covered by this mechanism: the two documented cross-provider tolerance-failure
+cases from `tasks/finalize_targeted_promotion.md` (SPY 2026-07-27 09:50/09:51 ET, SPY 2026-07-28
+09:30 ET) — both still sit unresolved in `fact_pending_manual_resolution`. This detector only
+catches shape anomalies *within* `yfinance`'s own series; a value that's wrong only *relative to*
+`ibkr` (nothing implausible about it in isolation) is a different failure mode, handled by Tier 2's
+existing per-field learned tolerance and (eventually) `finalize_targeted_promotion`'s targeted
+`--finalize`, not by this check.
+
 ## Open questions
 
-- **Exact threshold validation.** The four seed coefficients above (3/6/4/8) are unfit gut values —
-  needs to run against the 622-bar backlog and the already-confirmed DataBento-verified cases to
-  check false-positive/false-negative rates before treating them as settled.
-- **Where does the check live?** Ingest time (`providers/yfinance.py`) vs. a dedicated step in
-  `reconcile`'s automatic pass. The `t+1`/`t+2` dependency (needs bars that don't exist yet at
-  ingest time for the current minute) points toward the reconcile pass, which also gets
-  retroactive-sweep capability over the existing backlog for free — not yet formally decided.
-- **Quantify the actual impact first.** Not yet checked how much of the 622-bar backlog (`DOG`
-  especially, 499 stuck) this same single-bad-field pattern explains vs. genuine multi-field
-  disagreement — would sharpen whether this is a small cleanup or a significant chunk of the
-  backlog's real cause, and doubles as the validation dataset for the threshold question above.
+- **Quantify the actual impact on the 622-bar backlog.** Not yet checked how much of the original
+  stuck-bar backlog (`DOG` especially) this pattern explains vs. genuine multi-field disagreement.
+- **The 2026-08-05 SPY 16:00 ET candidate** flagged by the recalibrated boundary check hasn't been
+  visually confirmed the way the three original DataBento cases were — worth a candlestick check
+  before treating it as validated.
 
 ## Implementation plan
 
-<!-- Not started -- pending the open questions above. -->
+Done — mechanism, recalibration, and session-boundary fix all implemented and live-verified. No
+further mechanism work planned; only the open questions above remain.
 
 ## Test results
 
-<!-- Not started. -->
+Full unit suite passes (`tests/unit/test_outlier_detection.py`'s pure-algorithm cases — reversal
+vs. trend, one-sided boundary checks, missing-neighbor handling, per-field independence, custom
+thresholds — plus `test_reconcile_cli.py`'s end-to-end orchestration cases), `ruff format`/
+`ruff check` clean. Live-verified against the real database end-to-end, including a full
+staging-only reconstruction (`fact_market_data_1min` restored to staging and re-cleared to
+simulate a from-scratch reconcile run) to get a clean, complete before/after comparison across the
+whole recalibration.

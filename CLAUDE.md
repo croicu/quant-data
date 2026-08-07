@@ -245,6 +245,35 @@ pytest tests/unit/test_foo.py::test_bar   # single test
   from `quant_data.create_postgres_provider` (defaults to `quant_reader`), not `PostgresDatabase`
   directly.
 
+## Data Pipeline Principles
+
+**No information loss during the data processing stage — everything downstream of ingest must
+stay re-creatable from `staging_market_data_1min` alone.** Ingest is the only stage that talks to
+external providers; every later stage (`quant-reconcile`'s Tier 1-4 resolution,
+`fact_market_data_1min`, `fact_reconciliation`/`fact_reconciliation_participant`,
+`provider_pair_disagreement`) is a *derived* view of staging and must remain reproducible from it
+without re-ingesting.
+
+**Why**: surfaced concretely on 2026-08-07, investigating whether `quant-reconcile` could be
+re-run against a "fresh" dataset without actually re-running `quant-ingest`. The existing lazy-purge
+mechanism (`_promote_and_lazily_purge` / `purge_staging_bar`) already deletes a bar's per-provider
+staging rows once resolved and no longer needed as a Tier-3 neighbor — so for the 6,939 bars where
+the whistleblower was ever confirmed absent (croicu/quant-data#31) and a further ~41,913 bars where
+only the winning provider's row survived, the original raw per-provider disagreement is already
+gone. Moving `fact_market_data_1min` back into `staging_market_data_1min` could only reconstruct
+the winner's own value (and only by assuming which provider that was), never a genuine
+two-provider comparison — meaning `fact_reconciliation`'s own resolution can no longer actually be
+re-derived from staging for those bars. That's a direct violation of this principle, and it was
+only discovered because testing the outlier-detection recalibration needed a truly fresh run.
+
+**How to apply**: any future change to what gets purged, archived, or deleted from
+`staging_market_data_1min` (or any replacement for the lazy-purge mechanism) must be checked
+against this rule before shipping — if deleting a row would make it impossible to regenerate
+`fact_market_data_1min`/`fact_reconciliation` from staging alone, don't delete it outright; archive
+it instead (e.g., a raw, append-only, provider-tagged log mirroring what staging captured before
+any purge, distinct from staging's own prunable working copy). Reconciling `purge_staging_bar`'s
+current behavior against this rule is itself a real follow-up — not yet scoped as its own task.
+
 ## Git Remotes
 
 Two remotes exist for this repo, serving different purposes:
@@ -384,21 +413,23 @@ under `/local/` to the box:
   reputation tracking with no changes needed there.
 
 - **File**: [Yahoo data sanitization](tasks/yahoo_data_sanitization.md)
-- **Status**: Brainstorm — outlier definition converged in a 2026-08-06 design session (intra-provider
-  MAD-based reversal/trend check, session-boundary-aware, per-ticker DB-stored thresholds — seed
-  coefficients unvalidated). The `incomplete: bool` → tri-state `data_quality` (`accepted`/
-  `incomplete`/`rejected`) schema foundation this depends on was split out and **implemented**
-  (croicu/quant-data#32, `status:implementation`) — breaking change to public `OHLCV.incomplete`,
-  announced cross-repo via croicu/quant-scratch#16; migration `009` written but **not yet applied to
-  the real database** (needs the repo owner via `psql` as `quant_data`); no code path sets `rejected`
-  yet, just the foundation. Same issue also added `MarketData.fetch_rejected_whistleblower_bars` —
-  surfaces a rejected `yfinance` value even when it auto-resolved via Tier 1 and never became
-  pending, which `fetch_pending_resolution_bars` alone can't show. Still open on the
-  outlier-detection feature itself: threshold validation
-  against the 622-bar backlog, whether the check lives at ingest or reconcile time. The earlier
-  "remove vs. keep" tension is still unresolved too, and still depends on `ingestion_coverage`'s
-  unfinished write path if "remove" wins (12,061 `ibkr` rows already stuck the same way from
-  ordinary coverage gaps, ~20% of `staging_market_data_1min`).
+- **Status**: Brainstorm — the mechanism is now fully **implemented** (croicu/quant-data#32):
+  `reconcile/outlier_detection.py` (pure, unit-tested MAD-based reversal/trend check, intra-provider
+  only), `migrations/010_add_data_quality_thresholds` (per-(provider, ticker) coefficient overrides,
+  no rows seeded), and `quant-reconcile`'s new outlier-detection pass (runs before Tiers 1-4 so a
+  newly-rejected bar can auto-promote in the same run). Placement question resolved: reconcile time,
+  not ingest, specifically to sweep the existing stuck backlog retroactively. Depends on the
+  `incomplete: bool` → tri-state `data_quality` schema foundation (same #32) — breaking change to
+  public `OHLCV.incomplete`, announced cross-repo via croicu/quant-scratch#16 — plus
+  `MarketData.fetch_rejected_whistleblower_bars` (surfaces a rejected `yfinance` value even when it
+  auto-resolved via Tier 1 and never became pending). Migrations `009`/`010` written but **not yet
+  applied to the real database** (needs the repo owner via `psql` as `quant_data`); mechanism not
+  yet run against real data. Still open: **threshold validation** — the seed coefficients (3/6/4/8)
+  are still unfit gut values, now that the mechanism exists to actually validate them against the
+  622-bar backlog and the DataBento-confirmed cases. The earlier "remove vs. keep" tension is
+  unrelated to this and still unresolved, still depending on `ingestion_coverage`'s unfinished write
+  path if "remove" wins (12,061 `ibkr` rows already stuck the same way from ordinary coverage gaps,
+  ~20% of `staging_market_data_1min`).
 - **Key Context**: spawned from the same `SPY` investigation above. `yfinance`'s raw feed shows
   sporadic single-field spikes (confirmed via 3-day candlestick comparison against `ibkr`'s smooth
   curve) that drag an otherwise-agreeing bar's whole `field_group` comparison outside tolerance

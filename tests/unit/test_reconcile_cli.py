@@ -131,6 +131,90 @@ def test_completeness_resolves_yahoo_premarket_gap():
         assert resolution_path == "completeness"
 
 
+def _quiet_yfinance_window(target_time_id: int, diff_back: float, diff_fwd: float, half_span: int = 15) -> list[StagingRow]:
+    """A wide (2*half_span+1 bar) background of yfinance staging rows around target_time_id, with
+    an alternating 0.01/0.02 close-step (so the MAD-based reference scale used by
+    reconcile/outlier_detection.py is a genuine small positive number, matching
+    tests/unit/test_outlier_detection.py's _quiet_window) and the target's own back/forward diffs
+    overridden to diff_back/diff_fwd. reconcile/cli.py's outlier pass now builds a
+    +/-BACKGROUND_HALF_WINDOW_MINUTES window, so this needs to be at least that wide to actually
+    exercise real background data rather than the insufficient-sample skip."""
+    base_timestamp = datetime(2026, 7, 24, 14, 0)
+    values: dict[int, float] = {}
+    value = 100.0
+    step_toggle = True
+    for time_id in range(target_time_id - half_span, target_time_id):
+        values[time_id] = value
+        value += 0.01 if step_toggle else 0.02
+        step_toggle = not step_toggle
+    back_one_value = values[target_time_id - 1]
+    target_value = back_one_value + diff_back
+    values[target_time_id] = target_value
+    fwd_one_value = target_value + diff_fwd
+    values[target_time_id + 1] = fwd_one_value
+    value = fwd_one_value
+    step_toggle = True
+    for time_id in range(target_time_id + 2, target_time_id + half_span + 1):
+        value += 0.01 if step_toggle else 0.02
+        step_toggle = not step_toggle
+        values[time_id] = value
+
+    rows: list[StagingRow] = []
+    for time_id, close in values.items():
+        timestamp = base_timestamp + timedelta(minutes=(time_id - target_time_id))
+        rows.append(_staging_row(YFINANCE, time_id=time_id, timestamp=timestamp, close=close))
+    return rows
+
+
+def test_outlier_detection_rejects_whistleblower_bar_and_candidate_still_promotes():
+    # A yfinance reversal spike at time_id=102 (same shape/magnitude validated in
+    # tests/unit/test_outlier_detection.py's test_reversal_spike_is_rejected) should get marked
+    # rejected by the outlier pass, then -- since rejected is treated exactly like incomplete --
+    # Tier 1 should auto-promote ibkr's own clean value for that bar in the very same run.
+    base_timestamp = datetime(2026, 7, 24, 14, 0)
+    staging_rows = _quiet_yfinance_window(target_time_id=102, diff_back=3.0, diff_fwd=-3.0)
+    staging_rows.append(
+        _staging_row(IBKR, time_id=102, timestamp=base_timestamp + timedelta(minutes=2), open=50.0, high=51.0, low=49.0, close=50.5, volume=500)
+    )
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    database = FakeReconcileDatabase(PROVIDERS, FIELD_GROUPS, staging_rows, fields=FIELDS, disagreement_stats=disagreement_stats)
+
+    resolved, stuck = run_reconciliation(database, _settings(), finalize=False)
+
+    yfinance_row_at_102 = None
+    for row in database.staging_rows:
+        if row.provider_id == YFINANCE and row.time_id == 102:
+            yfinance_row_at_102 = row
+    assert yfinance_row_at_102 is not None
+    assert yfinance_row_at_102.data_quality == "rejected"
+
+    # ibkr's own clean value promoted via Tier 1 completeness (rejected treated like incomplete).
+    fact_row = database.fact_market_data[(1, 10, 102)]
+    _timestamp, open_, high, low, close, volume, _data_quality = fact_row
+    assert (open_, high, low, close, volume) == (50.0, 51.0, 49.0, 50.5, 500)
+    resolution_paths_for_102 = []
+    for ticker_id, date_id, time_id, _field_group_id, _winning_provider_id, resolution_path in database.fact_reconciliation:
+        if time_id == 102:
+            resolution_paths_for_102.append(resolution_path)
+    assert resolution_paths_for_102 == ["completeness"]
+
+
+def test_outlier_detection_leaves_normal_bars_accepted():
+    staging_rows = [
+        _staging_row(YFINANCE, time_id=100, timestamp=datetime(2026, 7, 24, 14, 0), close=100.00),
+        _staging_row(YFINANCE, time_id=101, timestamp=datetime(2026, 7, 24, 14, 1), close=100.01),
+        _staging_row(YFINANCE, time_id=102, timestamp=datetime(2026, 7, 24, 14, 2), close=100.02),
+        _staging_row(YFINANCE, time_id=103, timestamp=datetime(2026, 7, 24, 14, 3), close=100.03),
+        _staging_row(YFINANCE, time_id=104, timestamp=datetime(2026, 7, 24, 14, 4), close=100.04),
+    ]
+    database = FakeReconcileDatabase(PROVIDERS, FIELD_GROUPS, staging_rows, fields=FIELDS)
+
+    run_reconciliation(database, _settings(), finalize=False)
+
+    for row in database.staging_rows:
+        assert row.data_quality == "accepted"
+
+
 def test_bar_missing_a_configured_provider_is_left_alone():
     staging_rows = [_staging_row(IBKR)]  # yfinance never reported for this bar
 

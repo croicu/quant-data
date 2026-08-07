@@ -72,6 +72,16 @@ class DisagreementStatsRow:
     running_m2: float
 
 
+@dataclass
+class DataQualityThresholdRow:
+    provider_id: int
+    ticker_id: int
+    k_reversal_oc: float
+    k_trend_oc: float
+    k_reversal_hl: float
+    k_trend_hl: float
+
+
 class PostgresDatabase:
     """Concrete MarketDataProvider implementation, plus a write path used only by ingest.
 
@@ -510,6 +520,96 @@ class PostgresDatabase:
                 )
             )
         return result
+
+    def fetch_data_quality_thresholds(self) -> list[DataQualityThresholdRow]:
+        """Every deliberately-tuned (provider, ticker) override for the outlier-detection check
+        (reconcile/outlier_detection.py) -- small, bulk-fetched once per reconcile run. A
+        (provider, ticker) with no row here uses the module's own DEFAULT_K_* constants."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT provider_id, ticker_id, k_reversal_oc, k_trend_oc, k_reversal_hl, k_trend_hl FROM data_quality_thresholds")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch data_quality_thresholds: {error}") from error
+
+        result: list[DataQualityThresholdRow] = []
+        for provider_id, ticker_id, k_reversal_oc, k_trend_oc, k_reversal_hl, k_trend_hl in rows:
+            result.append(
+                DataQualityThresholdRow(
+                    provider_id=provider_id,
+                    ticker_id=ticker_id,
+                    k_reversal_oc=float(k_reversal_oc),
+                    k_trend_oc=float(k_trend_oc),
+                    k_reversal_hl=float(k_reversal_hl),
+                    k_trend_hl=float(k_trend_hl),
+                )
+            )
+        return result
+
+    def fetch_whistleblower_accepted_staging_rows(self) -> list[StagingRow]:
+        """Every staging_market_data_1min row from a whistleblower provider with
+        data_quality='accepted' -- the candidate pool for the outlier-detection check. Scoped to
+        'accepted' only: an already-incomplete row (e.g. a real zero-volume placeholder) has no
+        meaningful OHLC pattern to judge plausibility from, and re-flagging an already-rejected
+        row is a no-op. Bulk-fetched once per reconcile run; the caller groups by (ticker_id,
+        date_id) and walks each day in time_id order to build windows in memory."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT s.ticker_id, s.date_id, s.time_id, s.timestamp, s.provider_id,
+                           s.open, s.high, s.low, s.close, s.volume, s.data_quality
+                    FROM staging_market_data_1min s
+                    JOIN dim_provider p ON p.provider_id = s.provider_id
+                    WHERE p.role = %s AND s.data_quality = %s
+                    ORDER BY s.ticker_id, s.date_id, s.time_id
+                    """,
+                    (ProviderRole.WHISTLEBLOWER.value, DataQuality.ACCEPTED.value),
+                )
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch whistleblower accepted staging rows: {error}") from error
+
+        result: list[StagingRow] = []
+        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, data_quality in rows:
+            result.append(
+                StagingRow(
+                    ticker_id=ticker_id,
+                    date_id=date_id,
+                    time_id=time_id,
+                    timestamp=timestamp,
+                    provider_id=provider_id,
+                    open=float(open_),
+                    high=float(high),
+                    low=float(low),
+                    close=float(close),
+                    volume=int(volume),
+                    data_quality=data_quality,
+                )
+            )
+        return result
+
+    def mark_staging_bars_rejected(self, keys: list[tuple[int, int, int, int]]) -> None:
+        """Sets data_quality='rejected' for every (provider_id, ticker_id, date_id, time_id) key
+        given, in one transaction (one commit regardless of row count -- see croicu/quant-data#30
+        for why that matters at scale)."""
+        if not keys:
+            return
+        try:
+            with self._connection.cursor() as cursor:
+                for provider_id, ticker_id, date_id, time_id in keys:
+                    cursor.execute(
+                        """
+                        UPDATE staging_market_data_1min
+                        SET data_quality = %s
+                        WHERE provider_id = %s AND ticker_id = %s AND date_id = %s AND time_id = %s
+                        """,
+                        (DataQuality.REJECTED.value, provider_id, ticker_id, date_id, time_id),
+                    )
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to mark {len(keys)} staging bar(s) rejected: {error}") from error
 
     def fetch_ingestion_coverage(self) -> list[IngestionCoverageRow]:
         """Every contiguous ingested date range for every (ticker, provider) pair
