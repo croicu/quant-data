@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 import pandas
 import yfinance
 
-from quant_data.protocols import OHLCV
+from quant_data.protocols import OHLCV, DataQuality
 
 from ..diagnostics import Logger
 from ..errors import AppError
@@ -74,7 +74,7 @@ class YahooFinanceIntraDay:
                 low=low_value,
                 close=close_value,
                 volume=volume_value,
-                incomplete=incomplete,
+                data_quality=DataQuality.INCOMPLETE if incomplete else DataQuality.ACCEPTED,
             )
             bars.append(bar)
 

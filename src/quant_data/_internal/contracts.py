@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Protocol
 
-from quant_data.protocols import OHLCV, PendingResolutionBar
+from quant_data.protocols import OHLCV, PendingResolutionBar, RejectedWhistleblowerBar
 
 
 class MarketDataProvider(Protocol):
@@ -26,6 +26,14 @@ class MarketDataProvider(Protocol):
         range -- one entry per (bar, field group, provider) that reported a staging value, so a
         caller can see the actual disagreement instead of just that a bar is stuck. Read-only,
         same contract shape as fetch_bars."""
+        ...
+
+    def fetch_rejected_whistleblower_bars(self, ticker: str, start_date: date, end_date: date) -> list[RejectedWhistleblowerBar]:
+        """Read every whistleblower-reported staging value with data_quality=REJECTED, for a
+        ticker over an inclusive date range -- distinct from fetch_pending_resolution_bars, since
+        a rejected whistleblower value with an accepted candidate auto-resolves via Tier 1 and
+        never reaches fact_pending_manual_resolution at all. Read-only, same contract shape as
+        fetch_bars."""
         ...
 
     def close(self) -> None:

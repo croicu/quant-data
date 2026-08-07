@@ -13,6 +13,8 @@ from quant_data._internal.shared.postgres import PostgresDatabase, ProviderRow, 
 from quant_data._internal.shared.settings import PostgresSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
 from reconcile.algorithm import (
+    DATA_QUALITY_ACCEPTED,
+    DATA_QUALITY_INCOMPLETE,
     FIELD_GROUP_OHLC,
     GRADUATION_THRESHOLD_MATCHED_BARS,
     RESOLUTION_AGREEMENT,
@@ -94,7 +96,7 @@ def _to_provider_bar(row: StagingRow, provider: ProviderRow) -> ProviderBar:
         low=row.low,
         close=row.close,
         volume=row.volume,
-        incomplete=row.incomplete,
+        data_quality=row.data_quality,
     )
 
 
@@ -125,7 +127,7 @@ def _is_matched_bar(rows: list[StagingRow], expected_provider_count: int) -> boo
     if len(rows) != expected_provider_count:
         return False
     for row in rows:
-        if row.incomplete:
+        if row.data_quality != DATA_QUALITY_ACCEPTED:
             return False
     return True
 
@@ -149,7 +151,7 @@ def _synthetic_absent_whistleblower_bar(provider: ProviderRow) -> ProviderBar:
         low=0.0,
         close=0.0,
         volume=0,
-        incomplete=True,
+        data_quality=DATA_QUALITY_INCOMPLETE,
     )
 
 
@@ -240,7 +242,7 @@ def _promote_and_lazily_purge(
             ohlc_row.low,
             ohlc_row.close,
             ohlc_row.volume,
-            ohlc_row.incomplete,
+            ohlc_row.data_quality,
         )
 
         if _bar_still_needed_as_neighbor(ticker_id, ohlc_row.timestamp, bar_key_by_ticker_timestamp, resolved_by_bar, all_field_group_ids):

@@ -35,7 +35,7 @@ def _bar(
     low: float = 99.0,
     close: float = 100.5,
     volume: float = 1000,
-    incomplete: bool = False,
+    data_quality: str = "accepted",
 ) -> ProviderBar:
     return ProviderBar(
         provider_id=provider_id,
@@ -46,14 +46,14 @@ def _bar(
         low=low,
         close=close,
         volume=volume,
-        incomplete=incomplete,
+        data_quality=data_quality,
     )
 
 
 def test_completeness_promotes_candidate_when_whistleblower_incomplete():
     bars = [
         _bar(IBKR, ROLE_CANDIDATE),
-        _bar(YFINANCE, ROLE_WHISTLEBLOWER, incomplete=True),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, data_quality="incomplete"),
     ]
 
     resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: _uniform_tolerance(0.001)}, k=3.0, preferred_provider_id=None)
@@ -68,7 +68,7 @@ def test_completeness_does_not_resolve_when_candidate_incomplete():
     # falls through (to agreement, which also fails here since the candidate's garbage value
     # genuinely diverges from the whistleblower's).
     bars = [
-        _bar(IBKR, ROLE_CANDIDATE, open_=0.0, high=0.0, low=0.0, close=0.0, incomplete=True),
+        _bar(IBKR, ROLE_CANDIDATE, open_=0.0, high=0.0, low=0.0, close=0.0, data_quality="incomplete"),
         _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
     ]
 
@@ -208,7 +208,7 @@ def test_agreement_tie_breaks_via_preferred_provider():
             low=99.0,
             close=100.5,
             volume=1000,
-            incomplete=False,
+            data_quality="accepted",
         ),
         _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
     ]

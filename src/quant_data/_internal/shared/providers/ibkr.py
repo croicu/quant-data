@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from ib_async import IB, StartupFetchNONE, Stock
 
-from quant_data.protocols import OHLCV
+from quant_data.protocols import OHLCV, DataQuality
 
 from ..diagnostics import Logger
 from ..errors import AppError
@@ -113,7 +113,7 @@ class IBKRIntraDay:
                 # Unlike Yahoo, IBKR only returns bars it actually has trade data for -- no
                 # synthetic/NaN placeholder rows -- so no zero-volume-as-incomplete heuristic
                 # applies here; a zero-volume bar is a real "no trades that minute" fact.
-                incomplete=False,
+                data_quality=DataQuality.ACCEPTED,
             )
             bars.append(bar)
 

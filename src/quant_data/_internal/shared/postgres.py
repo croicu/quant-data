@@ -7,7 +7,7 @@ from datetime import date, datetime
 import psycopg
 
 from quant_data._internal.contracts import ConnectionTransport
-from quant_data.protocols import OHLCV, LoggingSink, PendingResolutionBar, ProviderRole
+from quant_data.protocols import OHLCV, DataQuality, LoggingSink, PendingResolutionBar, ProviderRole, RejectedWhistleblowerBar
 
 from .diagnostics import Logger
 from .errors import AppError, DateOutOfRangeError
@@ -59,7 +59,7 @@ class StagingRow:
     low: float
     close: float
     volume: int
-    incomplete: bool
+    data_quality: str
 
 
 @dataclass
@@ -137,7 +137,7 @@ class PostgresDatabase:
         normalized_ticker = ticker.upper()
 
         query = """
-            SELECT t.ticker, f.timestamp, f.open, f.high, f.low, f.close, f.volume, f.incomplete
+            SELECT t.ticker, f.timestamp, f.open, f.high, f.low, f.close, f.volume, f.data_quality
             FROM fact_market_data_1min f
             JOIN dim_ticker t ON t.ticker_id = f.ticker_id
             JOIN dim_date d ON d.date_id = f.date_id
@@ -156,7 +156,7 @@ class PostgresDatabase:
 
         bars: list[OHLCV] = []
         for row in rows:
-            row_ticker, row_timestamp, row_open, row_high, row_low, row_close, row_volume, row_incomplete = row
+            row_ticker, row_timestamp, row_open, row_high, row_low, row_close, row_volume, row_data_quality = row
             bar = OHLCV(
                 ticker=row_ticker,
                 timestamp=row_timestamp,
@@ -165,7 +165,7 @@ class PostgresDatabase:
                 low=float(row_low),
                 close=float(row_close),
                 volume=int(row_volume),
-                incomplete=bool(row_incomplete),
+                data_quality=DataQuality(row_data_quality),
             )
             bars.append(bar)
 
@@ -175,7 +175,7 @@ class PostgresDatabase:
         normalized_ticker = ticker.upper()
 
         query = """
-            SELECT t.ticker, s.timestamp, g.name, p.name, p.role, s.open, s.high, s.low, s.close, s.volume, s.incomplete
+            SELECT t.ticker, s.timestamp, g.name, p.name, p.role, s.open, s.high, s.low, s.close, s.volume, s.data_quality
             FROM fact_pending_manual_resolution fpmr
             JOIN dim_ticker t ON t.ticker_id = fpmr.ticker_id
             JOIN dim_date d ON d.date_id = fpmr.date_id
@@ -200,7 +200,7 @@ class PostgresDatabase:
 
         candidates: list[PendingResolutionBar] = []
         for row in rows:
-            row_ticker, row_timestamp, row_field_group, row_provider, row_role, row_open, row_high, row_low, row_close, row_volume, row_incomplete = row
+            row_ticker, row_timestamp, row_field_group, row_provider, row_role, row_open, row_high, row_low, row_close, row_volume, row_data_quality = row
             bar = OHLCV(
                 ticker=row_ticker,
                 timestamp=row_timestamp,
@@ -209,11 +209,58 @@ class PostgresDatabase:
                 low=float(row_low),
                 close=float(row_close),
                 volume=int(row_volume),
-                incomplete=bool(row_incomplete),
+                data_quality=DataQuality(row_data_quality),
             )
             candidates.append(PendingResolutionBar(field_group=row_field_group, provider=row_provider, role=ProviderRole(row_role), bar=bar))
 
         return candidates
+
+    def fetch_rejected_whistleblower_bars(self, ticker: str, start_date: date, end_date: date) -> list[RejectedWhistleblowerBar]:
+        """Every staging_market_data_1min row from a whistleblower provider with
+        data_quality='rejected' -- distinct from fetch_pending_resolution_bars, since a rejected
+        whistleblower value with an accepted candidate auto-resolves via Tier 1 completeness and
+        never reaches fact_pending_manual_resolution at all. Finds it regardless of resolution
+        outcome because whistleblower rows are never purged (see purge_staging_bar)."""
+        normalized_ticker = ticker.upper()
+
+        query = """
+            SELECT t.ticker, s.timestamp, p.name, s.open, s.high, s.low, s.close, s.volume, s.data_quality
+            FROM staging_market_data_1min s
+            JOIN dim_ticker t ON t.ticker_id = s.ticker_id
+            JOIN dim_date d ON d.date_id = s.date_id
+            JOIN dim_provider p ON p.provider_id = s.provider_id
+            WHERE t.ticker = %s AND d.date BETWEEN %s AND %s
+              AND p.role = %s AND s.data_quality = %s
+            ORDER BY s.timestamp
+        """
+
+        started = time.perf_counter()
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(query, (normalized_ticker, start_date, end_date, ProviderRole.WHISTLEBLOWER.value, DataQuality.REJECTED.value))
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch rejected whistleblower bars for '{normalized_ticker}' from {start_date} to {end_date}: {error}") from error
+        self._logger.perf(
+            f"fetch_rejected_whistleblower_bars({normalized_ticker}, {start_date.isoformat()}..{end_date.isoformat()})", time.perf_counter() - started
+        )
+
+        result: list[RejectedWhistleblowerBar] = []
+        for row in rows:
+            row_ticker, row_timestamp, row_provider, row_open, row_high, row_low, row_close, row_volume, row_data_quality = row
+            bar = OHLCV(
+                ticker=row_ticker,
+                timestamp=row_timestamp,
+                open=float(row_open),
+                high=float(row_high),
+                low=float(row_low),
+                close=float(row_close),
+                volume=int(row_volume),
+                data_quality=DataQuality(row_data_quality),
+            )
+            result.append(RejectedWhistleblowerBar(provider=row_provider, bar=bar))
+
+        return result
 
     def _resolve_dimension_ids(self, cursor: psycopg.Cursor, bar: OHLCV) -> tuple[int, int, int]:
         normalized_ticker = bar.ticker.upper()
@@ -257,7 +304,7 @@ class PostgresDatabase:
                     cursor.execute(
                         """
                         INSERT INTO fact_market_data_1min
-                            (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, incomplete)
+                            (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (ticker_id, date_id, time_id) DO UPDATE SET
                             open = EXCLUDED.open,
@@ -266,7 +313,7 @@ class PostgresDatabase:
                             close = EXCLUDED.close,
                             volume = EXCLUDED.volume,
                             timestamp = EXCLUDED.timestamp,
-                            incomplete = EXCLUDED.incomplete
+                            data_quality = EXCLUDED.data_quality
                         """,
                         (
                             ticker_id,
@@ -278,7 +325,7 @@ class PostgresDatabase:
                             bar.close,
                             bar.volume,
                             bar.timestamp,
-                            bar.incomplete,
+                            bar.data_quality.value,
                         ),
                     )
                     written += 1
@@ -312,7 +359,7 @@ class PostgresDatabase:
                     cursor.execute(
                         """
                         INSERT INTO staging_market_data_1min
-                            (provider_id, ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, incomplete)
+                            (provider_id, ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (provider_id, ticker_id, date_id, time_id) DO UPDATE SET
                             open = EXCLUDED.open,
@@ -321,7 +368,7 @@ class PostgresDatabase:
                             close = EXCLUDED.close,
                             volume = EXCLUDED.volume,
                             timestamp = EXCLUDED.timestamp,
-                            incomplete = EXCLUDED.incomplete
+                            data_quality = EXCLUDED.data_quality
                         """,
                         (
                             provider_id,
@@ -334,7 +381,7 @@ class PostgresDatabase:
                             bar.close,
                             bar.volume,
                             bar.timestamp,
-                            bar.incomplete,
+                            bar.data_quality.value,
                         ),
                     )
                     written += 1
@@ -498,7 +545,7 @@ class PostgresDatabase:
                 cursor.execute(
                     """
                     SELECT s.ticker_id, s.date_id, s.time_id, s.timestamp, s.provider_id,
-                           s.open, s.high, s.low, s.close, s.volume, s.incomplete
+                           s.open, s.high, s.low, s.close, s.volume, s.data_quality
                     FROM staging_market_data_1min s
                     JOIN dim_provider p ON p.provider_id = s.provider_id
                     WHERE p.name = ANY(%(names)s)
@@ -527,7 +574,7 @@ class PostgresDatabase:
         self._logger.perf(f"fetch_staging_rows_for_reconciliation({len(rows)} rows)", time.perf_counter() - started)
 
         result: list[StagingRow] = []
-        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, incomplete in rows:
+        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, data_quality in rows:
             result.append(
                 StagingRow(
                     ticker_id=ticker_id,
@@ -540,7 +587,7 @@ class PostgresDatabase:
                     low=float(low),
                     close=float(close),
                     volume=int(volume),
-                    incomplete=bool(incomplete),
+                    data_quality=data_quality,
                 )
             )
         return result
@@ -555,7 +602,7 @@ class PostgresDatabase:
                 cursor.execute(
                     """
                     SELECT s.ticker_id, s.date_id, s.time_id, s.timestamp, s.provider_id,
-                           s.open, s.high, s.low, s.close, s.volume, s.incomplete
+                           s.open, s.high, s.low, s.close, s.volume, s.data_quality
                     FROM staging_market_data_1min s
                     WHERE EXISTS (
                         SELECT 1 FROM fact_pending_manual_resolution fpmr
@@ -569,7 +616,7 @@ class PostgresDatabase:
         self._logger.perf(f"fetch_pending_manual_resolution_staging_rows({len(rows)} rows)", time.perf_counter() - started)
 
         result: list[StagingRow] = []
-        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, incomplete in rows:
+        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, data_quality in rows:
             result.append(
                 StagingRow(
                     ticker_id=ticker_id,
@@ -582,7 +629,7 @@ class PostgresDatabase:
                     low=float(low),
                     close=float(close),
                     volume=int(volume),
-                    incomplete=bool(incomplete),
+                    data_quality=data_quality,
                 )
             )
         return result
@@ -712,7 +759,7 @@ class PostgresDatabase:
         low: float,
         close: float,
         volume: int,
-        incomplete: bool,
+        data_quality: str,
     ) -> None:
         """Upsert the fully-resolved bar into fact_market_data_1min -- called once every field
         group for this bar has resolved. Does NOT purge staging rows; that's the separate,
@@ -722,7 +769,7 @@ class PostgresDatabase:
                 cursor.execute(
                     """
                     INSERT INTO fact_market_data_1min
-                        (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, incomplete)
+                        (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (ticker_id, date_id, time_id) DO UPDATE SET
                         open = EXCLUDED.open,
@@ -731,9 +778,9 @@ class PostgresDatabase:
                         close = EXCLUDED.close,
                         volume = EXCLUDED.volume,
                         timestamp = EXCLUDED.timestamp,
-                        incomplete = EXCLUDED.incomplete
+                        data_quality = EXCLUDED.data_quality
                     """,
-                    (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, incomplete),
+                    (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality),
                 )
             self._connection.commit()
         except psycopg.Error as error:

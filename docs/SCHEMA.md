@@ -40,9 +40,14 @@ candidate can promote via Tier 1 completeness when the whistleblower is confirme
 bar, not just when it reported incomplete); `quant-ingest`'s write path (recording + coalescing
 coverage on every successful fetch) is still outstanding — see its own section below and
 [croicu/quant-data#31](https://github.com/croicu/quant-data/issues/31).
-`fact_market_data_1min` itself is unchanged throughout:
-it remains the single golden, reconciled dataset every reader (`MarketData`) queries, regardless of
-which provider(s) a bar's value ultimately came from.
+`009_replace_incomplete_with_data_quality` replaced `staging_market_data_1min.incomplete`/
+`fact_market_data_1min.incomplete` (boolean) with a tri-state `data_quality` column (`accepted`/
+`incomplete`/`rejected`) — a breaking change to `quant_data`'s public `OHLCV.incomplete` field
+(now `OHLCV.data_quality: DataQuality`), laying the schema foundation for
+`tasks/yahoo_data_sanitization.md`'s per-provider outlier-rejection check (not yet implemented;
+no code path sets `rejected` yet).
+Otherwise `fact_market_data_1min` remains the single golden, reconciled dataset every reader
+(`MarketData`) queries, regardless of which provider(s) a bar's value ultimately came from.
 
 ## `dim_ticker`
 
@@ -105,7 +110,7 @@ out of sync with what's actually seeded here.
 | `open`, `high`, `low`, `close` | `NUMERIC NOT NULL` | Same precision rationale as `fact_market_data_1min` |
 | `volume` | `BIGINT NOT NULL` | `>= 0` |
 | `timestamp` | `TIMESTAMP NOT NULL` | UTC, same as `fact_market_data_1min` |
-| `incomplete` | `BOOLEAN NOT NULL DEFAULT FALSE` | Same meaning as `fact_market_data_1min.incomplete` |
+| `data_quality` | `TEXT NOT NULL CHECK (data_quality IN ('accepted', 'incomplete', 'rejected'))` | Same meaning as `fact_market_data_1min.data_quality` |
 
 Added in `003_add_dim_provider_and_staging`. Holds each provider's raw, as-ingested bars —
 identical bar columns to `fact_market_data_1min`, plus `provider_id` — so multiple providers
@@ -183,7 +188,7 @@ database with empty staging.
 | `open`, `high`, `low`, `close` | `NUMERIC NOT NULL` | Unbounded-precision, not a fixed-scale numeric or float — preserves exact precision for backtests |
 | `volume` | `BIGINT NOT NULL` | `>= 0` |
 | `timestamp` | `TIMESTAMP NOT NULL` | UTC, enforced by `PostgresDatabase` pinning the connection's session `TimeZone` to UTC on connect (see [issue #9](https://github.com/croicu/quant-data/issues/9)) — previously just assumed, which let an unpinned session silently shift every stored value by its own local offset; kept for reference/audit, redundant with the three dimension keys |
-| `incomplete` | `BOOLEAN NOT NULL DEFAULT FALSE` | Added in `002_add_incomplete_flag`. True when the provider couldn't supply full data for this bar (e.g. missing pre-market volume) — a signal to prioritize backfilling, not a data-quality gate on read. |
+| `data_quality` | `TEXT NOT NULL CHECK (data_quality IN ('accepted', 'incomplete', 'rejected'))` | Added in `002_add_incomplete_flag` as a boolean `incomplete`; replaced by `009_replace_incomplete_with_data_quality` with this tri-state column. `accepted` is the normal case; `incomplete` means the provider couldn't supply full data for this bar (e.g. missing pre-market volume) or a plausibility check couldn't be run against it; `rejected` means a per-provider staging-quality check ran and found the value implausible (`tasks/yahoo_data_sanitization.md`). `rejected` is treated identically to `incomplete` by reconcile's Tier 1 completeness check — the distinction is for audit/debugging, not different promotion behavior. Not a data-quality gate on read — a signal to prioritize backfilling/review. |
 
 Primary key: `(ticker_id, date_id, time_id)` — enforces exactly one bar per ticker per minute per
 date.

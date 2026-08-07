@@ -141,6 +141,13 @@ arguments (or `settings.postgres.sshUser`/`sshKeyPath`, both optional and must b
       pending = client.fetch_pending_resolution_bars("SPY", start_date=date(2026, 8, 3), end_date=date(2026, 8, 3))
       for candidate in pending:
           print(candidate.provider, candidate.role.value, candidate.field_group, candidate.bar.close)
+
+      # yfinance values a per-provider plausibility check flagged implausible -- distinct from
+      # fetch_pending_resolution_bars, since a rejected value with an accepted candidate resolves
+      # automatically and never becomes pending, so this is the only way to see it.
+      rejected = client.fetch_rejected_whistleblower_bars("SPY", start_date=date(2026, 8, 3), end_date=date(2026, 8, 3))
+      for entry in rejected:
+          print(entry.provider, entry.bar.timestamp, entry.bar.close)
   ```
 
 - **CroicuWS1's on-prem hosting** — pass `ssh_user`/`ssh_key_path`; `host`/`port` now mean the

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 from quant_data._internal.shared.errors import AppError
-from quant_data.protocols import OHLCV, PendingResolutionBar
+from quant_data.protocols import OHLCV, PendingResolutionBar, RejectedWhistleblowerBar
 
 
 class MockPostgresDatabase:
@@ -15,6 +15,7 @@ class MockPostgresDatabase:
         self.written_bars: list[OHLCV] = []
         self.written_staging_bars: list[tuple[str, OHLCV]] = []
         self.pending_resolution_bars: list[PendingResolutionBar] = []
+        self.rejected_whistleblower_bars: list[RejectedWhistleblowerBar] = []
         self.inception_date = inception_date
         self.earliest_covered_by_ticker = earliest_covered_by_ticker if earliest_covered_by_ticker is not None else {}
         self.closed = False
@@ -44,6 +45,16 @@ class MockPostgresDatabase:
         for candidate in self.pending_resolution_bars:
             if candidate.bar.ticker == normalized_ticker and start_date <= candidate.bar.timestamp.date() <= end_date:
                 matches.append(candidate)
+
+        return matches
+
+    def fetch_rejected_whistleblower_bars(self, ticker: str, start_date: date, end_date: date) -> list[RejectedWhistleblowerBar]:
+        normalized_ticker = ticker.upper()
+
+        matches: list[RejectedWhistleblowerBar] = []
+        for rejected in self.rejected_whistleblower_bars:
+            if rejected.bar.ticker == normalized_ticker and start_date <= rejected.bar.timestamp.date() <= end_date:
+                matches.append(rejected)
 
         return matches
 

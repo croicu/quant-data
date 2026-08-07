@@ -141,9 +141,9 @@ class FakeReconcileDatabase:
         low: float,
         close: float,
         volume: int,
-        incomplete: bool,
+        data_quality: str,
     ) -> None:
-        self.fact_market_data[(ticker_id, date_id, time_id)] = (timestamp, open, high, low, close, volume, incomplete)
+        self.fact_market_data[(ticker_id, date_id, time_id)] = (timestamp, open, high, low, close, volume, data_quality)
 
     def purge_staging_bar(self, ticker_id: int, date_id: int, time_id: int) -> None:
         whistleblower_provider_ids: set[int] = set()

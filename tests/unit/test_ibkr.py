@@ -8,6 +8,7 @@ import pytest
 
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.providers.ibkr import IBKRIntraDay
+from quant_data.protocols import DataQuality
 
 
 @dataclass
@@ -141,11 +142,11 @@ def test_fetch_bars_maps_bars_to_ohlcv(mock_ib_class):
     assert bars[0].ticker == "AAPL"
     assert bars[0].timestamp == datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc)
     assert bars[0].volume == 1234
-    assert bars[0].incomplete is False
+    assert bars[0].data_quality == DataQuality.ACCEPTED
     # A real zero-volume IBKR bar (no trades that minute) is not treated as incomplete, unlike
     # Yahoo's synthetic-gap heuristic.
     assert bars[1].volume == 0
-    assert bars[1].incomplete is False
+    assert bars[1].data_quality == DataQuality.ACCEPTED
 
 
 @patch("quant_data._internal.shared.providers.ibkr.IB")

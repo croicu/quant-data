@@ -5,7 +5,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from quant_data._internal.shared.errors import AppError
-from quant_data.protocols import OHLCV
+from quant_data.protocols import OHLCV, DataQuality
 
 DEFAULT_DATA_PATH = Path(__file__).parent.parent / "data" / "ohlcv_bars.json"
 
@@ -45,7 +45,7 @@ class MockIntraDayProvider:
                 low=float(bar_data["low"]),
                 close=float(bar_data["close"]),
                 volume=int(bar_data["volume"]),
-                incomplete=bool(bar_data.get("incomplete", False)),
+                data_quality=DataQuality(bar_data.get("data_quality", "accepted")),
             )
             bars.append(bar)
 

@@ -5,7 +5,7 @@ from types import TracebackType
 
 from quant_data._internal.contracts import MarketDataProvider
 from quant_data._internal.shared.diagnostics import Logger
-from quant_data.protocols import OHLCV, LoggingSink, PendingResolutionBar
+from quant_data.protocols import OHLCV, LoggingSink, PendingResolutionBar, RejectedWhistleblowerBar
 
 
 class MarketData:
@@ -36,6 +36,9 @@ class MarketData:
 
     def fetch_pending_resolution_bars(self, ticker: str, start_date: date, end_date: date) -> list[PendingResolutionBar]:
         return self._provider.fetch_pending_resolution_bars(ticker, start_date, end_date)
+
+    def fetch_rejected_whistleblower_bars(self, ticker: str, start_date: date, end_date: date) -> list[RejectedWhistleblowerBar]:
+        return self._provider.fetch_rejected_whistleblower_bars(ticker, start_date, end_date)
 
     def close(self) -> None:
         self._provider.close()

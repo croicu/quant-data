@@ -15,7 +15,7 @@ from quant_data._internal.shared.postgres import (
     ProviderRow,
     StagingRow,
 )
-from quant_data.protocols import OHLCV, PendingResolutionBar, ProviderRole
+from quant_data.protocols import OHLCV, DataQuality, PendingResolutionBar, ProviderRole, RejectedWhistleblowerBar
 
 
 class _FakeTransport:
@@ -350,7 +350,7 @@ def test_fetch_ingestion_coverage_returns_rows(mock_psycopg):
 def test_fetch_staging_rows_for_reconciliation_scopes_by_provider_names(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
     mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, False),
+        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, "accepted"),
     ]
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
@@ -369,7 +369,7 @@ def test_fetch_staging_rows_for_reconciliation_scopes_by_provider_names(mock_psy
             low=99.0,
             close=100.5,
             volume=1000,
-            incomplete=False,
+            data_quality="accepted",
         )
     ]
     mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
@@ -425,7 +425,7 @@ def test_promote_bar_to_fact_upserts_fact_only(mock_psycopg):
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
 
-    database.promote_bar_to_fact(1, 10, 20, datetime(2026, 7, 24, 13, 30), 100.0, 101.0, 99.0, 100.5, 1000, False)
+    database.promote_bar_to_fact(1, 10, 20, datetime(2026, 7, 24, 13, 30), 100.0, 101.0, 99.0, 100.5, 1000, "accepted")
 
     mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
     assert mock_cursor.execute.call_count == 1  # fact upsert only -- purge is a separate call
@@ -556,7 +556,7 @@ def test_fetch_earliest_covered_date_returns_none_for_a_never_ingested_ticker(mo
 def test_fetch_pending_manual_resolution_staging_rows_returns_rows(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
     mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, False),
+        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, "accepted"),
     ]
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
@@ -575,7 +575,7 @@ def test_fetch_pending_manual_resolution_staging_rows_returns_rows(mock_psycopg)
             low=99.0,
             close=100.5,
             volume=1000,
-            incomplete=False,
+            data_quality="accepted",
         )
     ]
 
@@ -584,8 +584,8 @@ def test_fetch_pending_manual_resolution_staging_rows_returns_rows(mock_psycopg)
 def test_fetch_pending_resolution_bars_returns_one_candidate_per_provider(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
     mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        ("SPY", datetime(2026, 8, 3, 13, 30), "ohlc", "ibkr", "candidate", 100.0, 101.0, 99.0, 100.5, 1000, False),
-        ("SPY", datetime(2026, 8, 3, 13, 30), "ohlc", "yfinance", "whistleblower", 100.1, 101.1, 99.1, 100.6, 1010, False),
+        ("SPY", datetime(2026, 8, 3, 13, 30), "ohlc", "ibkr", "candidate", 100.0, 101.0, 99.0, 100.5, 1000, "accepted"),
+        ("SPY", datetime(2026, 8, 3, 13, 30), "ohlc", "yfinance", "whistleblower", 100.1, 101.1, 99.1, 100.6, 1010, "accepted"),
     ]
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_reader", password="", dbname="quant_data")
@@ -597,15 +597,64 @@ def test_fetch_pending_resolution_bars_returns_one_candidate_per_provider(mock_p
             field_group="ohlc",
             provider="ibkr",
             role=ProviderRole.CANDIDATE,
-            bar=OHLCV(ticker="SPY", timestamp=datetime(2026, 8, 3, 13, 30), open=100.0, high=101.0, low=99.0, close=100.5, volume=1000, incomplete=False),
+            bar=OHLCV(
+                ticker="SPY",
+                timestamp=datetime(2026, 8, 3, 13, 30),
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=1000,
+                data_quality=DataQuality.ACCEPTED,
+            ),
         ),
         PendingResolutionBar(
             field_group="ohlc",
             provider="yfinance",
             role=ProviderRole.WHISTLEBLOWER,
-            bar=OHLCV(ticker="SPY", timestamp=datetime(2026, 8, 3, 13, 30), open=100.1, high=101.1, low=99.1, close=100.6, volume=1010, incomplete=False),
+            bar=OHLCV(
+                ticker="SPY",
+                timestamp=datetime(2026, 8, 3, 13, 30),
+                open=100.1,
+                high=101.1,
+                low=99.1,
+                close=100.6,
+                volume=1010,
+                data_quality=DataQuality.ACCEPTED,
+            ),
         ),
     ]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_rejected_whistleblower_bars_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+        ("SPY", datetime(2026, 8, 3, 13, 30), "yfinance", 100.1, 101.1, 99.1, 100.6, 1010, "rejected"),
+    ]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_reader", password="", dbname="quant_data")
+
+    rejected = database.fetch_rejected_whistleblower_bars("spy", date(2026, 8, 3), date(2026, 8, 3))
+
+    assert rejected == [
+        RejectedWhistleblowerBar(
+            provider="yfinance",
+            bar=OHLCV(
+                ticker="SPY",
+                timestamp=datetime(2026, 8, 3, 13, 30),
+                open=100.1,
+                high=101.1,
+                low=99.1,
+                close=100.6,
+                volume=1010,
+                data_quality=DataQuality.REJECTED,
+            ),
+        ),
+    ]
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    call_args = mock_cursor.execute.call_args
+    assert call_args.args[1] == ("SPY", date(2026, 8, 3), date(2026, 8, 3), "whistleblower", "rejected")
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")

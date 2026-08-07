@@ -18,15 +18,19 @@ FIELD_GROUP_OHLC = "ohlc"
 ROLE_CANDIDATE = "candidate"
 ROLE_WHISTLEBLOWER = "whistleblower"
 
+DATA_QUALITY_ACCEPTED = "accepted"
+DATA_QUALITY_INCOMPLETE = "incomplete"
+DATA_QUALITY_REJECTED = "rejected"
+
 RESOLUTION_COMPLETENESS = "completeness"
 RESOLUTION_AGREEMENT = "agreement"
 RESOLUTION_BOUNDARY_FIX = "boundary_fix"
 RESOLUTION_FINALIZED = "finalized"
 RESOLUTION_MANUAL_OVERRIDE = "manual_override"
 
-# A ticker below this many matched bars (every configured provider reported real, non-incomplete
-# data for that minute) sits in staging completely unevaluated -- no Tier 1-4 attempt, no partial
-# stats update -- until it graduates in one batch (croicu/quant-data#28).
+# A ticker below this many matched bars (every configured provider reported real, data_quality =
+# accepted data for that minute) sits in staging completely unevaluated -- no Tier 1-4 attempt, no
+# partial stats update -- until it graduates in one batch (croicu/quant-data#28).
 GRADUATION_THRESHOLD_MATCHED_BARS = 1400
 
 _GROUP_FIELDS: dict[str, list[str]] = {
@@ -44,7 +48,7 @@ class ProviderBar:
     low: float
     close: float
     volume: float
-    incomplete: bool
+    data_quality: str
 
 
 @dataclass
@@ -123,7 +127,7 @@ def _resolve_completeness(bars: list[ProviderBar]) -> Resolution | None:
     valid: list[ProviderBar] = []
     invalid: list[ProviderBar] = []
     for bar in bars:
-        if bar.incomplete:
+        if bar.data_quality != DATA_QUALITY_ACCEPTED:
             invalid.append(bar)
         else:
             valid.append(bar)

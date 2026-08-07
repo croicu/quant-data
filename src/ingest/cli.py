@@ -16,6 +16,7 @@ from quant_data._internal.shared.providers.ibkr import CATEGORY_IBKR, IBKRIntraD
 from quant_data._internal.shared.providers.yfinance import CATEGORY_YFINANCE, YahooFinanceIntraDay
 from quant_data._internal.shared.settings import PostgresSettings, RateLimitSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
+from quant_data.protocols import DataQuality
 
 from .rate_limiter import RateLimiter
 
@@ -224,7 +225,7 @@ def _ingest_one(
         any_provider_succeeded = True
         total_written += written
         for bar in bars:
-            if bar.incomplete:
+            if bar.data_quality != DataQuality.ACCEPTED:
                 total_incomplete += 1
 
     if not any_provider_succeeded:

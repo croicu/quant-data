@@ -11,6 +11,21 @@ from enum import Enum
 from typing import Protocol
 
 
+class DataQuality(Enum):
+    """Mirrors staging_market_data_1min/fact_market_data_1min's data_quality CHECK constraint --
+    a closed set, same precedent as ProviderRole below. Replaces the old plain incomplete: bool
+    field: ACCEPTED is the old False, INCOMPLETE is the old True (no confidence in the value, but
+    no positive evidence it's wrong -- a real zero-volume bar, or a bar a plausibility check
+    couldn't run against), and REJECTED is new (a per-provider staging quality check ran and found
+    the value implausible -- see tasks/yahoo_data_sanitization.md). REJECTED is treated
+    identically to INCOMPLETE by reconcile's Tier 1 completeness check -- the distinction is for
+    audit/debugging, not different promotion behavior."""
+
+    ACCEPTED = "accepted"
+    INCOMPLETE = "incomplete"
+    REJECTED = "rejected"
+
+
 @dataclass
 class OHLCV:
     ticker: str
@@ -20,7 +35,7 @@ class OHLCV:
     low: float
     close: float
     volume: int
-    incomplete: bool = False
+    data_quality: DataQuality = DataQuality.ACCEPTED
 
 
 class ProviderRole(Enum):
@@ -47,6 +62,22 @@ class PendingResolutionBar:
     field_group: str
     provider: str
     role: ProviderRole
+    bar: OHLCV
+
+
+@dataclass
+class RejectedWhistleblowerBar:
+    """A whistleblower-reported staging value with data_quality=REJECTED -- a per-provider
+    plausibility check found it implausible relative to its own series' neighbors (see
+    tasks/yahoo_data_sanitization.md). Deliberately scoped to the whistleblower only, not a
+    general per-provider rejected-bars feed: this exists to answer "did yfinance's own raw feed
+    have a bad tick here," an audit/quality-monitoring question distinct from
+    PendingResolutionBar's "the providers disagree, a human needs to decide" -- a rejected
+    whistleblower value with an accepted candidate auto-resolves via Tier 1 and never reaches
+    fact_pending_manual_resolution at all, so this is the only way to see it. No role field
+    (always WHISTLEBLOWER by construction, unlike PendingResolutionBar which covers both sides)."""
+
+    provider: str
     bar: OHLCV
 
 

@@ -80,15 +80,21 @@ independent top-level packages.
 
 ### `quant_data.protocols`
 
-- `OHLCV`: ticker, timestamp (UTC), open/high/low/close, volume, and `incomplete` (defaults
-  `False`) — set when the provider couldn't supply full data for that minute (see
-  `docs/SCHEMA.md`'s `fact_market_data_1min.incomplete`). Re-exported at the `quant_data` top
-  level.
+- `OHLCV`: ticker, timestamp (UTC), open/high/low/close, volume, and `data_quality`
+  (`DataQuality`, defaults `ACCEPTED`) — set when the provider couldn't supply full data for that
+  minute, or (not yet implemented) a per-provider plausibility check rejected the value (see
+  `docs/SCHEMA.md`'s `fact_market_data_1min.data_quality`). Re-exported at the `quant_data` top
+  level. **Breaking change (`009_replace_incomplete_with_data_quality`)**: this field was
+  `incomplete: bool` before; now `data_quality: DataQuality`.
 - `ProviderRole(Enum)`: `CANDIDATE`/`WHISTLEBLOWER`, mirroring `dim_provider.role`'s `CHECK`
   constraint. A closed set (unlike e.g. `LoggingSink`'s open `category` strings), so this follows
   the same pattern as `_internal.shared.diagnostics.TelemetryLevel` — the one other closed-set
   string column in this codebase already modeled as an `Enum` — rather than a plain `str`.
   Re-exported at the `quant_data` top level.
+- `DataQuality(Enum)`: `ACCEPTED`/`INCOMPLETE`/`REJECTED`, mirroring
+  `staging_market_data_1min`/`fact_market_data_1min.data_quality`'s `CHECK` constraint — same
+  closed-set-`Enum` precedent as `ProviderRole`. `REJECTED` is treated identically to `INCOMPLETE`
+  by reconcile's Tier 1 completeness check; the distinction is for audit/debugging only.
 - `PendingResolutionBar`: `field_group` (`str`), `provider` (`str`), `role` (`ProviderRole`),
   `bar` (`OHLCV`) — one provider's disputed staging value for a (bar, field group) still awaiting
   manual resolution (`fact_pending_manual_resolution`). A bar is pending precisely because its
@@ -99,6 +105,14 @@ independent top-level packages.
   several candidates — today's data is exactly one whistleblower (`yfinance`) plus one candidate
   (`ibkr`), but `dim_provider` isn't hardcoded to two rows, so don't assume exactly one candidate.
   Re-exported at the `quant_data` top level.
+- `RejectedWhistleblowerBar`: `provider` (`str`), `bar` (`OHLCV`) — a whistleblower-reported
+  staging value with `data_quality=REJECTED`. Deliberately separate from `PendingResolutionBar`:
+  a rejected whistleblower value with an *accepted* candidate auto-resolves via Tier 1 completeness
+  and never reaches `fact_pending_manual_resolution` at all, so it would never be visible through
+  `fetch_pending_resolution_bars` — this is the only way to see it, regardless of resolution
+  outcome, since whistleblower rows are never purged. No `role` field (always `WHISTLEBLOWER` by
+  construction, unlike `PendingResolutionBar` which covers both sides of a dispute). Re-exported at
+  the `quant_data` top level.
 - `LoggingSink(Protocol)`: `diagnostic`/`info`/`warning`/`error`/`fatal(message, category="general")`
   plus `perf(description, elapsed_seconds)` — the injectable logging contract (quant-data#20).
   Mirrors `_internal.shared.diagnostics.DiagnosticsLogSink`'s method surface exactly, so a host
@@ -123,8 +137,9 @@ independent top-level packages.
 ### `quant_data._internal.contracts`
 
 - `MarketDataProvider(Protocol)`: `fetch_bars(ticker, start_date, end_date) -> list[OHLCV]`,
-  `fetch_pending_resolution_bars(ticker, start_date, end_date) -> list[PendingResolutionBar]`, plus
-  `close() -> None`, read-only. The read-side contract `MarketData` depends on (not
+  `fetch_pending_resolution_bars(ticker, start_date, end_date) -> list[PendingResolutionBar]`,
+  `fetch_rejected_whistleblower_bars(ticker, start_date, end_date) -> list[RejectedWhistleblowerBar]`,
+  plus `close() -> None`, read-only. The read-side contract `MarketData` depends on (not
   `PostgresDatabase` concretely) and that `PostgresDatabase` implements (via
   `create_postgres_provider`) — not something external consumers import directly, since they use
   `MarketData` plus a factory instead. `fetch_pending_resolution_bars` joins
@@ -132,6 +147,10 @@ independent top-level packages.
   surface every candidate/whistleblower provider's disputed raw value for a still-pending (bar,
   field group) — `fact_pending_manual_resolution` itself holds no `OHLCV` data, only the key
   marking a (bar, field group) as stuck, so the actual values are read from staging.
+  `fetch_rejected_whistleblower_bars` queries `staging_market_data_1min` directly, filtered to
+  `role = 'whistleblower'` and `data_quality = 'rejected'` — no join against
+  `fact_pending_manual_resolution`, since a rejected whistleblower value with an accepted candidate
+  never becomes pending at all.
 - `IntraDayProvider(Protocol)`: `connect() -> None`, `fetch_bars(ticker, target_date) ->
   list[OHLCV]` for a single session day, and `close() -> None`. The ingest-side contract for
   external data sources — `ingest` depends on this abstraction, not concretely on whichever
@@ -236,9 +255,9 @@ independent top-level packages.
 - `providers/yfinance.py` — `YahooFinanceIntraDay`, an `IntraDayProvider` implementation wrapping
   `yfinance`. Ported from `quant-scratch`'s `shared/providers/yahoo_finance.py`, adapted to
   produce `OHLCV` (which carries its own `ticker`, unlike `quant-scratch`'s `DayBar`) and to set
-  `incomplete=True` (with the value coerced to `0`/`0.0`) whenever `yfinance` returns `NaN` for
-  any OHLCV field, or a literal `0` for volume — a real tick can't have zero volume, so `yfinance`
-  reporting either NaN or a literal 0 both signal the same underlying problem (most commonly
+  `data_quality=DataQuality.INCOMPLETE` (with the value coerced to `0`/`0.0`) whenever `yfinance`
+  returns `NaN` for any OHLCV field, or a literal `0` for volume — a real tick can't have zero
+  volume, so `yfinance` reporting either NaN or a literal 0 both signal the same underlying problem (most commonly
   pre-market/after-hours minutes with no trades recorded). This is `ingest`'s default provider
   (`settings.providers` defaults to `["yfinance"]`), not the only one anymore — see
   `providers/ibkr.py` below, added to close exactly this pre-/after-market zero-volume gap and
@@ -435,12 +454,12 @@ the full design (field consistency groups, the candidate/whistleblower model, th
     graduation counting or the fixed-point loop ever see it — behaving exactly like a bar missing
     any other required provider (not evaluated, and critically **not** marked pending, since "not
     ingested yet" isn't evidence of anything). For a covered-but-absent bar_key, a placeholder
-    `ProviderBar` (`incomplete=True`, dummy zero field values, `role=WHISTLEBLOWER`) is synthesized
-    when building `provider_bars` for that bar — `_resolve_completeness` already treats an
-    incomplete-flagged bar as "reported but unusable," so this reuses that exact path with **zero
+    `ProviderBar` (`data_quality="incomplete"`, dummy zero field values, `role=WHISTLEBLOWER`) is
+    synthesized when building `provider_bars` for that bar — `_resolve_completeness` already treats
+    a non-`"accepted"` bar as "reported but unusable," so this reuses that exact path with **zero
     changes to `algorithm.py`**: a confirmed-absent whistleblower behaves identically to one that
-    reported and was flagged incomplete, including the resolution_path (`'completeness'`, not a new
-    label). The dummy values are never actually compared against — Tier 2/3 measure tolerance using
+    reported and was flagged `incomplete`, including the resolution_path (`'completeness'`, not a
+    new label). The dummy values are never actually compared against — Tier 2/3 measure tolerance using
     the *candidate's* own reference value, never the whistleblower's, and both fail closed
     (correctly) if ever reached with placeholder zeros instead of Tier 1 catching it first. Live
     motivating case: 6,939 of 7,192 `ibkr` rows stuck in staging on CroicuWS1 were exactly this —
@@ -498,8 +517,8 @@ the full design (field consistency groups, the candidate/whistleblower model, th
 - A bar promotes to `fact_market_data_1min` once **every** field group has a resolution (checked
   after the convergence loop above, for every bar whether resolved just now or in an earlier run).
   Today that's just `'ohlc'` — `volume` is no longer its own field group (see
-  `tasks/volume_reconciliation.md`); the promoted row's `volume` and `incomplete` come straight off
-  the `'ohlc'` winner's own `StagingRow`, not a separately resolved value.
+  `tasks/volume_reconciliation.md`); the promoted row's `volume` and `data_quality` come straight
+  off the `'ohlc'` winner's own `StagingRow`, not a separately resolved value.
 - **Lazy purge.** `promote_bar_to_fact` (upsert into `fact_market_data_1min`) and
   `purge_staging_bar` (delete that bar's staging rows) are separate calls, not one atomic step.
   After promoting, a bar's staging rows are purged only if neither adjacent minute (`t-1`/`t+1`,
@@ -534,8 +553,11 @@ the full design (field consistency groups, the candidate/whistleblower model, th
   not this class's shape, but a narrower surface is still better ergonomics regardless of backend.
   `fetch_pending_resolution_bars(ticker, start_date, end_date)` delegates straight to the provider,
   same shape as `fetch_bars` — the first public method exposing anything from the reconciliation
-  domain (see "Contracts" below). Re-exported at `quant_data` top level (`from quant_data import
-  MarketData`).
+  domain (see "Contracts" below). `fetch_rejected_whistleblower_bars(ticker, start_date, end_date)`
+  is the same shape again, surfacing whistleblower values a per-provider plausibility check flagged
+  implausible (`data_quality=REJECTED`) — distinct from `fetch_pending_resolution_bars` since a
+  rejected value with an accepted candidate resolves automatically and never becomes pending.
+  Re-exported at `quant_data` top level (`from quant_data import MarketData`).
 - `postgres_provider.py` — `create_postgres_provider(host, port, dbname, user="quant_reader",
   password="", ssh_user=None, ssh_key_path=None)`: today's factory, resolves a
   `ConnectionTransport` from the `ssh_user`/`ssh_key_path` kwargs (`transports.resolve_transport`)
@@ -582,11 +604,14 @@ behavior — `LoggingSink` is behavioral too — it's public-vs-private: `protoc
 external consumers. The database schema itself (five dimension tables, `fact_market_data_1min`,
 `staging_market_data_1min`, and `reconcile`'s own `fact_reconciliation`/
 `fact_reconciliation_participant`/`provider_pair_disagreement`) remains the underlying persisted
-contract — see `docs/SCHEMA.md`. `fact_market_data_1min` (via `MarketData.fetch_bars`) and, as of
+contract — see `docs/SCHEMA.md`. `fact_market_data_1min` (via `MarketData.fetch_bars`), as of
 `MarketData.fetch_pending_resolution_bars`, `fact_pending_manual_resolution` joined against
-`staging_market_data_1min` are the actual external contract now — everything else (
-`fact_reconciliation`, `fact_reconciliation_participant`, `provider_pair_disagreement`,
-`dim_provider.role`) is still this repo's own internal write-path plumbing, never queried directly
-by `quant-scratch` or any other consumer. Exposing pending-resolution data required a `quant_reader`
-grant on `staging_market_data_1min`/`fact_pending_manual_resolution`/`dim_field_group`/
-`dim_provider` — see `docs/DATABASE.md`'s "Granting quant_reader access to new tables".
+`staging_market_data_1min`, and as of `MarketData.fetch_rejected_whistleblower_bars`,
+`staging_market_data_1min` directly (filtered on `role`/`data_quality`) are the actual external
+contract now — everything else (`fact_reconciliation`, `fact_reconciliation_participant`,
+`provider_pair_disagreement`, `dim_provider.role`) is still this repo's own internal write-path
+plumbing, never queried directly by `quant-scratch` or any other consumer. Exposing
+pending-resolution data required a `quant_reader` grant on `staging_market_data_1min`/
+`fact_pending_manual_resolution`/`dim_field_group`/`dim_provider` — see `docs/DATABASE.md`'s
+"Granting quant_reader access to new tables". `fetch_rejected_whistleblower_bars` needed no new
+grant, since it only reads tables `quant_reader` already had access to from that earlier rollout.

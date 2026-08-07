@@ -62,7 +62,7 @@ def _settings(providers=None, preferred_provider="ibkr", k=3.0) -> Settings:
 
 
 def _staging_row(provider_id: int, ticker_id=1, date_id=10, time_id=20, timestamp=None, **overrides) -> StagingRow:
-    defaults = dict(open=100.0, high=101.0, low=99.0, close=100.5, volume=1000, incomplete=False)
+    defaults = dict(open=100.0, high=101.0, low=99.0, close=100.5, volume=1000, data_quality="accepted")
     defaults.update(overrides)
     return StagingRow(
         ticker_id=ticker_id,
@@ -102,7 +102,7 @@ def test_agreement_promotes_bar_and_purges_staging():
     assert len(database.staging_rows) == 1
     assert database.staging_rows[0].provider_id == YFINANCE
     fact_row = database.fact_market_data[(1, 10, 20)]
-    _timestamp, _open_, _high, _low, _close, volume, _incomplete = fact_row
+    _timestamp, _open_, _high, _low, _close, volume, _data_quality = fact_row
     assert volume == 1000  # IBKR's own volume, since IBKR won ohlc
     for _, _, _, _, _, resolution_path in database.fact_reconciliation:
         assert resolution_path == "agreement"
@@ -114,8 +114,8 @@ def test_completeness_resolves_yahoo_premarket_gap():
     # completeness, promoting IBKR's values. Seeded as already-graduated (croicu/quant-data#28's
     # per-ticker gate) so this test stays focused on Tier 1 completeness mechanics, not graduation.
     staging_rows = [
-        _staging_row(IBKR, open=100.0, high=101.0, low=99.0, close=100.5, volume=500, incomplete=False),
-        _staging_row(YFINANCE, open=0.0, high=0.0, low=0.0, close=0.0, volume=0, incomplete=True),
+        _staging_row(IBKR, open=100.0, high=101.0, low=99.0, close=100.5, volume=500, data_quality="accepted"),
+        _staging_row(YFINANCE, open=0.0, high=0.0, low=0.0, close=0.0, volume=0, data_quality="incomplete"),
     ]
     disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
     database = FakeReconcileDatabase(PROVIDERS, FIELD_GROUPS, staging_rows, fields=FIELDS, disagreement_stats=disagreement_stats)
@@ -125,7 +125,7 @@ def test_completeness_resolves_yahoo_premarket_gap():
     assert resolved == 1
     assert stuck == 0
     fact_row = database.fact_market_data[(1, 10, 20)]
-    _timestamp, open_, high, low, close, volume, _incomplete = fact_row
+    _timestamp, open_, high, low, close, volume, _data_quality = fact_row
     assert (open_, high, low, close, volume) == (100.0, 101.0, 99.0, 100.5, 500)
     for _, _, _, _, _, resolution_path in database.fact_reconciliation:
         assert resolution_path == "completeness"
@@ -166,7 +166,7 @@ def test_candidate_promotes_when_whistleblower_confirmed_absent():
     assert resolved == 1
     assert stuck == 0
     fact_row = database.fact_market_data[(1, 10, 20)]
-    _timestamp, open_, high, low, close, volume, _incomplete = fact_row
+    _timestamp, open_, high, low, close, volume, _data_quality = fact_row
     assert (open_, high, low, close, volume) == (100.0, 101.0, 99.0, 100.5, 500)
     for _, _, _, _, _, resolution_path in database.fact_reconciliation:
         assert resolution_path == "completeness"
@@ -232,7 +232,7 @@ def test_finalize_promotes_preferred_providers_raw_value():
     run_reconciliation(database, _settings(preferred_provider="ibkr"), finalize=True)
 
     fact_row = database.fact_market_data[(1, 10, 20)]
-    _timestamp, open_, high, low, close, _volume, _incomplete = fact_row
+    _timestamp, open_, high, low, close, _volume, _data_quality = fact_row
     assert (open_, high, low, close) == (100.0, 101.0, 99.0, 100.5)  # IBKR's raw value, not Yahoo's
 
 
@@ -258,8 +258,10 @@ def test_ungraduated_ticker_stays_completely_unevaluated():
     # resolves for either, and no stats get computed, since an ungraduated ticker gets no Tier 1-4
     # attempt at all (croicu/quant-data#28).
     staging_rows = _matched_bar_rows(GRADUATION_THRESHOLD_MATCHED_BARS - 1)
-    staging_rows.append(_staging_row(IBKR, time_id=9000, timestamp=datetime(2026, 7, 24, 20, 0), incomplete=False))
-    staging_rows.append(_staging_row(YFINANCE, time_id=9000, timestamp=datetime(2026, 7, 24, 20, 0), open=0.0, high=0.0, low=0.0, close=0.0, incomplete=True))
+    staging_rows.append(_staging_row(IBKR, time_id=9000, timestamp=datetime(2026, 7, 24, 20, 0), data_quality="accepted"))
+    staging_rows.append(
+        _staging_row(YFINANCE, time_id=9000, timestamp=datetime(2026, 7, 24, 20, 0), open=0.0, high=0.0, low=0.0, close=0.0, data_quality="incomplete")
+    )
     database = FakeReconcileDatabase(PROVIDERS, FIELD_GROUPS, staging_rows, fields=FIELDS)
 
     resolved, stuck = run_reconciliation(database, _settings(), finalize=False)
@@ -276,8 +278,10 @@ def test_ticker_graduates_at_threshold_and_resolves_same_run():
     # the ticker's ENTIRE currently-fetched backlog (matched and unmatched together) resolves in
     # this same run, not just the batch used to compute the tolerance.
     staging_rows = _matched_bar_rows(GRADUATION_THRESHOLD_MATCHED_BARS)
-    staging_rows.append(_staging_row(IBKR, time_id=9000, timestamp=datetime(2026, 7, 24, 20, 0), incomplete=False))
-    staging_rows.append(_staging_row(YFINANCE, time_id=9000, timestamp=datetime(2026, 7, 24, 20, 0), open=0.0, high=0.0, low=0.0, close=0.0, incomplete=True))
+    staging_rows.append(_staging_row(IBKR, time_id=9000, timestamp=datetime(2026, 7, 24, 20, 0), data_quality="accepted"))
+    staging_rows.append(
+        _staging_row(YFINANCE, time_id=9000, timestamp=datetime(2026, 7, 24, 20, 0), open=0.0, high=0.0, low=0.0, close=0.0, data_quality="incomplete")
+    )
     database = FakeReconcileDatabase(PROVIDERS, FIELD_GROUPS, staging_rows, fields=FIELDS)
 
     resolved, stuck = run_reconciliation(database, _settings(), finalize=False)

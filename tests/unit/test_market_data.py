@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from quant_data.client.market_data import MarketData
-from quant_data.protocols import OHLCV, PendingResolutionBar, ProviderRole
+from quant_data.protocols import OHLCV, DataQuality, PendingResolutionBar, ProviderRole, RejectedWhistleblowerBar
 from tests.mocks.postgres import MockPostgresDatabase
 
 
@@ -49,6 +49,32 @@ def test_fetch_pending_resolution_bars_delegates_to_provider():
         if candidate.role == ProviderRole.WHISTLEBLOWER:
             whistleblower_providers.append(candidate.provider)
     assert whistleblower_providers == ["yfinance"]
+
+
+def test_fetch_rejected_whistleblower_bars_delegates_to_provider():
+    provider = MockPostgresDatabase()
+    provider.rejected_whistleblower_bars = [
+        RejectedWhistleblowerBar(
+            provider="yfinance",
+            bar=OHLCV(
+                ticker="SPY",
+                timestamp=datetime(2026, 8, 3, 13, 30),
+                open=1.0,
+                high=2.0,
+                low=0.5,
+                close=1.5,
+                volume=100,
+                data_quality=DataQuality.REJECTED,
+            ),
+        ),
+    ]
+    client = MarketData(provider)
+
+    rejected = client.fetch_rejected_whistleblower_bars("spy", date(2026, 8, 3), date(2026, 8, 3))
+
+    assert len(rejected) == 1
+    assert rejected[0].provider == "yfinance"
+    assert rejected[0].bar.data_quality == DataQuality.REJECTED
 
 
 def test_close_delegates_to_provider():

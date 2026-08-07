@@ -384,15 +384,21 @@ under `/local/` to the box:
   reputation tracking with no changes needed there.
 
 - **File**: [Yahoo data sanitization](tasks/yahoo_data_sanitization.md)
-- **Status**: Brainstorm — disposition (mark outlier bars `incomplete=True` and keep the row,
-  reusing Tier 1/`_resolve_completeness` rather than discarding at ingest or building a new tier)
-  **re-opened for discussion 2026-08-05**: the DV team framing of this as "remove the outliers"
-  is in tension with "keep the row, just flag it" — needs explicit reconciling before filing the
-  GitHub issue. Outlier-detection rule also still open. **Direct dependency on `ingestion_coverage`
-  found 2026-08-06**: "remove the row" (not "mark incomplete") only works safely once
-  `ingestion_coverage`'s still-unfinished write path exists — otherwise every removed outlier just
-  becomes a new orphaned/unaccounted bar, the same problem already confirmed live at scale
-  (12,061 `ibkr` rows, ~20% of `staging_market_data_1min`). See the task file's Design decisions.
+- **Status**: Brainstorm — outlier definition converged in a 2026-08-06 design session (intra-provider
+  MAD-based reversal/trend check, session-boundary-aware, per-ticker DB-stored thresholds — seed
+  coefficients unvalidated). The `incomplete: bool` → tri-state `data_quality` (`accepted`/
+  `incomplete`/`rejected`) schema foundation this depends on was split out and **implemented**
+  (croicu/quant-data#32, `status:implementation`) — breaking change to public `OHLCV.incomplete`,
+  announced cross-repo via croicu/quant-scratch#16; migration `009` written but **not yet applied to
+  the real database** (needs the repo owner via `psql` as `quant_data`); no code path sets `rejected`
+  yet, just the foundation. Same issue also added `MarketData.fetch_rejected_whistleblower_bars` —
+  surfaces a rejected `yfinance` value even when it auto-resolved via Tier 1 and never became
+  pending, which `fetch_pending_resolution_bars` alone can't show. Still open on the
+  outlier-detection feature itself: threshold validation
+  against the 622-bar backlog, whether the check lives at ingest or reconcile time. The earlier
+  "remove vs. keep" tension is still unresolved too, and still depends on `ingestion_coverage`'s
+  unfinished write path if "remove" wins (12,061 `ibkr` rows already stuck the same way from
+  ordinary coverage gaps, ~20% of `staging_market_data_1min`).
 - **Key Context**: spawned from the same `SPY` investigation above. `yfinance`'s raw feed shows
   sporadic single-field spikes (confirmed via 3-day candlestick comparison against `ibkr`'s smooth
   curve) that drag an otherwise-agreeing bar's whole `field_group` comparison outside tolerance

@@ -8,6 +8,7 @@ import pytest
 
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.providers.yfinance import YahooFinanceIntraDay
+from quant_data.protocols import DataQuality
 
 
 def _history_frame(rows: list[dict]) -> pandas.DataFrame:
@@ -66,9 +67,9 @@ def test_fetch_bars_flags_nan_rows_as_incomplete(mock_yfinance):
 
     assert len(bars) == 2
     assert bars[0].ticker == "AAPL"
-    assert bars[0].incomplete is False
+    assert bars[0].data_quality == DataQuality.ACCEPTED
     assert bars[0].volume == 1000
-    assert bars[1].incomplete is True
+    assert bars[1].data_quality == DataQuality.INCOMPLETE
     assert bars[1].volume == 0
     assert bars[1].open == 0.0
 
@@ -93,7 +94,7 @@ def test_fetch_bars_flags_literal_zero_volume_as_incomplete(mock_yfinance):
 
     assert len(bars) == 1
     assert bars[0].volume == 0
-    assert bars[0].incomplete is True
+    assert bars[0].data_quality == DataQuality.INCOMPLETE
     # A literal 0 is a real (if suspicious) OHLC reading, unlike the NaN case -- only volume
     # drives incomplete here, open/high/low/close shouldn't be coerced to 0.0.
     assert bars[0].open == 100.0
