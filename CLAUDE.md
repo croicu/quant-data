@@ -184,6 +184,24 @@ own other repos), this whole rule doesn't apply — follow normal GitHub OSS eti
 section if/when that actually happens; it's not a case worth designing for speculatively before a
 real external contributor shows up.
 
+## Branching and PRs
+
+`main` is branch-protected on GitHub (PR required, 0 required reviews, `enforce_admins: true`,
+`lint-and-test` CI check required, no force-pushes/deletions) — set up 2026-08-13 to mirror
+[`geo-places`](https://github.com/croicu/geo-places)'s setup. This means direct pushes to `main`
+are rejected for everyone, including the repo owner, so all work (feature or ad-hoc) goes through
+a branch:
+
+1. Starting new work: create a feature branch off `main` (not on `main` directly).
+2. Commit as usual — see "Before committing" below; the per-commit pause still applies on a
+   feature branch exactly as it would have on `main`.
+3. Once ready: push the branch and open a PR (`gh pr create`).
+4. The user reviews and merges the PR themselves, then deletes the branch. Don't merge or delete
+   the branch — that's the user's call, same spirit as "Who closes an issue" above.
+
+This doesn't change the two-remotes workflow in "Git Remotes" below — `croicuws1` pushes still
+happen from `main` after a PR merge, not from a feature branch.
+
 ## Before committing
 
 Run these before every commit:
