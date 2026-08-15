@@ -47,13 +47,19 @@ thing by another name.
   from `quant-reconcile`, or does the raw multi-venue-record-per-minute shape (mentioned in
   `tasks/finalize_targeted_promotion.md` — "combined by hand via min-of-lows/max-of-highs")
   need its own normalization step built first?
-- **Where does DataBento's value live?** Not obviously a `dim_provider` row — that table's
-  `role` is a closed `CHECK` (`candidate`/`whistleblower`, see `docs/SCHEMA.md`), and DataBento
-  here is neither: it doesn't report routinely (candidate) and isn't a permanent audit trail of
-  every bar (whistleblower). Options: a third role added to the `CHECK` constraint, a table
-  outside `dim_provider`/`staging_market_data_1min` entirely (e.g. a narrow
-  `stuck_bar_verification` table keyed by the same (ticker, date, time, field_group) grain), or
-  no persistence at all — fetch-and-display only, never stored.
+- **Where does DataBento's value live? Partially resolved by `011_add_market_data_archive`**
+  (croicu/quant-data#35, closed) — `dim_provider.role` gained a third value, `'advisor'`
+  ("can suggest a value but has no autonomous authoring rights"), and `'databento'` was seeded as
+  a `dim_provider` row with that role. But that migration deliberately gave it **zero footprint
+  beyond the identity row itself** — no archive entry, no `fact_reconciliation_participant` row,
+  since neither of the two planned finalize APIs (`tasks/finalize_targeted_promotion.md`) ever
+  names `databento` as the thing being accepted. So the `dim_provider` row exists now, but the
+  original question — does a DataBento pull actually get persisted anywhere (matching this file's
+  "no persistence at all" option), or does this task still want its own storage (the narrower
+  `stuck_bar_verification` table option)? — is still open. Revisit once
+  `finalize_targeted_promotion.md`'s two-API design is actually implemented, since that's what
+  determines whether "fetch-and-display only" is sufficient or whether DataBento verification
+  needs to leave its own audit trail.
 - **Field-group grain**: `fact_pending_manual_resolution` operates at (bar, field_group) grain
   (today just `'ohlc'`). Does a DataBento pull fetch/compare the whole bar or just the disputed
   field_group?

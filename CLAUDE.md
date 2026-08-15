@@ -430,19 +430,6 @@ under `/local/` to the box:
   `fact_market_data_1min`, correctly feeding `fact_reconciliation_participant`'s existing
   reputation tracking with no changes needed there.
 
-- **File**: [Staging archive before purge](tasks/staging_archive_before_purge.md)
-- **Status**: Brainstorm, direction chosen — archive a `candidate` row to a new, never-pruned table
-  immediately before `purge_staging_bar` deletes it (over the simpler "just stop purging"
-  alternative), so the working `staging_market_data_1min` table stays lean and the existing
-  full-table sweeps (`_run_outlier_detection_pass`/`fetch_staging_rows_for_reconciliation`) don't
-  slow down as history accumulates. Schema/implementation details still open.
-- **Key Context**: direct consequence of `CLAUDE.md`'s own "No information loss during the data
-  processing stage" principle (added 2026-08-07) being violated in practice — investigating whether
-  `quant-reconcile` could be re-run against a "fresh" dataset found only 4,101 of 52,953 resolved
-  bars still had both providers' original staging rows intact; 41,913 had lost the `candidate` side
-  entirely, 6,939 had nothing left at all. The real disagreement evidence behind most already-
-  resolved history is already gone and unrecoverable without this.
-
 - **File**: [DataBento stuck-bar verification](tasks/databento_stuck_bar_verification.md)
 - **Status**: Brainstorm, not converged — several open questions (auto-tiebreaker vs.
   assistive-only, cost/budget, API access model, where a DataBento value would even live given
@@ -777,3 +764,31 @@ under `/local/` to the box:
   detail (numbers, methodology, what's explicitly out of scope) was in
   `tasks/yahoo_data_sanitization.md` before its deletion per this file's "delete once the issue
   closes" convention — see issue #32's comments for the same summary.
+- **Archive candidate rows before purge; `market_data_archive`** — closed issue #35 (commit
+  `473ccd0`), opened and closed by Claude mid-task per this file's "Who closes an issue" exception.
+  `purge_staging_bar` now archives a candidate's staging row into the new, permanent
+  `market_data_archive` table before deleting it (one transaction) — closes the information-loss
+  gap where a resolved bar's raw disagreement evidence was gone for good once purged (only 4,101 of
+  52,953 resolved bars checked 2026-08-07 still had both providers' original staging rows intact).
+  Whistleblower rows unaffected, still never purged. `dim_provider.role` gained a third value,
+  `'advisor'` (seeds `'manual'`/`'databento'`) — can suggest a value but has no autonomous authoring
+  rights, unlike `'candidate'`. `fact_reconciliation_participant` gained a nullable `archive_id`,
+  back-filled once a participant's row is actually archived. The two-API finalize surface (accept
+  candidate/whistleblower, accept value) that would let a human write directly to the archive was
+  deliberately deferred to `tasks/finalize_targeted_promotion.md`'s own not-yet-converged scope —
+  this migration only ships the schema/plumbing it depends on.
+
+  Live-verified against a restored CroicuWS1 snapshot twice: once as an incremental fix alongside
+  discovering and fixing a second, unrelated bug (below), once via a full clean-slate rebuild
+  (drop/restore/migrate/reconcile from scratch) — both produced identical final numbers. Confirmed
+  correct `archive_id` back-fill (candidate rows only), whistleblower never archived, zero
+  unaccounted-for data across every stuck/pending/resolved bar traced.
+
+  Testing surfaced two follow-up gaps, both recorded in Pending Tasks above rather than silently
+  dropped: `ingestion_coverage`'s `quant-ingest` write path is still missing (issue #31) — its own
+  one-time backfill had gone stale, stranding ~8,900 real candidate bars in staging behind a
+  since-fixed coverage gate — and its backfill query itself needed a fix (union
+  `staging_market_data_1min` with `market_data_archive`, since a fully-purged date is now invisible
+  to a staging-only query). Separately, candidate-missing bars (the mirror image of #31's
+  whistleblower-missing case) were found to have no resolution path at all, not even into the
+  pending queue — a new, not-yet-designed gap.
