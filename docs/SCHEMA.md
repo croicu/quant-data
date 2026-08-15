@@ -51,6 +51,10 @@ outlier-detection pass (runs before Tiers 1-4, so a newly-rejected bar can auto-
 candidate in the same invocation) are what actually set `data_quality = 'rejected'` now.
 Otherwise `fact_market_data_1min` remains the single golden, reconciled dataset every reader
 (`MarketData`) queries, regardless of which provider(s) a bar's value ultimately came from.
+`012_add_timestamp_to_pending_manual_resolution` added `fact_pending_manual_resolution.timestamp`,
+a schema-consistency fix bringing it in line with every other fact/staging table's denormalized
+`timestamp` column (see its own section below and
+[croicu/quant-data#36](https://github.com/croicu/quant-data/issues/36)).
 
 ## `dim_ticker`
 
@@ -346,6 +350,7 @@ overrides, so this table can (and likely will) stay empty for a long time.
 | `date_id` | `INT NOT NULL` | FK → `dim_date` |
 | `time_id` | `INT NOT NULL` | FK → `dim_time` |
 | `field_group_id` | `INT NOT NULL` | FK → `dim_field_group` |
+| `timestamp` | `TIMESTAMP NOT NULL` | UTC, same as `fact_market_data_1min`/`staging_market_data_1min`/`market_data_archive`. Added in `012_add_timestamp_to_pending_manual_resolution` |
 | `flagged_at` | `TIMESTAMP` | Defaults to insert time |
 
 Primary key: `(ticker_id, date_id, time_id, field_group_id)`. Added in
@@ -369,6 +374,15 @@ provider's raw value *and* whether it's the candidate or whistleblower, rather t
 that a bar is stuck. Requires `quant_reader` to have `SELECT` on `staging_market_data_1min`,
 `dim_field_group`, and `dim_provider` in addition to this table — see `docs/DATABASE.md`'s
 "Granting quant_reader access to new tables".
+
+`timestamp` (added in `012_add_timestamp_to_pending_manual_resolution`,
+[croicu/quant-data#36](https://github.com/croicu/quant-data/issues/36)) brings this table in line
+with every other fact/staging table, all of which carry a denormalized `timestamp` alongside their
+`date_id`/`time_id` dimension keys — this was the one holdout, forcing a `dim_date`/`dim_time` join
+just to get a readable timestamp. Surfaced building a Power Query/Excel dashboard against
+`quant-data` from `quant-scratch`'s `open-quant-data` tool
+([croicu/quant-scratch#19](https://github.com/croicu/quant-scratch/issues/19)/
+[#20](https://github.com/croicu/quant-scratch/pull/20)).
 
 ## `dataset_inception`
 

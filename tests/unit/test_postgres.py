@@ -744,7 +744,7 @@ def test_mark_pending_manual_resolution_inserts(mock_psycopg):
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
 
-    database.mark_pending_manual_resolution(1, 10, 20, 1)
+    database.mark_pending_manual_resolution(1, 10, 20, 1, datetime(2026, 7, 24, 13, 30))
 
     mock_connection.commit.assert_called_once()
     mock_connection.rollback.assert_not_called()
@@ -759,7 +759,7 @@ def test_mark_pending_manual_resolution_rolls_back_on_error(mock_psycopg):
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
 
     with pytest.raises(AppError):
-        database.mark_pending_manual_resolution(1, 10, 20, 1)
+        database.mark_pending_manual_resolution(1, 10, 20, 1, datetime(2026, 7, 24, 13, 30))
 
     mock_connection.rollback.assert_called_once()
 

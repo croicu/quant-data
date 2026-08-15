@@ -751,7 +751,7 @@ class PostgresDatabase:
             result.add((ticker_id, date_id, time_id, field_group_id))
         return result
 
-    def mark_pending_manual_resolution(self, ticker_id: int, date_id: int, time_id: int, field_group_id: int) -> None:
+    def mark_pending_manual_resolution(self, ticker_id: int, date_id: int, time_id: int, field_group_id: int, timestamp: datetime) -> None:
         """Records that a (bar, field group) exhausted the automatic pass's Tiers 1-3 within a run
         and is now awaiting --finalize or manual correction -- future plain quant-reconcile runs
         will skip it entirely via fetch_staging_rows_for_reconciliation's NOT EXISTS check."""
@@ -759,11 +759,11 @@ class PostgresDatabase:
             with self._connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO fact_pending_manual_resolution (ticker_id, date_id, time_id, field_group_id)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO fact_pending_manual_resolution (ticker_id, date_id, time_id, field_group_id, timestamp)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (ticker_id, date_id, time_id, field_group_id) DO NOTHING
                     """,
-                    (ticker_id, date_id, time_id, field_group_id),
+                    (ticker_id, date_id, time_id, field_group_id, timestamp),
                 )
             self._connection.commit()
         except psycopg.Error as error:

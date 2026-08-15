@@ -654,13 +654,13 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
             break
 
     newly_pending = 0
-    for bar_key in eligible_bars:
+    for bar_key, rows in eligible_bars.items():
         ticker_id, date_id, time_id = bar_key
         current_bar_resolutions = resolved_by_bar[bar_key]
         for field_group_id in all_field_group_ids:
             if field_group_id in current_bar_resolutions:
                 continue
-            database.mark_pending_manual_resolution(ticker_id, date_id, time_id, field_group_id)
+            database.mark_pending_manual_resolution(ticker_id, date_id, time_id, field_group_id, rows[0].timestamp)
             newly_pending += 1
 
     _promote_and_lazily_purge(database, eligible_bars, resolved_by_bar, bar_key_by_ticker_timestamp, all_field_group_ids, field_group_ids_by_name["ohlc"])
