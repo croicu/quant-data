@@ -198,6 +198,13 @@ GRANT SELECT ON staging_market_data_1min, fact_pending_manual_resolution, dim_fi
 Without this, `fetch_pending_resolution_bars` fails with a real Postgres `permission denied`, the
 same enforcement `docs/ARCHITECTURE.md` documents for the write side.
 
+Migration `011` (`market_data_archive`, croicu/quant-data#35) similarly needs its own grant, per the
+decision to keep a single reader role rather than a more granular set of accounts:
+
+```sql
+GRANT SELECT ON market_data_archive TO quant_reader;
+```
+
 ## Granting `quant_writer` access to new tables
 
 Same gap as `quant_reader` above, on the write-role side: `quant_writer` doesn't automatically get
@@ -223,6 +230,21 @@ INSERT INTO dataset_inception (inception_date) VALUES ('2020-01-01');
 ```
 
 `quant-ingest --backfill` fails with a clear `AppError` (not a silent no-op) until this row exists.
+
+Migration `011` (`market_data_archive`, croicu/quant-data#35) needs `quant_writer` to both insert
+archived rows and back-fill the `archive_id` it just created onto the corresponding
+`fact_reconciliation_participant` row (`PostgresDatabase.purge_staging_bar`'s archive-then-delete):
+
+```sql
+GRANT INSERT ON market_data_archive TO quant_writer;
+GRANT USAGE ON SEQUENCE market_data_archive_archive_id_seq TO quant_writer;
+GRANT UPDATE (archive_id) ON fact_reconciliation_participant TO quant_writer;
+```
+
+The sequence grant is the easy one to miss — `archive_id`'s `SERIAL` default calls `nextval()`
+under the hood, which needs its own `USAGE` grant separately from the table's `INSERT` grant. This
+is also the first table `quant_writer` inserts into that has a `SERIAL` primary key (every table it
+writes to so far uses a composite natural key), so it's the first time this gap has come up.
 
 ## Populating real data
 

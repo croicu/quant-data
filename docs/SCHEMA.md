@@ -51,6 +51,11 @@ outlier-detection pass (runs before Tiers 1-4, so a newly-rejected bar can auto-
 candidate in the same invocation) are what actually set `data_quality = 'rejected'` now.
 Otherwise `fact_market_data_1min` remains the single golden, reconciled dataset every reader
 (`MarketData`) queries, regardless of which provider(s) a bar's value ultimately came from.
+`011_add_market_data_archive` widened `dim_provider.role` with a third value, `'advisor'` (seeding
+`'manual'` and `'databento'`), and added `market_data_archive` — a permanent record of a bar's raw
+provider value once no longer kept in `staging_market_data_1min`, closing the information-loss gap
+`purge_staging_bar` had (see its own section below and
+[croicu/quant-data#35](https://github.com/croicu/quant-data/issues/35)).
 `012_add_timestamp_to_pending_manual_resolution` added `fact_pending_manual_resolution.timestamp`,
 a schema-consistency fix bringing it in line with every other fact/staging table's denormalized
 `timestamp` column (see its own section below and
@@ -91,20 +96,29 @@ populated once, not per ticker/date.
 |---|---|---|
 | `provider_id` | `SERIAL PRIMARY KEY` | |
 | `name` | `TEXT NOT NULL UNIQUE` | Always lowercase — enforced by a `CHECK` constraint |
-| `role` | `TEXT NOT NULL DEFAULT 'candidate'` | `'candidate'` or `'whistleblower'`, enforced by a `CHECK` constraint. Added in `004_add_reconciliation_tables` |
+| `role` | `TEXT NOT NULL DEFAULT 'candidate'` | `'candidate'`, `'whistleblower'`, or `'advisor'`, enforced by a `CHECK` constraint. Added in `004_add_reconciliation_tables`; widened with `'advisor'` in `011_add_market_data_archive` |
 | `created_at` | `TIMESTAMP` | Defaults to insert time |
 
 Data-source dimension, added in `003_add_dim_provider_and_staging`. Seeded with `'yfinance'` and
 `'ibkr'` — IBKR's real and paper accounts return identical market data, so both share the single
-`'ibkr'` row; the account used is an execution detail, not a distinct data identity. Not hardcoded
-to exactly two rows — more providers can be added later without a design change.
+`'ibkr'` row; the account used is an execution detail, not a distinct data identity. `011` added
+`'manual'` and `'databento'`, both `role = 'advisor'`. Not hardcoded to exactly these rows — more
+providers can be added later without a design change.
 
 `role` distinguishes real candidate providers (`'ibkr'` today — data that can actually be promoted
 into `fact_market_data_1min`) from a whistleblower provider (`'yfinance'` — compared against to
 derive reconciliation's tolerance and completeness signals, never promoted except via a person's
-manual correction; see `tasks/quant-reconcile.md`). This is the single source of truth for that
-distinction — deliberately not duplicated as a separate list in `settings.json`, so it can't drift
-out of sync with what's actually seeded here.
+manual correction; see `tasks/quant-reconcile.md`) from an advisor provider (`'manual'`,
+`'databento'` — can suggest a value but has no autonomous authoring rights; unlike `'candidate'`,
+an advisor can never win a bar through the automatic Tier 1-3 pass, only through an explicit human
+action). This is the single source of truth for that distinction — deliberately not duplicated as
+a separate list in `settings.json`, so it can't drift out of sync with what's actually seeded here.
+
+`'databento'` has zero footprint anywhere else in the schema — it's a purely out-of-band reference
+a human consults before acting, never itself written to `staging_market_data_1min` or referenced by
+`fact_reconciliation_participant`. `'manual'` is the existing hand-correction path
+(`fact_reconciliation.resolution_path = 'manual_override'`) gaining an actual `dim_provider`
+identity — see `market_data_archive` below.
 
 ## `staging_market_data_1min`
 
@@ -131,7 +145,11 @@ A staging row is purged once its bar reconciles into `fact_market_data_1min` **a
 adjacent minute (`t-1`/`t+1`, same ticker) is still unresolved — a resolved bar's raw rows are kept
 a little longer if a neighboring bar might still need them as a Tier-3 windowed-average input, so a
 bar can be promoted into `fact_market_data_1min` immediately without losing that data for a future
-run (see `docs/ARCHITECTURE.md`'s `reconcile` section). A bar with staging rows still present is in
+run (see `docs/ARCHITECTURE.md`'s `reconcile` section). Since `011_add_market_data_archive`
+(croicu/quant-data#35), a candidate row is archived to `market_data_archive` in the same
+transaction immediately before it's deleted — "purged" no longer means "gone," see
+`market_data_archive` below. The whistleblower's permanent purge exemption is unaffected: its rows
+are still never archived or deleted, exactly as before. A bar with staging rows still present is in
 one of three states: not every configured provider has reported yet; already resolved but waiting
 on a neighbor before it's safe to purge; or the providers disagree beyond tolerance and the bar has
 a row in `fact_pending_manual_resolution` (see below), in which case a plain `quant-reconcile` run
@@ -253,6 +271,7 @@ for the full per-tier logic.
 | `field_group_id` | `INT NOT NULL` | |
 | `provider_id` | `INT NOT NULL` | FK → `dim_provider` |
 | `won` | `BOOLEAN NOT NULL` | |
+| `archive_id` | `INT` | FK → `market_data_archive`, nullable. Added in `011_add_market_data_archive` |
 
 Primary key: `(ticker_id, date_id, time_id, field_group_id, provider_id)`, with a composite foreign
 key on `(ticker_id, date_id, time_id, field_group_id)` back to `fact_reconciliation`. Added in
@@ -264,6 +283,60 @@ filtered (via a join to `fact_reconciliation`) to `resolution_path = 'manual_ove
 separate reputation table needed. For the whistleblower specifically, `won = TRUE` rows (always
 `manual_override`, its only path to winning) are their own signal: how often a person actually
 reached for its value specifically, as opposed to hand-correcting to something else entirely.
+
+`archive_id` starts `NULL` on `INSERT` (`record_reconciliation` never sets it — archiving always
+happens later, if at all this run, via `purge_staging_bar`) and is back-filled once that
+participant's raw value is actually archived: an archived candidate row, or a `'manual'` winner
+(written directly to `market_data_archive`, never staged — see below). Stays permanently `NULL`
+for the whistleblower, which is never archived, and for any candidate not yet purged.
+
+## `market_data_archive`
+
+| Column | Type | Notes |
+|---|---|---|
+| `archive_id` | `SERIAL PRIMARY KEY` | |
+| `provider_id` | `INT NOT NULL` | FK → `dim_provider` |
+| `ticker_id` | `INT NOT NULL` | FK → `dim_ticker` |
+| `date_id` | `INT NOT NULL` | FK → `dim_date` |
+| `time_id` | `INT NOT NULL` | FK → `dim_time` |
+| `timestamp` | `TIMESTAMP NOT NULL` | UTC, same as `staging_market_data_1min` |
+| `open`, `high`, `low`, `close` | `NUMERIC NOT NULL` | Same precision rationale as `fact_market_data_1min` |
+| `volume` | `BIGINT NOT NULL` | `>= 0` |
+| `data_quality` | `TEXT NOT NULL CHECK (data_quality IN ('accepted', 'incomplete', 'rejected'))` | Same meaning as `staging_market_data_1min.data_quality` |
+| `archived_at` | `TIMESTAMP NOT NULL` | Defaults to insert time |
+
+Added in `011_add_market_data_archive` ([croicu/quant-data#35](https://github.com/croicu/quant-data/issues/35),
+`tasks/staging_archive_before_purge.md`). Permanent, append-only record of a bar's raw provider
+value once it's no longer kept in `staging_market_data_1min` — directly motivated by
+`CLAUDE.md`'s "No information loss during the data processing stage" principle, which
+`purge_staging_bar` was violating: once a candidate row was deleted, the original disagreement
+evidence behind an already-resolved bar was gone for good (52,953 resolved bars checked
+2026-08-07; only 4,101 still had both providers' original staging rows intact).
+
+Two ways a row gets here, per the design converged in issue #35:
+
+- **Archived candidate rows** — `purge_staging_bar` inserts here immediately before deleting a
+  candidate's staging row, in the same transaction, then writes the new `archive_id` back onto
+  that provider's `fact_reconciliation_participant` row. Implemented as of this migration.
+  Whistleblower rows are never archived (unaffected by this table entirely) — they're already
+  permanently purge-exempt in staging, per `staging_market_data_1min`'s own retention rule above.
+- **Direct `'manual'` writes** — a hand-entered "accept value" correction (distinct from "accept
+  candidate/whistleblower," which just attributes the win to the real provider and archives
+  nothing new) is written directly here, bypassing staging entirely, unconditionally tagged
+  `provider_id` = `'manual'` even if the value happens to match an existing provider's own
+  reported number. **Not yet implemented** — the CLI/API surface for this
+  (`tasks/finalize_targeted_promotion.md`) is a separate, not-yet-converged follow-up; this
+  migration only adds the schema (table, plus `dim_provider`'s `'manual'` row) it depends on.
+
+Loosely mirrors `staging_market_data_1min`'s columns rather than the leanest possible shape,
+since new columns are expected here over time and a close mirror keeps that trivial. The surrogate
+`archive_id` primary key (rather than the natural `(provider_id, ticker_id, date_id, time_id)` key)
+exists because `fact_reconciliation_participant.archive_id` must be able to reference a `'manual'`
+row with no corresponding staging row to key off of, and because the natural key isn't unique here
+— the same bar can be archived more than once over time (e.g. re-ingested and re-resolved after a
+prior archival). Never pruned — retention is perpetual, by design (a same-instance tablespace move
+to cheaper storage remains available later with zero schema impact if the table ever outgrows
+CroicuWS1's ~10TB, but that's a physical relocation, not a row-count/retention policy).
 
 ## `dim_field`
 
@@ -424,6 +497,10 @@ single shared date, since tickers may already have different amounts of history.
 - `idx_fact_reconciliation_participant_provider` on
   `fact_reconciliation_participant(provider_id, won)` — supports the reputation read pattern:
   aggregating win/loss by provider without scanning the whole table.
+- `idx_market_data_archive_ticker_date_time` on `market_data_archive(ticker_id, date_id, time_id)`
+  — same rationale as `staging_market_data_1min`'s own secondary index: supports "everything ever
+  archived for this bar" lookups, the natural read pattern for an audit table keyed by a surrogate
+  `archive_id`.
 - `fact_pending_manual_resolution` needs no index beyond its own primary key — the table only ever
   holds the pending subset (small and self-limiting, unlike `staging_market_data_1min` which grows
   with every ingested minute), so both the plain pass's per-bar existence check and `--finalize`'s

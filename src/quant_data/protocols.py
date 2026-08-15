@@ -39,13 +39,16 @@ class OHLCV:
 
 
 class ProviderRole(Enum):
-    """Mirrors dim_provider.role's CHECK constraint ('candidate' or 'whistleblower') -- a closed
-    set, unlike e.g. LoggingSink's category strings, so an Enum fits here the same way
+    """Mirrors dim_provider.role's CHECK constraint ('candidate', 'whistleblower', or 'advisor') --
+    a closed set, unlike e.g. LoggingSink's category strings, so an Enum fits here the same way
     quant_data._internal.shared.diagnostics.TelemetryLevel does for the other closed-set string
-    column in this codebase."""
+    column in this codebase. ADVISOR (added in migration 011, e.g. 'manual'/'databento') can
+    suggest a value but has no autonomous authoring rights -- unlike CANDIDATE, it can never win a
+    bar through reconcile's automatic Tier 1-3 pass, only through an explicit human action."""
 
     CANDIDATE = "candidate"
     WHISTLEBLOWER = "whistleblower"
+    ADVISOR = "advisor"
 
 
 @dataclass

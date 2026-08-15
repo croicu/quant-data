@@ -495,6 +495,37 @@ under `/local/` to the box:
   CroicuWS1 with a custom logger object (not quant-data's own `Logger`), confirming every internal
   log call landed there instead.
 
+- **`quant-ingest`'s `ingestion_coverage` write path** — issue #31, opened by the repo owner.
+  `status:implementation`. The schema + one-time backfill (this issue's original scope) and
+  `quant-reconcile`'s consuming side (checking coverage before treating a missing whistleblower row
+  as "confirmed absent," synthesizing the placeholder bar) already shipped. What's still missing:
+  `quant-ingest` itself never records/coalesces coverage on a successful fetch, so the table only
+  ever reflects whatever was in staging at the one-time backfill's moment — it goes stale the
+  instant real ingestion resumes. Confirmed live 2026-08-14 testing `croicu/quant-data#35`'s archive
+  work on a restored snapshot: ~8,900 candidate bars sat stuck in staging (neither resolved nor
+  pending) purely because their dates predated the backfill; re-deriving coverage unstuck 7,950 of
+  them in the next run. **Whoever implements this must derive coverage from
+  `staging_market_data_1min UNION market_data_archive`, not staging alone** — a candidate's staging
+  row can now be archived-and-purged once resolved (`market_data_archive`, #35), so a staging-only
+  query silently understates coverage for any date that's already fully resolved and purged
+  (confirmed: 7 real `(ticker, provider, date)` combos existed only in the archive, invisible to
+  staging). See `tasks/quant_reconcile.md` and the 2026-08-14 comment on issue #31 for the full
+  finding.
+
+- **Candidate-missing bars have no resolution path at all** — found 2026-08-14, same investigation
+  as above, no issue opened yet. Unlike a missing *whistleblower* row (issue #31's exact concern),
+  `fetch_staging_rows_for_reconciliation` requires every configured *candidate* provider to have
+  reported before a bar becomes eligible for reconciliation in the first place — if a candidate
+  (`ibkr` today) simply never writes a row for a minute (e.g. a thin pre-market minute with no
+  trades), that bar_key is invisible to the whole Tier 1-4 pass, and since it's never evaluated it
+  also never reaches `fact_pending_manual_resolution` for a person to see. Concrete case: `PSQ`
+  2026-08-04 08:00 UTC — `yfinance` reported (flagged `incomplete`), `ibkr` never wrote a row at
+  all; the bar is permanently stuck with zero automatic or manual path forward. Not a data-loss
+  concern (the raw `yfinance` row is preserved forever, same as any other whistleblower row) but a
+  completeness gap — needs its own design pass (e.g. should a candidate-confirmed-absent bar at
+  least surface in the pending queue?) before it's implementable; deliberately not bundled into
+  issue #31's fix since the two need different mechanisms.
+
 - **File**: [Scheduled jobs](tasks/scheduled_jobs.md)
 - **Status**: Brainstorm, postponed (see issue #3) — deprioritized, not actively worked
 - **Key Context**: How recurring background/maintenance work (DB maintenance now, ingest scheduling

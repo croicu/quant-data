@@ -502,21 +502,52 @@ def test_promote_bar_to_fact_upserts_fact_only(mock_psycopg):
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
-def test_purge_staging_bar_deletes_staging_rows(mock_psycopg):
+def test_purge_staging_bar_with_no_candidate_rows_only_selects_and_deletes(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.fetchall.return_value = []
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
 
     database.purge_staging_bar(1, 10, 20)
 
-    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
-    mock_cursor.execute.assert_called_once()
+    assert mock_cursor.execute.call_count == 2  # select candidates, then delete -- nothing to archive
     mock_connection.commit.assert_called_once()
 
-    # Whistleblower-role providers must be excluded from the delete (croicu/quant-data#28) --
-    # guards against an accidental revert to an unconditional delete.
-    call_args = mock_cursor.execute.call_args
-    assert call_args.args[1] == (1, 10, 20, ProviderRole.WHISTLEBLOWER.value)
+    # Whistleblower-role providers must be excluded from both the select and the delete
+    # (croicu/quant-data#28) -- guards against an accidental revert to an unconditional delete.
+    for call in mock_cursor.execute.call_args_list:
+        assert call.args[1] == (1, 10, 20, ProviderRole.WHISTLEBLOWER.value)
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_purge_staging_bar_archives_candidate_rows_before_deleting(mock_psycopg):
+    # croicu/quant-data#35: archive-then-delete -- each selected candidate row is inserted into
+    # market_data_archive (RETURNING archive_id), that archive_id is written back onto the
+    # provider's fact_reconciliation_participant row, and only then is the staging row deleted.
+    mock_connection = _connect(mock_psycopg, [(501,), (502,)])
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.fetchall.return_value = [
+        (2, datetime(2026, 7, 24, 13, 30), 100.0, 101.0, 99.0, 100.5, 1000, "accepted"),
+        (3, datetime(2026, 7, 24, 13, 30), 100.1, 101.1, 99.1, 100.6, 1001, "accepted"),
+    ]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.purge_staging_bar(1, 10, 20)
+
+    mock_connection.commit.assert_called_once()
+    calls = mock_cursor.execute.call_args_list
+    assert len(calls) == 1 + 2 * 2 + 1  # select + (archive insert + participant update) * 2 rows + delete
+
+    insert_calls = [call for call in calls if "INSERT INTO market_data_archive" in call.args[0]]
+    assert [call.args[1][0] for call in insert_calls] == [2, 3]  # provider_id, in select order
+
+    update_calls = [call for call in calls if "UPDATE fact_reconciliation_participant" in call.args[0]]
+    assert [call.args[1] for call in update_calls] == [(501, 1, 10, 20, 2), (502, 1, 10, 20, 3)]
+
+    delete_calls = [call for call in calls if "DELETE FROM staging_market_data_1min" in call.args[0]]
+    assert len(delete_calls) == 1
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
