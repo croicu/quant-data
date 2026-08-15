@@ -246,6 +246,16 @@ under the hood, which needs its own `USAGE` grant separately from the table's `I
 is also the first table `quant_writer` inserts into that has a `SERIAL` primary key (every table it
 writes to so far uses a composite natural key), so it's the first time this gap has come up.
 
+Migration `013` (`materiality_floor`, `tasks/materiality_floor_tolerance.md`) needs `quant_writer`
+to read it (`PostgresDatabase.fetch_materiality_floors`, called once per `quant-reconcile` run):
+
+```sql
+GRANT SELECT ON materiality_floor TO quant_writer;
+```
+
+No `quant_reader` grant needed — like `data_quality_thresholds`, this is a purely internal
+reconcile-tuning table, never read via `MarketData`.
+
 ## Populating real data
 
 `quant-ingest` fetches bars from Yahoo Finance over an inclusive date range and writes them into

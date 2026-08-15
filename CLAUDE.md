@@ -444,6 +444,26 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
+- **Per-minute volume appears to strongly predict inter-provider (`ibkr`/`yfinance`) disagreement
+  noise** — found 2026-08-15 while calibrating a real value for `materiality_floor`
+  (croicu/quant-data#40), not yet its own issue. Comparing avg `ibkr` per-bar volume against avg
+  disagreement (in bps of reference price) across every ticker with a non-trivial pending-manual-
+  resolution sample: `SPY` (396,509 vol → 0.374 bps) → `IWM` (203,452 → 0.822) → `QQQ` (164,358 →
+  1.301) → `DIA` (49,355 → 1.039) → `PSQ` (38,993 → 3.952) → `DOG` (9,986 → 5.017) — volume rank
+  and noise rank line up almost exactly across the whole set (`SH` the one exception, but only 2
+  pending bars, too small a sample to weigh). Surfaced concretely investigating why `QQQ` (fewer
+  index constituents than `SPY`, which intuitively should mean *less* noise if basket complexity
+  were the driver) actually shows ~3.5x `SPY`'s disagreement — number of underlying constituents
+  and the ETF's own trading liquidity are different variables; what apparently matters is how
+  liquid/tightly-quoted the traded security itself is minute-to-minute, not what's underneath the
+  wrapper. **This directly conflicts with the DOG stuck-rate investigation below (marked ⚠), which
+  ruled out volume as an explanation on a different, larger sample** — not yet reconciled; worth
+  its own investigation (larger sample, control for price level properly, check `SH`/`RWM` once
+  they have enough pending bars to measure) before treating it as settled. If it holds up, this is
+  a more powerful, more general finding than the original DOG investigation: a volume-based model
+  could plausibly inform `materiality_floor` (or even `provider_pair_disagreement` tolerance more
+  broadly) *across* tickers, rather than needing pure per-ticker trial and error.
+
 - **Fix ~130s SSH-tunnel connect stall; add `Logger.perf()` timing markers** — issue #19, opened by
   the repo owner from `quant-scratch`-side testing. `status:ready-for-integration`, fix pushed to
   `main` as `cd424a0` — **left open**, per this file's "Who closes an issue" rule:
@@ -676,7 +696,9 @@ under `/local/` to the box:
   `boundary_fix`), then the pending-queue mechanism itself live-flagging that real backlog (`DOG`
   499/`PSQ` 66/`SH` 54/`SPY` 3, confirmed skipped by a follow-up run). Investigating why `DOG`
   disagreed at a 25.9% stuck rate (vs. `PSQ`/`SH`'s ~1.8%, `QQQ`/`DIA`/`SPY`'s ~0%) ruled out
-  ticker-average volume, per-bar volume, and price level as explanations, and spawned two
+  ticker-average volume, per-bar volume, and price level as explanations **(⚠ needs
+  re-verification — see the volume/noise correlation finding under Pending Tasks below, which
+  directly conflicts with this on a different, smaller sample; not yet reconciled)**, and spawned two
   follow-up tasks: `tasks/per_ticker_disagreement.md` (give `provider_pair_disagreement` a
   `ticker_id` dimension) and `tasks/inverse_pair_cross_check.md` (explicitly postponed — use
   `DOG`/`SH`/`PSQ`'s already-reliable long counterpart as a third-reference anomaly flag on
