@@ -642,6 +642,51 @@ the full design (field consistency groups, the candidate/whistleblower model, th
 
 ## Data flow
 
+```
+   yfinance (whistleblower)                 ibkr (candidate)
+            |                                       |
+            +--------------------+------------------+
+                                 |
+                                 v   quant-ingest (quant_writer)
+                 +---------------------------------+      +--------------------------+
+                 |    staging_market_data_1min     |----->|    market_data_archive   |
+                 +---------------------------------+      +--------------------------+
+                                 |                          (candidate row only, once no
+                                 v   quant-reconcile          longer needed as a Tier-3
+                 +---------------------------------+          neighbor; whistleblower
+                 |     outlier-detection pass      |           row is never purged)
+                 |    (whistleblower ticks only)   |
+                 +---------------------------------+
+                                 |
+                                 v
+   +-------------------------------------------------------+
+   |  Tiers 1-3: completeness / agreement / boundary-fix   |
+   |  tolerance = max(k * stddev * reference, floor)       |
+   +-------------------------------------------------------+
+          |                                    |
+     resolved                               stuck
+          |                                    v
+          |                  +-------------------------------------+
+          |                  |   fact_pending_manual_resolution    |
+          |                  +-------------------------------------+
+          |                                    |
+          |                     --finalize (preferredProvider,
+          |                      no tolerance) / manual correction
+          |                                    |
+          v                                    v
+   +-----------------------------------------------------+
+   |               fact_market_data_1min                 |
+   +-----------------------------------------------------+
+          |
+          v
+   +----------------------------+
+   |  MarketData (quant_reader) |
+   +----------------------------+
+          |
+          v
+   quant-scratch and other consumers
+```
+
 A caller supplies `ticker` + a date range → `MarketDataProvider.fetch_bars` joins
 `fact_market_data_1min` against `dim_ticker`/`dim_date` for that ticker/range → returns `OHLCV`
 rows ordered by timestamp.
