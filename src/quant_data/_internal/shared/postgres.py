@@ -888,23 +888,61 @@ class PostgresDatabase:
             raise AppError(f"Failed to promote bar ({ticker_id}, {date_id}, {time_id}) to fact_market_data_1min: {error}") from error
 
     def purge_staging_bar(self, ticker_id: int, date_id: int, time_id: int) -> None:
-        """Deletes a fully-resolved bar's staging rows for every candidate provider. Split out
-        from promote_bar_to_fact so a bar can be promoted immediately while its raw staging data
-        is deliberately kept a little longer if an adjacent bar (t-1/t+1) hasn't resolved yet and
-        might still need it as a Tier-3 windowed-average neighbor -- purging immediately on
+        """Archives, then deletes, a fully-resolved bar's staging rows for every candidate
+        provider -- one transaction, so a row is never deleted without first landing in
+        market_data_archive (croicu/quant-data#35, tasks/staging_archive_before_purge.md). Split
+        out from promote_bar_to_fact so a bar can be promoted immediately while its raw staging
+        data is deliberately kept a little longer if an adjacent bar (t-1/t+1) hasn't resolved yet
+        and might still need it as a Tier-3 windowed-average neighbor -- purging immediately on
         promotion permanently lost that data for any future run (tasks/quant_reconcile.md's
         "missing neighbor" gap).
 
+        Each archived row's new archive_id is also written back onto that provider's
+        fact_reconciliation_participant row (left NULL by record_reconciliation, since archiving
+        always happens later than that INSERT, if it happens at all this run).
+
         Whistleblower-role providers (yfinance today) are permanently exempt -- their rows are
-        never deleted here, unlike candidates' (croicu/quant-data#28). Rationale is irreplaceability,
-        not just audit trail: Yahoo's historical access policy is external and not guaranteed, so
-        whatever's already been fetched may be the only copy that will ever exist. Accepted
-        tradeoff: unbounded storage growth for a provider whose individual bars are never promoted.
-        The orphaned whistleblower row becomes permanently inert for reconcile's purposes once its
-        candidate siblings are gone (fetch_staging_rows_for_reconciliation's expected-provider-count
-        check can never be satisfied again for that bar_key), which needs no compensating logic."""
+        never archived or deleted here, unlike candidates' (croicu/quant-data#28). Rationale is
+        irreplaceability, not just audit trail: Yahoo's historical access policy is external and
+        not guaranteed, so whatever's already been fetched may be the only copy that will ever
+        exist. Accepted tradeoff: unbounded storage growth for a provider whose individual bars are
+        never promoted. The orphaned whistleblower row becomes permanently inert for reconcile's
+        purposes once its candidate siblings are gone (fetch_staging_rows_for_reconciliation's
+        expected-provider-count check can never be satisfied again for that bar_key), which needs
+        no compensating logic."""
         try:
             with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT provider_id, timestamp, open, high, low, close, volume, data_quality
+                    FROM staging_market_data_1min
+                    WHERE ticker_id = %s AND date_id = %s AND time_id = %s
+                      AND provider_id NOT IN (SELECT provider_id FROM dim_provider WHERE role = %s)
+                    """,
+                    (ticker_id, date_id, time_id, ProviderRole.WHISTLEBLOWER.value),
+                )
+                rows_to_archive = cursor.fetchall()
+
+                for provider_id, timestamp, open_, high, low, close, volume, data_quality in rows_to_archive:
+                    cursor.execute(
+                        """
+                        INSERT INTO market_data_archive
+                            (provider_id, ticker_id, date_id, time_id, timestamp, open, high, low, close, volume, data_quality)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING archive_id
+                        """,
+                        (provider_id, ticker_id, date_id, time_id, timestamp, open_, high, low, close, volume, data_quality),
+                    )
+                    archive_id = cursor.fetchone()[0]
+                    cursor.execute(
+                        """
+                        UPDATE fact_reconciliation_participant
+                        SET archive_id = %s
+                        WHERE ticker_id = %s AND date_id = %s AND time_id = %s AND provider_id = %s
+                        """,
+                        (archive_id, ticker_id, date_id, time_id, provider_id),
+                    )
+
                 cursor.execute(
                     """
                     DELETE FROM staging_market_data_1min
@@ -916,7 +954,7 @@ class PostgresDatabase:
             self._connection.commit()
         except psycopg.Error as error:
             self._connection.rollback()
-            raise AppError(f"Failed to purge staging rows for bar ({ticker_id}, {date_id}, {time_id}): {error}") from error
+            raise AppError(f"Failed to archive and purge staging rows for bar ({ticker_id}, {date_id}, {time_id}): {error}") from error
 
     def save_provider_pair_disagreement_batch(self, rows: list[tuple[int, int, int, int, float, float, float]]) -> None:
         """Upserts every (provider_id, ticker_id, field_id, sample_count, running_mean, running_m2,

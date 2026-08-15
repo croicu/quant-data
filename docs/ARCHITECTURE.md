@@ -86,11 +86,13 @@ independent top-level packages.
   `docs/SCHEMA.md`'s `fact_market_data_1min.data_quality`). Re-exported at the `quant_data` top
   level. **Breaking change (`009_replace_incomplete_with_data_quality`)**: this field was
   `incomplete: bool` before; now `data_quality: DataQuality`.
-- `ProviderRole(Enum)`: `CANDIDATE`/`WHISTLEBLOWER`, mirroring `dim_provider.role`'s `CHECK`
-  constraint. A closed set (unlike e.g. `LoggingSink`'s open `category` strings), so this follows
-  the same pattern as `_internal.shared.diagnostics.TelemetryLevel` — the one other closed-set
-  string column in this codebase already modeled as an `Enum` — rather than a plain `str`.
-  Re-exported at the `quant_data` top level.
+- `ProviderRole(Enum)`: `CANDIDATE`/`WHISTLEBLOWER`/`ADVISOR` (`ADVISOR` added in
+  `011_add_market_data_archive`, croicu/quant-data#35 — can suggest a value but has no autonomous
+  authoring rights, unlike `CANDIDATE`), mirroring `dim_provider.role`'s `CHECK` constraint. A
+  closed set (unlike e.g. `LoggingSink`'s open `category` strings), so this follows the same
+  pattern as `_internal.shared.diagnostics.TelemetryLevel` — the one other closed-set string column
+  in this codebase already modeled as an `Enum` — rather than a plain `str`. Re-exported at the
+  `quant_data` top level.
 - `DataQuality(Enum)`: `ACCEPTED`/`INCOMPLETE`/`REJECTED`, mirroring
   `staging_market_data_1min`/`fact_market_data_1min.data_quality`'s `CHECK` constraint — same
   closed-set-`Enum` precedent as `ProviderRole`. `REJECTED` is treated identically to `INCOMPLETE`
@@ -582,6 +584,20 @@ the full design (field consistency groups, the candidate/whistleblower model, th
   permanently inert for reconcile's purposes — `fetch_staging_rows_for_reconciliation`'s
   every-configured-provider-reported check can never be satisfied again for that bar_key, so it
   never resurfaces, needing no compensating logic.
+- **Archive-then-delete (croicu/quant-data#35).** `purge_staging_bar` no longer just deletes a
+  candidate's staging rows — in the same transaction, it first inserts each one into
+  `market_data_archive` (a permanent, append-only table), then writes that new `archive_id` back
+  onto the corresponding `fact_reconciliation_participant` row (left `NULL` by `record_reconciliation`,
+  since archiving always happens later than that `INSERT`, if it happens at all this run), and only
+  then deletes the staging row. Closes a real information-loss gap: as of `CLAUDE.md`'s "No
+  information loss during the data processing stage" principle being violated in practice, only
+  4,101 of 52,953 resolved bars checked 2026-08-07 still had both providers' original staging rows
+  intact. Whistleblower rows are unaffected — still never archived or deleted, exactly as before.
+  See `tasks/staging_archive_before_purge.md` for the full design discussion. **Not yet wired up
+  to `--finalize`**: a hand-entered "accept value" correction writing directly to
+  `market_data_archive` (bypassing staging) is a separate, not-yet-implemented follow-up
+  (`tasks/finalize_targeted_promotion.md`) — this migration only adds the schema it depends on
+  (`market_data_archive` itself, plus `dim_provider`'s new `'manual'`/`'databento'` rows).
 - `settings.reconcile.preferredProvider` (default `"ibkr"`) and `settings.reconcile.k` (default
   `3.0`, must be positive) are the only two tunables — see `ReconcileSettings` above.
 
