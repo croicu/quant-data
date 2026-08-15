@@ -12,6 +12,7 @@ from quant_data._internal.shared.postgres import (
     FieldGroupRow,
     FieldRow,
     IngestionCoverageRow,
+    MaterialityFloorRow,
     PostgresDatabase,
     ProviderRow,
     StagingRow,
@@ -357,6 +358,18 @@ def test_fetch_data_quality_thresholds_returns_rows(mock_psycopg):
     thresholds = database.fetch_data_quality_thresholds()
 
     assert thresholds == [DataQualityThresholdRow(provider_id=2, ticker_id=1, k_reversal_oc=3.0, k_trend_oc=6.0, k_reversal_hl=4.0, k_trend_hl=8.0)]
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_fetch_materiality_floors_returns_rows(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [(2, 1, 4, 0.05, "absolute")]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    floors = database.fetch_materiality_floors()
+
+    assert floors == [MaterialityFloorRow(provider_id=2, ticker_id=1, field_id=4, floor_value=0.05, floor_type="absolute")]
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")

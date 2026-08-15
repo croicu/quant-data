@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
-from quant_data._internal.shared.postgres import PostgresDatabase, ProviderRow, StagingRow
+from quant_data._internal.shared.postgres import MaterialityFloorRow, PostgresDatabase, ProviderRow, StagingRow
 from quant_data._internal.shared.settings import PostgresSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
 from reconcile.algorithm import (
@@ -23,6 +23,7 @@ from reconcile.algorithm import (
     ROLE_CANDIDATE,
     ROLE_WHISTLEBLOWER,
     DisagreementStats,
+    FieldTolerance,
     ProviderBar,
     batch_stats,
     fields_for_group,
@@ -414,6 +415,10 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
             running_m2=row.running_m2,
         )
 
+    floors_by_key: dict[tuple[int, int, int], MaterialityFloorRow] = {}
+    for floor_row in database.fetch_materiality_floors():
+        floors_by_key[(floor_row.provider_id, floor_row.ticker_id, floor_row.field_id)] = floor_row
+
     staging_rows = database.fetch_staging_rows_for_reconciliation(settings.providers, candidate_provider_names)
 
     bars: dict[tuple[int, int, int], list[StagingRow]] = {}
@@ -584,17 +589,23 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
                 if field_group_id in current_bar_resolutions:
                     continue
 
-                tolerances: dict[int, dict[str, float]] = {}
+                tolerances: dict[int, dict[str, FieldTolerance]] = {}
                 for row in rows:
                     provider = providers_by_id[row.provider_id]
                     if provider.role != ROLE_CANDIDATE:
                         continue
-                    field_tolerances: dict[str, float] = {}
+                    field_tolerances: dict[str, FieldTolerance] = {}
                     for field_name in fields_for_group(field_group_name):
                         field_id = field_ids_by_name[field_name]
                         stats = stats_by_key.get((provider.provider_id, ticker_id, field_id))
                         if stats is not None:
-                            field_tolerances[field_name] = stddev_from_stats(stats)
+                            floor_row = floors_by_key.get((provider.provider_id, ticker_id, field_id))
+                            if floor_row is not None:
+                                field_tolerances[field_name] = FieldTolerance(
+                                    stddev=stddev_from_stats(stats), floor_value=floor_row.floor_value, floor_type=floor_row.floor_type
+                                )
+                            else:
+                                field_tolerances[field_name] = FieldTolerance(stddev=stddev_from_stats(stats))
                     if field_tolerances:
                         tolerances[provider.provider_id] = field_tolerances
 

@@ -11,6 +11,7 @@ from reconcile.algorithm import (
     ROLE_CANDIDATE,
     ROLE_WHISTLEBLOWER,
     DisagreementStats,
+    FieldTolerance,
     ProviderBar,
     relative_diffs_for_stats_update,
     resolve_automatic,
@@ -23,8 +24,8 @@ IBKR = 1
 YFINANCE = 2
 
 
-def _uniform_tolerance(stddev: float) -> dict[str, float]:
-    return {"open": stddev, "high": stddev, "low": stddev, "close": stddev}
+def _uniform_tolerance(stddev: float) -> dict[str, FieldTolerance]:
+    return {"open": FieldTolerance(stddev), "high": FieldTolerance(stddev), "low": FieldTolerance(stddev), "close": FieldTolerance(stddev)}
 
 
 def _bar(
@@ -124,7 +125,7 @@ def test_agreement_checks_each_field_against_its_own_learned_tolerance():
         _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
     ]
 
-    tolerances = {IBKR: {"open": 0.0001, "high": 0.02, "low": 0.02, "close": 0.0001}}
+    tolerances = {IBKR: {"open": FieldTolerance(0.0001), "high": FieldTolerance(0.02), "low": FieldTolerance(0.02), "close": FieldTolerance(0.0001)}}
     resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances=tolerances, k=3.0, preferred_provider_id=None)
 
     assert resolution is not None
@@ -140,7 +141,72 @@ def test_agreement_fails_when_a_field_has_no_learned_tolerance_yet():
         _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
     ]
 
-    tolerances = {IBKR: {"open": 0.01, "high": 0.01, "low": 0.01}}
+    tolerances = {IBKR: {"open": FieldTolerance(0.01), "high": FieldTolerance(0.01), "low": FieldTolerance(0.01)}}
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances=tolerances, k=3.0, preferred_provider_id=None)
+
+    assert resolution is None
+
+
+def test_agreement_fails_with_near_zero_stddev_and_no_floor():
+    # A converged, honestly-tiny stddev makes the computed tolerance ~0 -- even a one-cent diff
+    # fails without a materiality floor to bound it below (tasks/materiality_floor_tolerance.md's
+    # motivating case).
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.51),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    tiny_stddev = _uniform_tolerance(0.000001)
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: tiny_stddev}, k=3.0, preferred_provider_id=None)
+
+    assert resolution is None
+
+
+def test_agreement_resolves_via_absolute_materiality_floor():
+    # Same near-zero stddev as above, but an absolute floor of 0.05 admits the one-cent diff --
+    # the floor bounds the computed tolerance below regardless of how tight stddev has converged.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.51),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    field_tolerance = FieldTolerance(stddev=0.000001, floor_value=0.05, floor_type="absolute")
+    tolerances = {IBKR: {"open": field_tolerance, "high": field_tolerance, "low": field_tolerance, "close": field_tolerance}}
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances=tolerances, k=3.0, preferred_provider_id=None)
+
+    assert resolution is not None
+    assert resolution.resolution_path == RESOLUTION_AGREEMENT
+
+
+def test_agreement_resolves_via_bps_of_reference_materiality_floor():
+    # reference_value = avg(100, 101, 99, 100.51) = 100.1275. 10 bps of that is ~0.1001 --
+    # comfortably above the 0.01 diff on close, so bps_of_reference scales the floor by the bar's
+    # own price level rather than using floor_value as a raw unit.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.51),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    field_tolerance = FieldTolerance(stddev=0.000001, floor_value=10.0, floor_type="bps_of_reference")
+    tolerances = {IBKR: {"open": field_tolerance, "high": field_tolerance, "low": field_tolerance, "close": field_tolerance}}
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances=tolerances, k=3.0, preferred_provider_id=None)
+
+    assert resolution is not None
+    assert resolution.resolution_path == RESOLUTION_AGREEMENT
+
+
+def test_agreement_floor_smaller_than_computed_tolerance_is_a_no_op():
+    # Same bars/stddev as test_agreement_fails_when_only_one_field_exceeds_its_own_tolerance
+    # (high's 4.0 diff exceeds its ~0.303 computed tolerance) -- a floor much smaller than the
+    # computed tolerance must not change the outcome, proving max() bounds tolerance up, never
+    # down or sideways.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=105.0, low=99.0, close=100.5),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    field_tolerance = FieldTolerance(stddev=0.001, floor_value=0.0001, floor_type="absolute")
+    tolerances = {IBKR: {"open": field_tolerance, "high": field_tolerance, "low": field_tolerance, "close": field_tolerance}}
     resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances=tolerances, k=3.0, preferred_provider_id=None)
 
     assert resolution is None

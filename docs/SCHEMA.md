@@ -60,6 +60,12 @@ provider value once no longer kept in `staging_market_data_1min`, closing the in
 a schema-consistency fix bringing it in line with every other fact/staging table's denormalized
 `timestamp` column (see its own section below and
 [croicu/quant-data#36](https://github.com/croicu/quant-data/issues/36)).
+`013_add_materiality_floor` added the per-(provider, ticker, field) minimum-tolerance table
+bounding `quant-reconcile`'s Tier 2/3 tolerance below by an economically meaningful minimum;
+`014_seed_materiality_floor_defaults` seeded it with volume-informed defaults for today's 6
+actively-ingested tickers; `015_relax_materiality_floor_psq_dog` overrode `PSQ`/`DOG` with their
+own observed-distribution P90 after live validation found `014`'s cross-ticker model under-fit
+them badly (see its own section below and `tasks/materiality_floor_tolerance.md`).
 
 ## `dim_ticker`
 
@@ -414,6 +420,57 @@ one holds *intra-provider* plausibility coefficients (is a value implausible rel
 series' recent neighbors) for the outlier-detection check that sets `data_quality = 'rejected'` —
 related concepts, deliberately not unified into one table. Only ever holds deliberately-tuned
 overrides, so this table can (and likely will) stay empty for a long time.
+
+## `materiality_floor`
+
+| Column | Type | Notes |
+|---|---|---|
+| `provider_id` | `INT NOT NULL` | FK → `dim_provider` |
+| `ticker_id` | `INT NOT NULL` | FK → `dim_ticker` |
+| `field_id` | `INT NOT NULL` | FK → `dim_field` |
+| `floor_value` | `NUMERIC NOT NULL` | Interpretation depends on `floor_type` |
+| `floor_type` | `TEXT NOT NULL CHECK (floor_type IN ('absolute', 'bps_of_reference'))` | `absolute`: `floor_value` is a raw unit (e.g. one tick). `bps_of_reference`: `floor_value` is basis points of the bar's own reference value |
+| `updated_at` | `TIMESTAMP` | Defaults to insert time |
+
+Primary key: `(provider_id, ticker_id, field_id)` — deliberately the exact same grain as
+`provider_pair_disagreement`, `provider_id` implicitly meaning the candidate (whistleblower stays
+singular/implicit, same convention). Added in `013_add_materiality_floor`
+(`tasks/materiality_floor_tolerance.md`); a missing `(provider, ticker, field)` falls back to
+`floor_value = 0.0` (no floor).
+
+`014_seed_materiality_floor_defaults` seeds today's 6 actively-ingested tickers with
+`floor_type = 'bps_of_reference'` defaults derived from a real finding, not a gut prior: per-bar
+`ibkr` volume correlates with `ibkr`/`yfinance` disagreement (log-log regression over the full
+pending-manual-resolution backlog as of 2026-08-15, `R² = 0.32` — a real relationship, explaining
+roughly a third of per-bar variance, not the whole story). Same value applied uniformly across
+`open`/`high`/`low`/`close` per ticker (the regression was fit against each bar's worst-of-4-fields
+diff — deliberately the conservative choice, not per-field-tuned). Explicitly overridable per
+`(provider, ticker, field)` as more data accumulates — see `CLAUDE.md`'s Pending Tasks entry on the
+volume/noise correlation for the full finding and its still-open tension with an earlier,
+conflicting investigation into `DOG`'s stuck rate.
+
+**`015_relax_materiality_floor_psq_dog`**: live validation of `014`'s defaults (full clean-slate
+reconcile run, 2026-08-15) found the population regression under-predicted `PSQ` and `DOG` badly
+enough to produce zero backlog reduction for either — `DOG`'s own observed average diff (5.017
+bps) was more than double its seeded floor (2.193 bps); `PSQ`'s was triple (3.952 vs. 1.299).
+Overridden with each ticker's own P90 (90th percentile of its pending backlog's diff distribution)
+instead of the cross-ticker model — a deliberate precision-for-workload tradeoff: `PSQ`/`DOG`
+matter more for trading execution than research-grade reconciliation accuracy. `IWM` deliberately
+left unseeded (`floor_value = 0.0`, no floor) — only 12 pending bars to derive a P90 from (vs.
+`PSQ`/`DOG`'s 31/37), too thin a sample to calibrate responsibly; revisit once more data
+accumulates.
+
+Bounds `quant-reconcile`'s Tier 2/3 tolerance (`k * stddev * reference_value`) below by an
+economically meaningful minimum, so Tier 2 classification means "statistically out of band *and*
+material enough to be worth a human's time" — not pure z-score distance. Without a floor, a field
+whose true cross-provider variance is genuinely tiny sees its tolerance shrink right along with the
+honestly-converging `stddev` estimate from `provider_pair_disagreement`, pushing economically
+trivial disagreements to Tier 4 (manual) purely because they exceed an ever-tightening *relative*
+threshold. Volume has no independent tolerance check to bound (rides along with the `ohlc` winner
+since `005_remove_volume_field_group`), so this table is keyed to `dim_field`
+(`open`/`high`/`low`/`close`), not `dim_field_group` — there'd be nothing for a volume row to
+affect. Only consulted by the automatic pass (Tiers 1-3); `--finalize`'s `resolve_finalize` never
+touches tolerance at all, so it's unaffected either way.
 
 ## `fact_pending_manual_resolution`
 

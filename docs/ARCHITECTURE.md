@@ -415,7 +415,7 @@ the full design (field consistency groups, the candidate/whistleblower model, th
   - `resolve_automatic(bars, field_group, windows, tolerances, k, preferred_provider_id)` — Tiers
     1-3 (completeness / agreement / boundary-fix), first one that resolves a group wins. Returns
     `None` if still stuck (Tier 4) — left in staging for a person to look at. `tolerances` is
-    `dict[int, dict[str, float]]` (`provider_id -> field_name -> stddev`) since
+    `dict[int, dict[str, FieldTolerance]]` (`provider_id -> field_name -> FieldTolerance`) since
     croicu/quant-data#28 — every field in the group (`open`/`high`/`low`/`close`) is checked
     independently against its own learned tolerance (`_agrees_within_tolerance`/`_windowed_agrees`),
     not "max diff across the group within one pooled tolerance" as before. A candidate missing
@@ -424,6 +424,19 @@ the full design (field consistency groups, the candidate/whistleblower model, th
     now per-field. `fields_for_group(field_group)` (public — `cli.py` needs it directly for the
     stats fan-out below and for the graduation batch) is the one place the group→fields mapping
     lives.
+  - `FieldTolerance(stddev, floor_value=0.0, floor_type=FLOOR_TYPE_ABSOLUTE)` — one field's Tier
+    2/3 input, added by `013_add_materiality_floor` (`tasks/materiality_floor_tolerance.md`).
+    `_tolerance()` computes `max(k * stddev * reference_value, floor)`, where `floor` is
+    `floor_value` directly (`FLOOR_TYPE_ABSOLUTE`) or `floor_value` basis points of the bar's own
+    `reference_value` (`FLOOR_TYPE_BPS_OF_REFERENCE`). `cli.py` builds each `FieldTolerance` from
+    `stats_by_key` (the existing `provider_pair_disagreement` stddev) plus a bulk-fetched
+    `floors_by_key` (`materiality_floor`, same `(provider_id, ticker_id, field_id)` grain) —
+    `floor_value` defaults to `0.0` when no row exists, so an unconfigured `(provider, ticker,
+    field)` behaves exactly as before the floor existed. `014_seed_materiality_floor_defaults`
+    seeds today's 6 actively-ingested tickers with volume-informed defaults (a real regression
+    finding, `R² = 0.32` — see `docs/SCHEMA.md`'s `materiality_floor` section); anything else
+    still falls back to `0.0` until deliberately configured. Only consulted by the automatic pass;
+    `resolve_finalize` never touches tolerance, so `--finalize` is unaffected either way.
   - `resolve_finalize(bars, preferred_provider_id)` — `--finalize`'s fallback: promotes
     `preferredProvider`'s raw value outright, no tolerance check.
   - `welford_update`/`stddev_from_stats`/`relative_diffs_for_stats_update` — the running-variance

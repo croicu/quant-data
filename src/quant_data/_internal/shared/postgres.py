@@ -82,6 +82,15 @@ class DataQualityThresholdRow:
     k_trend_hl: float
 
 
+@dataclass
+class MaterialityFloorRow:
+    provider_id: int
+    ticker_id: int
+    field_id: int
+    floor_value: float
+    floor_type: str
+
+
 class PostgresDatabase:
     """Concrete MarketDataProvider implementation, plus a write path used only by ingest.
 
@@ -542,6 +551,31 @@ class PostgresDatabase:
                     k_trend_oc=float(k_trend_oc),
                     k_reversal_hl=float(k_reversal_hl),
                     k_trend_hl=float(k_trend_hl),
+                )
+            )
+        return result
+
+    def fetch_materiality_floors(self) -> list[MaterialityFloorRow]:
+        """Every deliberately-tuned (provider, ticker, field) minimum-tolerance floor for
+        quant-reconcile's Tier 2/3 agreement check -- small, bulk-fetched once per reconcile run.
+        A (provider, ticker, field) with no row here applies floor_value = 0.0 (no floor, current
+        behavior unchanged) -- see reconcile.algorithm.FieldTolerance."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT provider_id, ticker_id, field_id, floor_value, floor_type FROM materiality_floor")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch materiality_floor: {error}") from error
+
+        result: list[MaterialityFloorRow] = []
+        for provider_id, ticker_id, field_id, floor_value, floor_type in rows:
+            result.append(
+                MaterialityFloorRow(
+                    provider_id=provider_id,
+                    ticker_id=ticker_id,
+                    field_id=field_id,
+                    floor_value=float(floor_value),
+                    floor_type=floor_type,
                 )
             )
         return result
