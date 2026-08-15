@@ -444,25 +444,15 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
-- **Per-minute volume appears to strongly predict inter-provider (`ibkr`/`yfinance`) disagreement
-  noise** — found 2026-08-15 while calibrating a real value for `materiality_floor`
-  (croicu/quant-data#40), not yet its own issue. Comparing avg `ibkr` per-bar volume against avg
-  disagreement (in bps of reference price) across every ticker with a non-trivial pending-manual-
-  resolution sample: `SPY` (396,509 vol → 0.374 bps) → `IWM` (203,452 → 0.822) → `QQQ` (164,358 →
-  1.301) → `DIA` (49,355 → 1.039) → `PSQ` (38,993 → 3.952) → `DOG` (9,986 → 5.017) — volume rank
-  and noise rank line up almost exactly across the whole set (`SH` the one exception, but only 2
-  pending bars, too small a sample to weigh). Surfaced concretely investigating why `QQQ` (fewer
-  index constituents than `SPY`, which intuitively should mean *less* noise if basket complexity
-  were the driver) actually shows ~3.5x `SPY`'s disagreement — number of underlying constituents
-  and the ETF's own trading liquidity are different variables; what apparently matters is how
-  liquid/tightly-quoted the traded security itself is minute-to-minute, not what's underneath the
-  wrapper. **This directly conflicts with the DOG stuck-rate investigation below (marked ⚠), which
-  ruled out volume as an explanation on a different, larger sample** — not yet reconciled; worth
-  its own investigation (larger sample, control for price level properly, check `SH`/`RWM` once
-  they have enough pending bars to measure) before treating it as settled. If it holds up, this is
-  a more powerful, more general finding than the original DOG investigation: a volume-based model
-  could plausibly inform `materiality_floor` (or even `provider_pair_disagreement` tolerance more
-  broadly) *across* tickers, rather than needing pure per-ticker trial and error.
+- **Volume/noise correlation vs. the earlier DOG investigation — still not reconciled.** The
+  per-bar volume regression used to calibrate `materiality_floor` (croicu/quant-data#40, closed —
+  see Completed Tasks) **directly conflicts with the DOG stuck-rate investigation below (marked
+  ⚠), which ruled out volume as an explanation on a different, larger sample.** Shipping the
+  calibration didn't resolve this tension, it just used the correlation pragmatically (and even
+  then, only partially — see #40's Completed Tasks entry for where it held up and where it
+  didn't). Worth its own investigation (larger sample, control for price level properly, check
+  `SH`/`RWM`/`IWM` once they have enough pending bars to measure) before either finding is treated
+  as settled.
 
 - **Fix ~130s SSH-tunnel connect stall; add `Logger.perf()` timing markers** — issue #19, opened by
   the repo owner from `quant-scratch`-side testing. `status:ready-for-integration`, fix pushed to
@@ -786,6 +776,16 @@ under `/local/` to the box:
   detail (numbers, methodology, what's explicitly out of scope) was in
   `tasks/yahoo_data_sanitization.md` before its deletion per this file's "delete once the issue
   closes" convention — see issue #32's comments for the same summary.
+- **Add `timestamp` to `fact_pending_manual_resolution`** — closed issue #36, opened by the repo
+  owner (surfaced building a Power Query/Excel dashboard against `quant-data` from `quant-scratch`'s
+  `open-quant-data` tool, croicu/quant-scratch#19/#20). Schema-consistency fix: every other
+  fact/staging table already carried a denormalized `timestamp` alongside its `date_id`/`time_id`
+  keys, forcing this one table's consumers into an extra `dim_date`/`dim_time` join. Migration `012`
+  adds the column and backfills existing rows from `dim_date.date` + `dim_time.hour`/`minute`;
+  `PostgresDatabase.mark_pending_manual_resolution` gained a `timestamp` parameter, sourced from the
+  bar's own `StagingRow.timestamp` at the one call site (`reconcile/cli.py`'s `_run_automatic_pass`).
+  Verified live against CroicuWS1: 215/215 existing pending rows correctly backfilled, `NOT NULL`
+  applied cleanly with no remaining nulls.
 - **Archive candidate rows before purge; `market_data_archive`** — closed issue #35 (commit
   `473ccd0`), opened and closed by Claude mid-task per this file's "Who closes an issue" exception.
   `purge_staging_bar` now archives a candidate's staging row into the new, permanent
@@ -814,3 +814,39 @@ under `/local/` to the box:
   to a staging-only query). Separately, candidate-missing bars (the mirror image of #31's
   whistleblower-missing case) were found to have no resolution path at all, not even into the
   pending queue — a new, not-yet-designed gap.
+- **Materiality floor on reconciliation tolerance** — closed issue #40 (commit `c861a9b`), opened
+  and closed by Claude mid-task per this file's "Who closes an issue" exception. New
+  `materiality_floor` table (`provider_id`, `ticker_id`, `field_id`, `floor_value`, `floor_type`),
+  exactly mirroring `provider_pair_disagreement`'s grain, bounding Tier 2/3 tolerance
+  (`k * stddev * reference_value`) below by an economically meaningful minimum — an honestly-
+  converging `stddev` estimate was pushing economically trivial disagreements (a fraction of a
+  cent) to Tier 4 purely because they exceeded an ever-tightening relative threshold. New
+  `FieldTolerance(stddev, floor_value=0.0, floor_type)` dataclass threaded through
+  `algorithm.py`'s tolerance chain; a missing `(provider, ticker, field)` falls back to
+  `floor_value = 0.0` (no floor, unchanged behavior) — the same "ship schema, seed real values once
+  validated" precedent as `data_quality_thresholds`, except this time seeded immediately with a
+  real, data-driven calibration rather than left empty.
+
+  Seed values came from a genuine finding, not a gut prior: per-bar `ibkr` volume correlates with
+  `ibkr`/`yfinance` disagreement (log-log regression over the full pending-manual-resolution
+  backlog, `R² = 0.32`). Live-verified against a restored CroicuWS1 snapshot via two full
+  clean-slate rebuilds: the volume-derived defaults alone took the backlog from 215 to 103 pending
+  bars (52%) — `SPY` 94%, `DIA` 85%, `QQQ` 72% resolved — but `PSQ` and `DOG` got zero benefit,
+  since both sit well above the fitted line (`DOG`'s own observed average diff was more than double
+  its regression-derived floor; `PSQ`'s was triple). Overriding those two with their own P90 (90th
+  percentile of their pending backlog's diff distribution) instead of the cross-ticker model took
+  the total to 42 pending (80% reduction from 215), both landing within a hair of the P90-implied
+  ~10% residual — confirming the per-ticker-distribution approach works precisely where the
+  population model didn't. `IWM` deliberately left unseeded (only 12 pending bars, too thin to
+  calibrate responsibly) — revisit once more data accumulates; it isn't in the active ingestion
+  watchlist, so that won't happen automatically.
+
+  A real limitation surfaced during testing, documented rather than worked around: the floor only
+  affects a bar's *first* evaluation — `fetch_staging_rows_for_reconciliation` excludes any bar
+  already in `fact_pending_manual_resolution`, so a newly-added or newly-tuned floor can never
+  retroactively unstick the *existing* backlog on its own. Confirmed directly: applying the floor
+  to an already-pending backlog resolved nothing (0 groups) until the database was rebuilt from
+  scratch so every bar got evaluated fresh with the floor already in place. A dedicated "retry
+  Tiers 1-3 against the pending queue with current stats" mechanism would be needed to close that
+  gap — not built here. The volume/noise correlation itself also surfaced a real, still-unresolved
+  tension with an earlier investigation — see Pending Tasks above.
