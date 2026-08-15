@@ -130,7 +130,7 @@ class FakeReconcileDatabase:
     def fetch_pending_manual_resolution_keys(self) -> set[tuple[int, int, int, int]]:
         return set(self.pending_manual_resolution)
 
-    def mark_pending_manual_resolution(self, ticker_id: int, date_id: int, time_id: int, field_group_id: int) -> None:
+    def mark_pending_manual_resolution(self, ticker_id: int, date_id: int, time_id: int, field_group_id: int, timestamp: datetime) -> None:
         self.pending_manual_resolution.add((ticker_id, date_id, time_id, field_group_id))
 
     def clear_pending_manual_resolution(self, ticker_id: int, date_id: int, time_id: int, field_group_id: int) -> None:

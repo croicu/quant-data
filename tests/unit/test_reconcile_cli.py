@@ -512,7 +512,7 @@ def test_plain_pass_skips_an_already_pending_bar():
         _staging_row(YFINANCE, open=150.0, high=151.0, low=149.0, close=150.5),
     ]
     database = FakeReconcileDatabase(PROVIDERS, FIELD_GROUPS, staging_rows, fields=FIELDS)
-    database.mark_pending_manual_resolution(1, 10, 20, OHLC)  # simulates an earlier run's flag
+    database.mark_pending_manual_resolution(1, 10, 20, OHLC, datetime(2026, 7, 24, 13, 30))  # simulates an earlier run's flag
 
     resolved, stuck = run_reconciliation(database, _settings(), finalize=False)
 
