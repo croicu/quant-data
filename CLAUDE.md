@@ -390,25 +390,6 @@ under `/local/` to the box:
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
-- **File**: [Massive provider integration](tasks/massive_provider_integration.md)
-- **Status**: Brainstorm, not converged — [issue #44](https://github.com/croicu/quant-data/issues/44)
-  is the source proposal. **Headline finding: tracing exactly how `ibkr`/`massive` disagreement
-  would get adjudicated surfaced a real, currently-dormant bug and a coverage regression in
-  `src/reconcile/algorithm.py`'s Tier 1** (an invalid whistleblower — outlier-`REJECTED` or
-  confirmed-absent — is only ever caught before Tiers 2/3 run because exactly one candidate exists
-  today; a second real candidate breaks that assumption, letting Tier 2 judge against a known-bad
-  outlier value in one case and stranding two agreeing candidates in the pending queue in the
-  other). Needs a fix decision before Massive goes live, not just documentation. Separately,
-  reading the actual merged `croicu/quant-scratch#24` prototype (not just the issue text) settled
-  provider naming (`massive`) and the API approach (plain `requests`, no SDK) — still open: the
-  Tier 1 fix approach, rate limit strategy (pre-emptive vs. the prototype's retry-on-429),
-  `reconcile.preferred_provider` default, and historical backfill/rollout scope.
-- **Key Context**: adds Massive (formerly Polygon.io) as a second `candidate` alongside `ibkr`,
-  the first time `fact_market_data_1min` would see a genuine two-candidate mixture. Validated in
-  croicu/quant-scratch#23/PR#24 — close prices agree closely, volume disagrees systematically
-  (worse in thin sessions, most at the 16:00 ET boundary), bar-count differences are pure
-  representation (IBKR pads zero-volume minutes, Massive omits them).
-
 - **File**: [Pipeline accuracy hardening](tasks/pipeline_accuracy_hardening.md) (supersedes
   [Per-ticker disagreement stats](tasks/per_ticker_disagreement.md) — that file's motivating
   evidence/ticker concentration data still stand and were carried forward, but its
@@ -462,6 +443,19 @@ under `/local/` to the box:
   purpose in the GitHub issue, not assumed away.
 
 ## Pending Tasks
+
+- **Massive provider integration** — [issue #44](https://github.com/croicu/quant-data/issues/44),
+  `status:implementation`. Adds Massive (formerly Polygon.io) as a second `candidate` alongside
+  `ibkr`, the first time `fact_market_data_1min` would see a genuine two-candidate mixture. Design
+  converged through several rounds (posted as issue comments, no task file kept) — settled provider
+  naming/API approach/credentials/rate-limit strategy, a whistleblower-validity-gate fix for two
+  real bugs a second candidate would expose in `src/reconcile/algorithm.py`'s Tier 1 (judging
+  agreement against an outlier-rejected whistleblower value; a coverage regression when the
+  whistleblower is confirmed-absent), and a graduation-key-granularity fix in `reconcile/cli.py`
+  (`graduated_ticker_ids` is currently derived per-ticker only, which would permanently lock
+  `massive` out of competing on any already-graduated ticker like `SPY` — the rollout plan's first
+  target). Not yet implemented; see the issue's comment thread for the full converged design and
+  required regression tests before code changes start.
 
 - **Volume/noise correlation vs. the earlier DOG investigation — still not reconciled.** The
   per-bar volume regression used to calibrate `materiality_floor` (croicu/quant-data#40, closed —
