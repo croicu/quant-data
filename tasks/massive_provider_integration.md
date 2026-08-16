@@ -180,10 +180,54 @@ this is fixed. It could still occasionally win via Tier 1 completeness if `ibkr`
 given bar, but that's incidental, not the intended path.
 
 **This blocks the rollout plan below as written** — `SPY` is exactly the ticker the rollout plan
-picks first, and it's exactly the ticker this bug disables `massive` on. Needs its own fix
-(graduation tracked per `(candidate_provider_id, ticker_id)` rather than per ticker alone, or the
-batch-calibration block re-triggered for any candidate still missing stats even on an
-already-graduated ticker) as in-scope, required work for this integration — not a follow-up.
+picks first, and it's exactly the ticker this bug disables `massive` on. In scope, required work
+for this integration, not a follow-up.
+
+**The fix is key-granularity, not a special case.** `stats_by_key` is keyed `(provider_id,
+ticker_id, field_id)`; the set-build above projects away *two* dimensions, not one. Fixing to
+`(candidate_provider_id, ticker_id)` closes the case found above but leaves the same bug one level
+down: a candidate holding stats for some field groups and not others would be permanently locked
+out of the missing ones, having already "graduated" on that ticker for that provider — same
+failure, narrower blast radius, no symptom until a field group is added or a partial calibration
+lands. Today `FIELD_GROUP_OHLC` bundles all 4 fields into every graduation batch atomically, so
+this specific shape isn't reachable yet — but the rule to implement is general, not shaped around
+today's one field group:
+
+> **The graduation key must be identical to the tolerance lookup key.** If tolerances are resolved
+> per `(provider, ticker, field)` — which they are, via `tolerances.get(candidate.provider_id)`
+> then `.get(field_name)` inside a loop already scoped to one `ticker_id` — graduation must be
+> tracked at that same granularity, not projected down to `ticker_id` alone.
+
+No migration or backfill of existing rows is implied: `ibkr`'s existing `SPY` stats stay valid
+under the wider key. Once fixed, `massive` runs its own graduation batch on `SPY` while `ibkr`
+continues competing normally — precisely the intended pre-graduation state, not a conflict.
+
+**Second risk found verifying this fix against the batch-computation body, not just the gating
+check** (`cli.py:490-506`): the block that *runs* once gating admits it doesn't scope itself to the
+newly-ungraduated candidate — it recomputes `diffs_by_candidate_field` from every `ROLE_CANDIDATE`
+bar in each currently-matched bar_key, `ibkr` included, and `stats_by_key[(candidate_provider_id,
+ticker_id, field_id)] = graduation_stats` is a flat overwrite, not a merge. Widening the *gating*
+key alone (so `massive` gets its own attempt on `SPY`) is not sufficient — the batch *body* would also
+recompute and silently overwrite `ibkr`'s already-graduated, already-Welford-accumulated stats with
+a fresh one-shot recomputation from whatever's currently sitting in staging (a smaller, differently
+composed sample than `ibkr`'s true accumulated history, given the lazy-purge mechanism). The fix
+needs to filter `diffs_by_candidate_field`'s population to only the specific `(candidate_provider_id,
+ticker_id, field_id)` combinations still missing from `stats_by_key`, not just widen which tickers
+enter the block.
+
+**Implementation constraints this implies:**
+- **The unadjudicated fallback needs its own `resolution_path` constant, not a sub-flag on
+  `RESOLUTION_AGREEMENT`.** The Welford exclusion above is currently free because `cli.py` updates
+  `provider_pair_disagreement` only `if resolution.resolution_path == RESOLUTION_AGREEMENT`. That
+  guarantee holds only while the new path is a distinct constant — implementing it as a flag on
+  `RESOLUTION_AGREEMENT` would silently invert it and start feeding unadjudicated bars into the
+  variance estimate. The `fact_reconciliation` reason code is downstream of this distinction, not a
+  substitute for it.
+- **The whistleblower validity gate composes with Tier 1 for free — no "preferred provider absent"
+  branch needed.** With the whistleblower filtered out, if `ibkr` is missing for a bar and only
+  `massive` is present, `valid` holds a single candidate and Tier 1's existing `len(valid) == 1`
+  already promotes it. The gate inherits that case rather than needing to handle it separately — an
+  extra guard here would reintroduce the coupling the gate exists to remove.
 
 ### Rollout and backfill (design intent settled; sizing depends on the graduation-gate fix above)
 
@@ -200,15 +244,21 @@ already-graduated ticker) as in-scope, required work for this integration — no
   simultaneous revision backlog when they clear (see "Graduation is an operational event" below).
   Scope initial rollout to `SPY`, mirroring quant-scratch#23's own scope — **but this is blocked on
   the graduation-gate bug above, since `SPY` is already graduated for `ibkr`.**
-- **Backfill — sized to graduation, corrected.** The earlier pass through this used
+- **Backfill — none for the `SPY` pilot.** The earlier pass through this used
   `GRADUATION_THRESHOLD_MATCHED_BARS = 4,000`; the actual constant in `src/reconcile/algorithm.py`
-  is **1,400**. At ~960 extended-hours minutes/trading day, that's roughly **1.5-2 trading days**
-  to clear the gate (not 4-5) — take margin for bars that fail to match. Throughput is a separate,
-  looser constraint: at 5 calls/minute with one call per ticker-day, even a 500-day backfill is
-  ~100 minutes for a single ticker, tolerable for `SPY` alone. Note the asymmetry a deep backfill
-  creates regardless of window size: backfilled history graduates the pair immediately but lands
-  its entire span in the revision backlog at once, whereas forward-only accumulation graduates
-  slower with a proportionally smaller backlog.
+  is **1,400**, which at ~960 extended-hours minutes/trading day is under two trading days of
+  forward-only accumulation. Backfill therefore buys almost nothing toward graduation while being
+  the sole cause of a large one-shot revision backlog (see "Graduation is an operational event"
+  below). Ingest `massive` forward-only on `SPY`, let it graduate over ~2 days, and the
+  retroactive-revision question arrives at pilot scale rather than backfill scale. Backfill depth
+  becomes a post-pilot decision, informed by the measured revision volume rather than estimated
+  ahead of it.
+- **Measure during the pilot: actual matched-bar accrual rate.** A matched bar requires `yfinance`
+  present and `ACCEPTED` for that minute too (`_is_matched_bar`'s `expected_provider_count ==
+  len(settings.providers)`, all of them, not just the new one), and `yfinance`'s extended-hours
+  coverage is thinner than `ibkr`'s 960/day padding. Real accrual to 1,400 may be materially slower
+  than the raw arithmetic suggests — this number is the input to every subsequent rollout-sizing
+  decision and is cheaper to observe on one ticker than to estimate.
 - **Graduation is an operational event, not just a threshold crossing.** When `massive` graduates
   on a ticker, two things change at once: `massive` starts competing on new bars, and the
   pre-graduation staging accumulation becomes evidence about bars already promoted to
@@ -238,10 +288,16 @@ already-graduated ticker) as in-scope, required work for this integration — no
 3. Both above → asserts no `provider_pair_disagreement` update occurs.
 4. Single candidate + invalid whistleblower → behavior identical to pre-change baseline (guards
    the "strict generalization" claim).
-5. **New**: a second candidate added to a ticker that's already graduated for the first candidate
-   must still reach its own graduation batch and be able to win Tier 2 — guards against the
-   graduation-gate bug found above regressing silently if "fixed" only in the narrow case tested by
-   hand.
+5. A second candidate added to a ticker already graduated for the first candidate must reach its
+   own graduation batch and be able to win Tier 2. **Assert at the tolerance lookup key's own
+   granularity** — if tolerances are per `(provider, ticker, field)`, the test must cover a
+   candidate graduated on one field group and not another, or it will pass against a fix that only
+   widened the key by one dimension.
+6. Graduating a second candidate on an already-graduated ticker must leave the first candidate's
+   existing `provider_pair_disagreement` stats byte-for-byte unchanged — guards against the
+   batch-computation body recomputing and overwriting an already-mature candidate's accumulated
+   stats just because it happened to be present in the same matched bars as the newly-graduating
+   one.
 
 ### Mechanical follow-through, not yet a design question
 
@@ -253,8 +309,10 @@ direct dependency), `settings.py` (new `MassiveSettings` + parsing, following `I
 exact pattern), `ingest/cli.py`'s `_build_provider`/`_default_providers`/rate-limit dispatch (new
 `"massive"` branch), a migration seeding `dim_provider (name, role) VALUES ('massive',
 'candidate')`, `src/reconcile/algorithm.py`'s whistleblower-validity-gate fix plus a new
-resolution-reason code and the graduation-per-candidate fix, and offline unit tests per rule 5
-(mock `request_fn`/DB access, no real network/DB in `tests/unit`).
+resolution-reason code, and `reconcile/cli.py`'s graduation-key fix (widened to
+`(provider_id, ticker_id, field_id)`, gating check *and* batch-computation body both scoped to that
+granularity so an already-graduated candidate's stats can't be silently recomputed), and offline
+unit tests per rule 5 (mock `request_fn`/DB access, no real network/DB in `tests/unit`).
 
 ## Implementation plan
 
