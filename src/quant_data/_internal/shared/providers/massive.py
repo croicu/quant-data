@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 import requests
 from requests.exceptions import HTTPError
 
+from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
 from quant_data.protocols import OHLCV, DataQuality
 
 from ..diagnostics import Logger
@@ -36,6 +37,8 @@ class MassiveIntraDay:
     IBKRIntraDay's persistent Gateway connection.
     """
 
+    FETCH_VERSION = "1"
+
     def __init__(
         self,
         api_key: str,
@@ -56,7 +59,7 @@ class MassiveIntraDay:
     def close(self) -> None:
         pass
 
-    def fetch_bars(self, ticker: str, target_date: date) -> list[OHLCV]:
+    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
         normalized_ticker = ticker.upper()
         date_str = target_date.isoformat()
         url = f"{BASE_URL}/v2/aggs/ticker/{normalized_ticker}/range/1/minute/{date_str}/{date_str}"
@@ -128,7 +131,7 @@ class MassiveIntraDay:
             f"quant-ingest: fetched {len(bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()} via Massive.",
             category=CATEGORY_MASSIVE,
         )
-        return bars
+        return ProviderFetchResult(bars=bars, payload=payload, payload_kind=PayloadKind.RAW_API_RESPONSE)
 
 
 def _bar_timestamp(bar: OHLCV) -> datetime:

@@ -81,6 +81,8 @@ attempting Tiers 2/3, falling through to `settings.reconcile.preferredProvider`'
 this distinct reason code (never comparing against a whistleblower value already known to be
 invalid) rather than either tier's silent no-op. See
 [croicu/quant-data#44](https://github.com/croicu/quant-data/issues/44) for the full design.
+`quant_ingest` (croicu/quant-data#52) is a **separate database**, not a `migrations/` entry against
+`quant_data` — see its own "`quant_ingest` database" section below.
 
 ## `dim_ticker`
 
@@ -566,6 +568,83 @@ decision outside this code's scope, not a bug). Moving `inception_date` backward
 an operational trigger, not just a value update: `--backfill` must re-run for every configured
 ticker from the new `inception_date` to that ticker's own current earliest covered date — not a
 single shared date, since tickers may already have different amounts of history.
+
+## `quant_ingest` database
+
+A **separate Postgres database**, not a schema or table inside `quant_data` — same server/instance
+(CroicuWS1), own connection (`settings.postgres.archiveDbname`), own `schema_migrations`, own
+migration sequence (`migrations/quant_ingest/*.sql`, independently numbered from `migrations/*.sql`).
+Added by [croicu/quant-data#52](https://github.com/croicu/quant-data/issues/52) as the append-only
+record of every provider fetch (see `provider_source_archive` below for exactly what "append-only"
+does and doesn't guarantee at the privilege level), addressing two things `staging_market_data_1min`/
+`market_data_archive` didn't: ingestion can be slow and cost real API calls, but nothing in
+`quant_data` is actually immutable, and `market_data_archive` only ever captures a *candidate's*
+staging row, only *once purged* — never the whistleblower, never at ingest time. Deliberately a
+separate database, not just a table: Postgres has no cross-database foreign keys, so this repo's own
+routine clean-slate testing (`DROP DATABASE quant_data`) can never touch it structurally — unlike
+`market_data_archive`, which has been swept up in a "clean slate" `TRUNCATE` list at least once.
+Because there's no cross-database FK, `ticker`/`provider` are stored as plain validated text here,
+not surrogate-key references to `quant_data`'s `dim_ticker`/`dim_provider`.
+
+### `provider_source_archive`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `BIGSERIAL PRIMARY KEY` | |
+| `ticker` | `TEXT NOT NULL` | `CHECK (ticker = UPPER(ticker))`, mirroring `dim_ticker.ticker`'s own constraint |
+| `provider` | `TEXT NOT NULL` | e.g. `'yfinance'`, `'ibkr'`, `'massive'` — no FK, `quant_ingest` has no `dim_provider` |
+| `trading_date` | `DATE NOT NULL` | |
+| `fetched_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | |
+| `fetch_version` | `TEXT NOT NULL` | the fetching provider's `IntraDayProvider.FETCH_VERSION` at fetch time |
+| `payload_kind` | `TEXT NOT NULL` | `CHECK (payload_kind IN ('raw_api_response', 'parsed_bars'))` |
+| `payload` | `JSONB NOT NULL` | see below |
+
+No unique constraint on `(ticker, provider, trading_date)` — append-only by design; a re-fetch of
+the same day (a catch-up re-run, a backfill retry) is a new row, never an upsert.
+`ProviderSourceArchiveWriter.record_fetch` only ever `INSERT`s; nothing in the application code
+issues `UPDATE`/`DELETE` against this table. `quant_writer` originally had `INSERT` + sequence
+`USAGE` only (true DB-enforced immutability); `DELETE` was granted afterward for manual cleanup, at
+the repo owner's explicit, informed request (2026-08-17 — see `docs/DATABASE.md`). `UPDATE` remains
+ungranted — a row can be removed, never edited in place.
+
+`payload_kind` exists because "raw" isn't uniform across providers: `MassiveIntraDay`'s plain
+`requests.get(...).json()` call genuinely has a raw JSON response to archive
+(`payload_kind = 'raw_api_response'`) — but `YahooFinanceIntraDay` never sees raw JSON at all (the
+`yfinance` package parses its own HTTP call internally) and `IBKRIntraDay` has no JSON to begin with
+(IB Gateway/TWS's wire protocol via `ib_async` isn't JSON). Both instead get a JSON-serialized form
+of the already-parsed `OHLCV` bars (`payload_kind = 'parsed_bars'`,
+`quant_data._internal.shared.providers.payload.parsed_bars_payload`). `quant_data._internal.contracts
+.PayloadKind`/`ProviderFetchResult` are the Python-side shapes behind this — see
+`docs/ARCHITECTURE.md`.
+
+`fetch_version` is deliberately a plain string, not numeric — a per-provider `FETCH_VERSION` class
+attribute, bumped by hand whenever that provider's own request construction changes (a new
+parameter, a changed default) in a way that could change what comes back. Lets a later pass identify
+which archived ranges were fetched under an outdated query shape.
+
+### `archive_coverage`
+
+| Column | Type | Notes |
+|---|---|---|
+| `coverage_id` | `SERIAL PRIMARY KEY` | |
+| `ticker` | `TEXT NOT NULL` | |
+| `provider` | `TEXT NOT NULL` | |
+| `fetch_version` | `TEXT NOT NULL` | |
+| `start_date` | `DATE NOT NULL` | |
+| `end_date` | `DATE NOT NULL` | |
+| `updated_at` | `TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP` | |
+
+The archive-side equivalent of `quant_data.ingestion_coverage` (croicu/quant-data#31) — coalesced
+contiguous date ranges, updated incrementally on every successful fetch rather than recomputed from
+scratch — but keyed by `(ticker, provider, fetch_version)` instead of just `(ticker, provider)`.
+Unlike `provider_source_archive` (`INSERT`/`DELETE` only, no `UPDATE`), this table *is* fully
+mutated (`quant_writer` has `SELECT`/`INSERT`/`UPDATE`/`DELETE`, same as `ingestion_coverage`) — it's
+maintained summary state, not an archival record itself. A date not covered by *any*
+`fetch_version`'s range for a `(ticker,
+provider)` is a genuine gap ("no IBKR data two weeks ago"); a date covered only by a non-current
+`fetch_version` is stale and a candidate for re-fetching in smaller chunks, without disturbing the
+old version's own range. `ProviderSourceArchiveWriter.record_fetch` writes both tables in one
+transaction, so a fetch is never archived without its coverage range also reflecting it.
 
 ## Indexes
 

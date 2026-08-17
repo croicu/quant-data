@@ -21,7 +21,7 @@ def test_fetch_bars_returns_live_intraday_data_for_known_ticker():
     provider = IBKRIntraDay()
     provider.connect()
     try:
-        bars = provider.fetch_bars("spy", target_date)
+        bars = provider.fetch_bars("spy", target_date).bars
     finally:
         provider.close()
 

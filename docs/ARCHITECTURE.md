@@ -155,13 +155,22 @@ independent top-level packages.
   `fact_pending_manual_resolution`, since a rejected whistleblower value with an accepted candidate
   never becomes pending at all.
 - `IntraDayProvider(Protocol)`: `connect() -> None`, `fetch_bars(ticker, target_date) ->
-  list[OHLCV]` for a single session day, and `close() -> None`. The ingest-side contract for
-  external data sources — `ingest` depends on this abstraction, not concretely on whichever
-  provider(s) are plugged in. `connect()`/`close()` were added alongside `IBKRIntraDay` (issue
-  #21/#22): a no-op for a stateless per-call fetcher like `YahooFinanceIntraDay`, but real
-  lifecycle methods for a provider with an expensive connection handshake to amortize across a
-  batch — `ingest` calls `connect()` once per provider at the start of a run and `close()` once at
-  the end, uniformly across every configured provider.
+  ProviderFetchResult` for a single session day, and `close() -> None`, plus a `FETCH_VERSION: str`
+  class attribute. The ingest-side contract for external data sources — `ingest` depends on this
+  abstraction, not concretely on whichever provider(s) are plugged in. `connect()`/`close()` were
+  added alongside `IBKRIntraDay` (issue #21/#22): a no-op for a stateless per-call fetcher like
+  `YahooFinanceIntraDay`, but real lifecycle methods for a provider with an expensive connection
+  handshake to amortize across a batch — `ingest` calls `connect()` once per provider at the start
+  of a run and `close()` once at the end, uniformly across every configured provider.
+  `fetch_bars`'s return type changed from a bare `list[OHLCV]` to `ProviderFetchResult` (croicu/
+  quant-data#52) — a small dataclass colocated with `IntraDayProvider` in this module (the one
+  deliberate exception to this module's own "not data" framing, since it's purely internal and
+  tightly coupled to this one Protocol method) holding `bars: list[OHLCV]` (unchanged, what `ingest`
+  writes to staging) plus `payload: dict` and `payload_kind: PayloadKind` (`RAW_API_RESPONSE` or
+  `PARSED_BARS`) for archiving into the separate `quant_ingest` database before the staging write —
+  see the `ingest` section below and `docs/SCHEMA.md`'s `quant_ingest database` section.
+  `FETCH_VERSION` is a plain string (not numeric) each concrete provider bumps by hand whenever its
+  own request construction changes in a way that could change what comes back.
 - `ConnectionTransport(Protocol)`: `open() -> tuple[str, int]` (establish whatever's needed to
   reach Postgres, returning the `(host, port)` to connect to) plus `close() -> None`. Introduced so
   `PostgresDatabase` never needs to know *how* Postgres is actually reached (direct TCP vs. an SSH
@@ -175,7 +184,9 @@ independent top-level packages.
   earlier layouts this was carried over from.
 - `settings.py` additionally defines `PostgresSettings` (`host`, `port`, `user`, `password`,
   `dbname`, plus optional `ssh_user`/`ssh_key_path` — parsed from `sshUser`/`sshKeyPath`, must be
-  set together or both omitted) and a `Settings.postgres` field, parsed from a `postgres` object
+  set together or both omitted; plus optional `archive_dbname`, parsed from `archiveDbname`,
+  croicu/quant-data#52 — the separate `quant_ingest` database, same server/role as `dbname`,
+  `None` disables archiving entirely) and a `Settings.postgres` field, parsed from a `postgres` object
   under `settings.json`/`settings.local.json`'s `settings` key. `ssh_user`/`ssh_key_path` select an
   `SshTunnelTransport` (see below) instead of the default `DirectTransport` — omitting them
   reproduces the exact behavior from before `ConnectionTransport` existed, so this is additive, not
@@ -258,6 +269,27 @@ independent top-level packages.
     `ssh -N -L ...`/systemd unit before the Python client could connect at all (see
     `docs/DATABASE.md`; direct `psql` access still needs that manual tunnel, since `psql` never
     goes through this transport abstraction).
+- `provider_source_archive.py` — `ProviderSourceArchiveWriter` (croicu/quant-data#52): a write-only
+  client for the separate `quant_ingest` database, deliberately not a method on `PostgresDatabase`
+  since `quant_ingest` has no relationship to `quant_data`'s star schema at all (Postgres has no
+  cross-database foreign keys) — this class owns its own `psycopg` connection and never touches
+  `dim_ticker`/`dim_provider`/`dim_date`. Same connection-setup shape as `PostgresDatabase`
+  (`ConnectionTransport`, `TimeZone=UTC` pinning, the `"localhost"` -> `"127.0.0.1"` normalization,
+  injectable `LoggingSink`), duplicated rather than shared, since the two classes' actual query
+  logic has nothing in common beyond that setup. One real method, `record_fetch(ticker, provider,
+  trading_date, fetch_version, payload_kind, payload)`, writing `provider_source_archive` and
+  coalescing `archive_coverage` in one transaction (same gaps-and-islands coalescing as
+  `PostgresDatabase.record_ingestion_coverage`, on plain `DATE` arithmetic instead of a surrogate
+  `date_id`, and keyed by `fetch_version` too). `record_fetch` itself only ever `INSERT`s into
+  `provider_source_archive` — `quant_writer`'s grants there originally excluded `UPDATE`/`DELETE`
+  entirely (true DB-enforced immutability); `DELETE` was granted afterward for manual cleanup, at
+  the repo owner's explicit, informed request (2026-08-17). `UPDATE` remains ungranted. See
+  `docs/SCHEMA.md`'s `quant_ingest database` section for the full schema/grant history and
+  rationale.
+- `providers/payload.py` — `parsed_bars_payload(bars) -> dict`, a small shared helper used by
+  `providers/yfinance.py` and `providers/ibkr.py` (not `providers/massive.py`, which has a genuine
+  raw payload) to JSON-serialize already-parsed `OHLCV` bars for `ProviderFetchResult.payload` when
+  a provider has nothing more raw to archive.
 - `providers/yfinance.py` — `YahooFinanceIntraDay`, an `IntraDayProvider` implementation wrapping
   `yfinance`. Ported from `quant-scratch`'s `shared/providers/yahoo_finance.py`, adapted to
   produce `OHLCV` (which carries its own `ticker`, unlike `quant-scratch`'s `DayBar`) and to set
@@ -398,6 +430,16 @@ this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests
   tolerance. Live-verified against CroicuWS1: ingesting one more day for an already-covered
   `(SPY, massive)` range extended the existing row in place (`2026-07-23`-`2026-08-05` →
   `2026-07-23`-`2026-08-06`) rather than creating a second one.
+- **`quant_ingest` archiving** (croicu/quant-data#52) — right after a provider's `fetch_bars` call
+  succeeds, *before* the staging write, `_ingest_one` calls `archive_writer.record_fetch(...)` if
+  `settings.postgres.archiveDbname` is configured (a `ProviderSourceArchiveWriter`, built by
+  `_default_archive_writer_factory`/injectable via `main`'s `archive_writer_factory` parameter, the
+  same DI pattern as `database_factory`). Ordered before the staging write deliberately: even a bug
+  in this repo's own parsing/staging code can't lose what the provider already returned, since it's
+  already durably archived by that point. Both a missing `archiveDbname` and a failed connection or
+  a failed `record_fetch` degrade the same way — logged and skipped, `quant-ingest` still writes to
+  staging exactly as it did before this feature existed. See `docs/SCHEMA.md`'s `quant_ingest
+  database` section for the schema this writes to.
 - `settings.providers` (`list[str]`, lowercased, default `["yfinance"]`) is a flat global list —
   the same providers run for every ticker in a given invocation; there's no per-ticker provider
   override (see `tasks/ibkr-provider-reconciliation.md`'s now-resolved "currently configured

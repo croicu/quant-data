@@ -12,6 +12,7 @@ from quant_data._internal.contracts import IntraDayProvider
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
+from quant_data._internal.shared.provider_source_archive import ProviderSourceArchiveWriter
 from quant_data._internal.shared.providers.ibkr import CATEGORY_IBKR, IBKRIntraDay
 from quant_data._internal.shared.providers.massive import CATEGORY_MASSIVE, MassiveIntraDay
 from quant_data._internal.shared.providers.yfinance import CATEGORY_YFINANCE, YahooFinanceIntraDay
@@ -141,6 +142,23 @@ def _default_database_factory(postgres_settings: PostgresSettings) -> PostgresDa
     )
 
 
+def _default_archive_writer_factory(postgres_settings: PostgresSettings) -> ProviderSourceArchiveWriter | None:
+    if postgres_settings.archive_dbname is None:
+        return None
+    transport = resolve_transport(
+        host=postgres_settings.host,
+        port=postgres_settings.port,
+        ssh_user=postgres_settings.ssh_user,
+        ssh_key_path=postgres_settings.ssh_key_path,
+    )
+    return ProviderSourceArchiveWriter(
+        transport=transport,
+        user=postgres_settings.user,
+        password=postgres_settings.password,
+        dbname=postgres_settings.archive_dbname,
+    )
+
+
 def _build_provider(name: str, settings: Settings) -> IntraDayProvider:
     if name == "yfinance":
         return YahooFinanceIntraDay()
@@ -189,6 +207,7 @@ def _ingest_one(
     rate_limiters: dict[str, RateLimiter],
     ticker: str,
     target_date: date_type,
+    archive_writer: ProviderSourceArchiveWriter | None = None,
 ) -> int | None:
     # Fetch and write failures are logged separately (rather than one catch-all at the call
     # site) so the log category actually reflects where the failure came from -- both raise the
@@ -213,13 +232,37 @@ def _ingest_one(
             rate_limiter.acquire()
 
         try:
-            bars = provider.fetch_bars(ticker, target_date)
+            fetch_result = provider.fetch_bars(ticker, target_date)
         except AppError as error:
             Logger.warning(
                 f"quant-ingest: failed to fetch '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
                 category=_FETCH_FAILURE_CATEGORY.get(provider_name, CATEGORY_INGEST),
             )
             continue
+
+        bars = fetch_result.bars
+
+        # Archived immediately after a successful fetch, before the staging write -- so even a
+        # bug in this repo's own parsing/staging code can't lose what the provider already
+        # returned (croicu/quant-data#52). Failing to archive is recoverable (the fetch itself
+        # succeeded, and staging still gets its normal chance below) -- logged and skipped, not
+        # fatal to this (ticker, date, provider).
+        if archive_writer is not None:
+            try:
+                archive_writer.record_fetch(
+                    ticker=ticker,
+                    provider=provider_name,
+                    trading_date=target_date,
+                    fetch_version=provider.FETCH_VERSION,
+                    payload_kind=fetch_result.payload_kind,
+                    payload=fetch_result.payload,
+                )
+            except AppError as error:
+                Logger.warning(
+                    f"quant-ingest: failed to record provider source archive for '{ticker.upper()}' "
+                    f"on {target_date.isoformat()} via '{provider_name}': {error}",
+                    category=CATEGORY_INGEST,
+                )
 
         try:
             written = database.write_staging_bars(provider_name, bars)
@@ -267,6 +310,7 @@ def main(
     database_factory: Callable[[PostgresSettings], PostgresDatabase] | None = None,
     today: Callable[[], date_type] | None = None,
     rate_limiters: dict[str, RateLimiter] | None = None,
+    archive_writer_factory: Callable[[PostgresSettings], ProviderSourceArchiveWriter | None] | None = None,
 ) -> int:
     arguments = parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -318,8 +362,26 @@ def main(
 
         active_database_factory = database_factory if database_factory is not None else _default_database_factory
         active_rate_limiters = rate_limiters if rate_limiters is not None else _default_rate_limiters(settings)
+        active_archive_writer_factory = archive_writer_factory if archive_writer_factory is not None else _default_archive_writer_factory
 
         database = active_database_factory(settings.postgres)
+        # A missing archiveDbname setting or a failed connection both degrade the same way --
+        # ingest still writes to staging as before, just without archiving to quant_ingest this
+        # run, rather than aborting the whole run over a secondary, additive feature.
+        try:
+            archive_writer = active_archive_writer_factory(settings.postgres)
+        except AppError as error:
+            Logger.warning(
+                f"quant-ingest: failed to connect to quant_ingest -- provider fetches will not be archived: {error}",
+                category=CATEGORY_INGEST,
+            )
+            archive_writer = None
+        if archive_writer is None and settings.postgres.archive_dbname is None:
+            Logger.warning(
+                "quant-ingest: settings.postgres.archiveDbname is not configured -- "
+                "provider fetches will not be archived to quant_ingest (croicu/quant-data#52).",
+                category=CATEGORY_INGEST,
+            )
         succeeded: list[tuple[str, date_type]] = []
         failed: list[tuple[str, date_type]] = []
         try:
@@ -349,7 +411,7 @@ def main(
                         category=CATEGORY_INGEST,
                     )
                     for target_date in _date_range(chunk_start_date, chunk_end_date):
-                        written = _ingest_one(connected_providers, database, active_rate_limiters, ticker, target_date)
+                        written = _ingest_one(connected_providers, database, active_rate_limiters, ticker, target_date, archive_writer)
                         if written is None:
                             failed.append((ticker, target_date))
                         else:
@@ -379,13 +441,15 @@ def main(
 
                 for target_date in target_dates:
                     for ticker in tickers:
-                        written = _ingest_one(connected_providers, database, active_rate_limiters, ticker, target_date)
+                        written = _ingest_one(connected_providers, database, active_rate_limiters, ticker, target_date, archive_writer)
                         if written is None:
                             failed.append((ticker, target_date))
                         else:
                             succeeded.append((ticker, target_date))
         finally:
             database.close()
+            if archive_writer is not None:
+                archive_writer.close()
             for provider_instance in connected_providers.values():
                 provider_instance.close()
 

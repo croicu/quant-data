@@ -256,6 +256,68 @@ GRANT SELECT ON materiality_floor TO quant_writer;
 No `quant_reader` grant needed — like `data_quality_thresholds`, this is a purely internal
 reconcile-tuning table, never read via `MarketData`.
 
+## Setting up the `quant_ingest` database
+
+`quant_ingest` (croicu/quant-data#52) is a separate database on the same Postgres instance as
+`quant_data` — the immutable, append-only record of every provider fetch, kept structurally
+isolated from `quant_data`'s own routine clean-slate `DROP DATABASE`/`TRUNCATE` testing. Create and
+migrate it the same way as `quant_data` was originally set up, connected as the schema-owner role:
+
+```bash
+psql -h localhost -p 5433 -U quant_data -d postgres -c "CREATE DATABASE quant_ingest OWNER quant_data;"
+psql -h localhost -p 5433 -U quant_data -d quant_ingest -f migrations/quant_ingest/001_init_provider_source_archive.sql
+```
+
+Grant `quant_writer` access — originally deliberately asymmetric between the two tables, since only
+`provider_source_archive` was meant to be immutable:
+
+```sql
+GRANT CONNECT ON DATABASE quant_ingest TO quant_writer;
+GRANT SELECT, INSERT ON provider_source_archive TO quant_writer;
+GRANT USAGE ON SEQUENCE provider_source_archive_id_seq TO quant_writer;
+GRANT SELECT, INSERT, UPDATE, DELETE ON archive_coverage TO quant_writer;
+GRANT USAGE ON SEQUENCE archive_coverage_coverage_id_seq TO quant_writer;
+```
+
+**Update (2026-08-17): `DELETE` was additionally granted on `provider_source_archive`** at the repo
+owner's explicit request, for manual row cleanup:
+
+```sql
+GRANT DELETE ON provider_source_archive TO quant_writer;
+```
+
+This was a deliberate, informed relaxation, not an oversight — confirmed explicitly after being
+told it removes the DB-level enforcement that a compromised or buggy write path cannot delete
+archived data. `ProviderSourceArchiveWriter.record_fetch` itself still only ever `INSERT`s; nothing
+in the application code exercises this grant. `UPDATE` remains ungranted on
+`provider_source_archive` — a row can be removed, never edited in place. `archive_coverage` is
+maintained summary state (same as `quant_data`'s own `ingestion_coverage`), so it always had the
+full read/write grant. No `quant_reader` grant on either table — this is an internal audit log, not
+part of `MarketData`'s public read surface; add one later if a read need actually shows up.
+
+Then point `quant-ingest` at it via `settings.postgres.archiveDbname` (`settings.local.json`, same
+`host`/`port`/`user`/`password`/`sshUser`/`sshKeyPath` as the rest of `settings.postgres` — just a
+different `dbname`):
+
+```json
+{
+  "settings": {
+    "postgres": {
+      "host": "localhost",
+      "port": 5433,
+      "user": "quant_writer",
+      "password": "...",
+      "dbname": "quant_data",
+      "archiveDbname": "quant_ingest"
+    }
+  }
+}
+```
+
+Omitting `archiveDbname` disables archiving entirely (the default, backward-compatible with any
+`settings.json` predating this feature) — `quant-ingest` still writes to `staging_market_data_1min`
+exactly as before.
+
 ## Populating real data
 
 `quant-ingest` fetches bars from Yahoo Finance over an inclusive date range and writes them into

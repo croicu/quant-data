@@ -444,6 +444,41 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
+- **Immutable provider-fetch archive in a new `quant_ingest` database** —
+  [issue #52](https://github.com/croicu/quant-data/issues/52), `status:implementation`. A separate
+  database (not a table/schema inside `quant_data`) holding the immutable, append-only record of
+  every provider fetch — motivated by ingestion being slow/costly and by `market_data_archive`
+  (#35) only ever capturing a *candidate's* staging row, only *once purged*, never the whistleblower
+  or the raw fetch itself. Deliberately separate from `quant_data`: Postgres has no cross-database
+  foreign keys, so this repo's own routine clean-slate `DROP DATABASE quant_data` testing can never
+  touch it structurally (concretely motivated by that same testing having swept up
+  `market_data_archive` in a "clean slate" `TRUNCATE` list once already). `provider_source_archive`
+  (ticker/provider/trading_date as plain checked text/date, `fetch_version`, `payload_kind` —
+  `raw_api_response` for Massive's genuine raw JSON vs. `parsed_bars` for yfinance/IBKR, which have
+  no raw payload this repo's code ever sees — `payload JSONB`) was originally immutable at the
+  DB-privilege level (`quant_writer` gets `INSERT` + sequence `USAGE` only, no `UPDATE`/`DELETE`) —
+  **update, 2026-08-17: `DELETE` was additionally granted** to `quant_writer` on
+  `provider_source_archive`, at the repo owner's explicit request, for manual row cleanup, after
+  being told this removes the DB-level guarantee that a compromised or buggy write path cannot
+  delete archived data. A deliberate, informed relaxation, not an oversight.
+  `ProviderSourceArchiveWriter.record_fetch` itself still only ever `INSERT`s; `UPDATE` remains
+  ungranted (a row can be removed, never edited in place). See `docs/DATABASE.md`.
+  `archive_coverage` is the archive-side equivalent of `ingestion_coverage`/#31, keyed by
+  `(ticker, provider, fetch_version)` instead of just `(ticker, provider)`, so a version bump
+  doesn't silently extend an old range. `IntraDayProvider.fetch_bars` now returns
+  `ProviderFetchResult` (bars + payload + payload_kind) instead of a bare `list[OHLCV]`, and gained
+  a `FETCH_VERSION: str` class attribute each provider bumps by hand when its own request
+  construction changes. `ProviderSourceArchiveWriter` (new, not a `PostgresDatabase` method — no
+  star-schema dependency at all) writes both tables in one transaction, called from `_ingest_one`
+  immediately after a fetch succeeds and before the staging write, so even a bug in this repo's own
+  parsing/staging code can't lose what a provider already returned. Purely additive: an unconfigured
+  `settings.postgres.archiveDbname` (the default) disables archiving entirely, `quant-ingest` still
+  writes to staging exactly as before. Deliberately excludes splitting `quant-ingest` into two
+  decoupled "ingest"/"stage" processes (discussed, explicitly deferred to its own future issue) —
+  this issue only ships the `quant_ingest` database and archiving as an additive step alongside
+  today's existing staging-write path. Implemented, unit-tested; not yet live-verified against
+  CroicuWS1 or committed.
+
 - **Massive provider integration** — [issue #44](https://github.com/croicu/quant-data/issues/44),
   `status:implementation`. Adds Massive (formerly Polygon.io) as a second `candidate` alongside
   `ibkr`, the first time `fact_market_data_1min` would see a genuine two-candidate mixture. Design

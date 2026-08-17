@@ -16,7 +16,7 @@ def _last_weekday(reference: date) -> date:
 def test_fetch_bars_returns_live_intraday_data_for_known_ticker():
     target_date = _last_weekday(datetime.now().date() - timedelta(days=1))
 
-    bars = YahooFinanceIntraDay().fetch_bars("spy", target_date)
+    bars = YahooFinanceIntraDay().fetch_bars("spy", target_date).bars
 
     assert len(bars) > 0
     assert isinstance(bars[0], OHLCV)

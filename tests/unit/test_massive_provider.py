@@ -6,6 +6,7 @@ import pytest
 import requests
 from requests.exceptions import HTTPError
 
+from quant_data._internal.contracts import PayloadKind
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.providers.massive import MassiveIntraDay
 from quant_data.protocols import DataQuality
@@ -54,7 +55,7 @@ class _RecordingSleep:
 def test_fetch_bars_parses_and_sorts_chronologically():
     provider = MassiveIntraDay(api_key="test-key", request_fn=_FixedPayloadRequest(_SAMPLE_PAYLOAD))
 
-    bars = provider.fetch_bars("spy", _TARGET_DATE)
+    bars = provider.fetch_bars("spy", _TARGET_DATE).bars
 
     assert len(bars) == 2
     assert bars[0].timestamp < bars[1].timestamp
@@ -63,6 +64,21 @@ def test_fetch_bars_parses_and_sorts_chronologically():
     assert bars[0].volume == 6319  # truncated from the fractional 6319.407237
     assert bars[1].close == 745.4
     assert bars[0].data_quality == DataQuality.ACCEPTED  # no synthetic/NaN placeholder rows, like IBKR
+
+
+def test_fetch_bars_result_carries_the_literal_raw_payload():
+    # Massive is the one provider with a genuine raw API response (plain requests.get, no SDK) --
+    # unlike yfinance/IBKR, which have no raw JSON this repo's code ever sees (croicu/quant-data#52).
+    provider = MassiveIntraDay(api_key="test-key", request_fn=_FixedPayloadRequest(_SAMPLE_PAYLOAD))
+
+    result = provider.fetch_bars("spy", _TARGET_DATE)
+
+    assert result.payload_kind == PayloadKind.RAW_API_RESPONSE
+    assert result.payload == _SAMPLE_PAYLOAD
+
+
+def test_fetch_version_is_a_class_attribute():
+    assert MassiveIntraDay.FETCH_VERSION == "1"
 
 
 def test_fetch_bars_sends_expected_url_and_params():
@@ -119,7 +135,7 @@ def test_fetch_bars_retries_on_rate_limit_then_succeeds():
     sleep = _RecordingSleep()
     provider = MassiveIntraDay(api_key="test-key", request_fn=fake_request, sleep_fn=sleep)
 
-    bars = provider.fetch_bars("spy", _TARGET_DATE)
+    bars = provider.fetch_bars("spy", _TARGET_DATE).bars
 
     assert len(bars) == 2
     assert sleep.calls == [15.0, 15.0]

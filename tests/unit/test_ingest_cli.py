@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 
 from ingest import cli
+from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.providers.massive import MassiveIntraDay
 from quant_data._internal.shared.settings import MassiveSettings, Settings
 from tests.mocks.postgres import MockPostgresDatabase
+from tests.mocks.provider_source_archive import MockProviderSourceArchiveWriter
 from tests.mocks.yfinance import MockIntraDayProvider
 
 SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
@@ -21,6 +23,8 @@ class _RecordingProvider:
     succeeds with no bars -- lets --backfill tests assert exactly which dates were fetched without
     depending on the yfinance fixture's specific covered dates."""
 
+    FETCH_VERSION = "1"
+
     def __init__(self) -> None:
         self.connected = False
         self.closed = False
@@ -29,9 +33,9 @@ class _RecordingProvider:
     def connect(self) -> None:
         self.connected = True
 
-    def fetch_bars(self, ticker: str, target_date: date):
+    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
         self.fetch_calls.append((ticker.upper(), target_date))
-        return []
+        return ProviderFetchResult(bars=[], payload={}, payload_kind=PayloadKind.PARSED_BARS)
 
     def close(self) -> None:
         self.closed = True
@@ -40,6 +44,8 @@ class _RecordingProvider:
 class _FailingProvider:
     """Fake IntraDayProvider that fails at a chosen lifecycle stage, for testing that one
     provider's failure doesn't sink providers that succeed."""
+
+    FETCH_VERSION = "1"
 
     def __init__(self, fail_on: str = "fetch_bars") -> None:
         self.fail_on = fail_on
@@ -51,7 +57,7 @@ class _FailingProvider:
         if self.fail_on == "connect":
             raise AppError("connect failed")
 
-    def fetch_bars(self, ticker: str, target_date: date):
+    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
         raise AppError("fetch failed")
 
     def close(self) -> None:
@@ -63,6 +69,27 @@ def _use_database(database: MockPostgresDatabase):
         return database
 
     return factory
+
+
+def _use_archive_writer(writer):
+    def factory(postgres_settings):
+        return writer
+
+    return factory
+
+
+class _FailingArchiveWriter:
+    """Fake ProviderSourceArchiveWriter whose record_fetch always raises -- for testing that a
+    broken archive write is recoverable, not fatal to the staging write it precedes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def record_fetch(self, ticker: str, provider: str, trading_date: date, fetch_version: str, payload_kind, payload: dict) -> None:
+        raise AppError("archive write failed")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _custom_settings(tmp_path: Path, **overrides) -> Path:
@@ -491,6 +518,87 @@ def test_main_does_not_record_coverage_when_fetch_fails():
     )
 
     assert database.recorded_coverage == []
+
+
+def test_main_archives_provider_fetch_before_staging_write():
+    database = MockPostgresDatabase()
+    archive_writer = MockProviderSourceArchiveWriter()
+
+    cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": MockIntraDayProvider()},
+        database_factory=_use_database(database),
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert len(archive_writer.recorded_fetches) == 1
+    ticker, provider, trading_date, fetch_version, payload_kind, payload = archive_writer.recorded_fetches[0]
+    assert ticker == "AAPL"
+    assert provider == "yfinance"
+    assert trading_date == date(2026, 1, 2)
+    assert fetch_version == "1"
+    assert payload_kind == PayloadKind.PARSED_BARS
+    assert len(payload["bars"]) == 2  # AAPL 2026-01-02 has 2 fixture bars
+    assert archive_writer.closed is True
+
+
+def test_main_does_not_archive_when_fetch_fails():
+    database = MockPostgresDatabase()
+    archive_writer = MockProviderSourceArchiveWriter()
+
+    cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": _FailingProvider()},
+        database_factory=_use_database(database),
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert archive_writer.recorded_fetches == []
+
+
+def test_main_still_writes_staging_when_archive_write_fails():
+    # A broken quant_ingest write (or connection) must not sink the staging write it's meant to
+    # protect -- the fetch itself already succeeded, so staging still gets its normal chance.
+    database = MockPostgresDatabase()
+    archive_writer = _FailingArchiveWriter()
+
+    exit_code = cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": MockIntraDayProvider()},
+        database_factory=_use_database(database),
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert exit_code == 0
+    assert len(database.written_staging_bars) == 2
+    assert archive_writer.closed is True
+
+
+def test_main_still_writes_staging_when_archive_writer_factory_fails():
+    database = MockPostgresDatabase()
+
+    def failing_factory(postgres_settings):
+        raise AppError("cannot connect to quant_ingest")
+
+    exit_code = cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": MockIntraDayProvider()},
+        database_factory=_use_database(database),
+        archive_writer_factory=failing_factory,
+    )
+
+    assert exit_code == 0
+    assert len(database.written_staging_bars) == 2
+
+
+def test_default_archive_writer_factory_returns_none_when_not_configured():
+    settings = Settings.load(path=SETTINGS_PATH)
+
+    assert cli._default_archive_writer_factory(settings.postgres) is None
 
 
 def test_main_connects_and_closes_every_provider():

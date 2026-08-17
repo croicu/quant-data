@@ -5,10 +5,12 @@ from datetime import date, datetime, timedelta
 import pandas
 import yfinance
 
+from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
 from quant_data.protocols import OHLCV, DataQuality
 
 from ..diagnostics import Logger
 from ..errors import AppError
+from .payload import parsed_bars_payload
 from .yfinance_logging import CATEGORY_YFINANCE, install_log_capture
 
 install_log_capture()
@@ -27,6 +29,8 @@ def _safe_int(value: float) -> tuple[int, bool]:
 
 
 class YahooFinanceIntraDay:
+    FETCH_VERSION = "1"
+
     def connect(self) -> None:
         # Stateless per-call HTTP fetch -- no persistent connection to establish, unlike
         # IBKRIntraDay. Satisfies IntraDayProvider's connect()/close() lifecycle as a no-op so
@@ -36,7 +40,7 @@ class YahooFinanceIntraDay:
     def close(self) -> None:
         pass
 
-    def fetch_bars(self, ticker: str, target_date: date) -> list[OHLCV]:
+    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
         normalized_ticker = ticker.upper()
         start = datetime.combine(target_date, datetime.min.time())
         end = start + timedelta(days=1)
@@ -82,4 +86,4 @@ class YahooFinanceIntraDay:
             f"quant-ingest: fetched {len(bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()}.",
             category=CATEGORY_YFINANCE,
         )
-        return bars
+        return ProviderFetchResult(bars=bars, payload=parsed_bars_payload(bars), payload_kind=PayloadKind.PARSED_BARS)

@@ -45,6 +45,11 @@ class PostgresSettings:
     dbname: str
     ssh_user: str | None = None
     ssh_key_path: str | None = None
+    # quant_ingest (croicu/quant-data#52) -- a separate database on the same server, same
+    # host/port/user/password/ssh_user/ssh_key_path as the primary connection above, just a
+    # different dbname. None means archiving to quant_ingest is disabled (e.g. an existing
+    # settings.json predating this feature) -- quant-ingest still writes to staging as before.
+    archive_dbname: str | None = None
 
 
 @dataclass
@@ -219,6 +224,8 @@ class Settings:
             if (ssh_user_payload is None) != (ssh_key_path_payload is None):
                 raise TaskError("'settings.postgres.sshUser' and 'settings.postgres.sshKeyPath' must be set together (or both omitted).")
 
+            archive_dbname_payload = postgres_payload.get("archiveDbname")
+
             postgres_settings = PostgresSettings(
                 host=str(postgres_payload["host"]),
                 port=int(postgres_payload["port"]),
@@ -227,6 +234,7 @@ class Settings:
                 dbname=str(postgres_payload["dbname"]),
                 ssh_user=str(ssh_user_payload) if ssh_user_payload is not None else None,
                 ssh_key_path=str(ssh_key_path_payload) if ssh_key_path_payload is not None else None,
+                archive_dbname=str(archive_dbname_payload) if archive_dbname_payload is not None else None,
             )
 
         tickers_payload = settings_payload.get("tickers", [])

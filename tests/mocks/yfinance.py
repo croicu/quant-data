@@ -4,13 +4,17 @@ import json
 from datetime import date, datetime
 from pathlib import Path
 
+from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
 from quant_data._internal.shared.errors import AppError
+from quant_data._internal.shared.providers.payload import parsed_bars_payload
 from quant_data.protocols import OHLCV, DataQuality
 
 DEFAULT_DATA_PATH = Path(__file__).parent.parent / "data" / "ohlcv_bars.json"
 
 
 class MockIntraDayProvider:
+    FETCH_VERSION = "1"
+
     def __init__(self, data_path: Path = DEFAULT_DATA_PATH) -> None:
         with data_path.open("r", encoding="utf-8") as f:
             self._bars_by_ticker: dict = json.load(f)
@@ -23,7 +27,7 @@ class MockIntraDayProvider:
     def close(self) -> None:
         self.closed = True
 
-    def fetch_bars(self, ticker: str, target_date: date) -> list[OHLCV]:
+    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
         normalized_ticker = ticker.upper()
 
         ticker_data = self._bars_by_ticker.get(normalized_ticker)
@@ -49,4 +53,4 @@ class MockIntraDayProvider:
             )
             bars.append(bar)
 
-        return bars
+        return ProviderFetchResult(bars=bars, payload=parsed_bars_payload(bars), payload_kind=PayloadKind.PARSED_BARS)

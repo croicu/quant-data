@@ -63,7 +63,7 @@ def test_fetch_bars_flags_nan_rows_as_incomplete(mock_yfinance):
     )
     mock_yfinance.Ticker.return_value.history.return_value = history
 
-    bars = YahooFinanceIntraDay().fetch_bars("aapl", date(2026, 7, 24))
+    bars = YahooFinanceIntraDay().fetch_bars("aapl", date(2026, 7, 24)).bars
 
     assert len(bars) == 2
     assert bars[0].ticker == "AAPL"
@@ -90,7 +90,7 @@ def test_fetch_bars_flags_literal_zero_volume_as_incomplete(mock_yfinance):
     )
     mock_yfinance.Ticker.return_value.history.return_value = history
 
-    bars = YahooFinanceIntraDay().fetch_bars("aapl", date(2026, 7, 24))
+    bars = YahooFinanceIntraDay().fetch_bars("aapl", date(2026, 7, 24)).bars
 
     assert len(bars) == 1
     assert bars[0].volume == 0
