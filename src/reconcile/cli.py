@@ -163,6 +163,26 @@ def _synthetic_absent_whistleblower_bar(provider: ProviderRow) -> ProviderBar:
     )
 
 
+def _missing_graduation_keys(
+    ticker_id: int,
+    candidate_provider_ids: list[int],
+    ohlc_field_ids: list[int],
+    graduated_keys: set[tuple[int, int, int]],
+) -> set[tuple[int, int, int]]:
+    """Every (candidate_provider_id, ticker_id, field_id) combination not yet present in
+    graduated_keys -- the graduation key is deliberately identical to stats_by_key's own key shape
+    (provider_id, ticker_id, field_id), not projected down to ticker_id alone. A per-ticker-only
+    gate would let one candidate's existing graduation on a ticker silently lock out a second,
+    later-added candidate from ever graduating on that same ticker (croicu/quant-data#44)."""
+    missing: set[tuple[int, int, int]] = set()
+    for candidate_provider_id in candidate_provider_ids:
+        for field_id in ohlc_field_ids:
+            key = (candidate_provider_id, ticker_id, field_id)
+            if key not in graduated_keys:
+                missing.add(key)
+    return missing
+
+
 def _is_date_covered(coverage_ranges: dict[tuple[int, int], list[tuple[int, int]]], ticker_id: int, provider_id: int, date_id: int) -> bool:
     ranges = coverage_ranges.get((ticker_id, provider_id))
     if ranges is None:
@@ -377,12 +397,14 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
     providers_by_id: dict[int, ProviderRow] = {}
     providers_by_name: dict[str, ProviderRow] = {}
     candidate_provider_names: list[str] = []
+    candidate_provider_ids: list[int] = []
     whistleblower_provider_id: int | None = None
     for provider in providers:
         providers_by_id[provider.provider_id] = provider
         providers_by_name[provider.name] = provider
         if provider.role == ROLE_CANDIDATE:
             candidate_provider_names.append(provider.name)
+            candidate_provider_ids.append(provider.provider_id)
         elif provider.role == ROLE_WHISTLEBLOWER:
             whistleblower_provider_id = provider.provider_id
 
@@ -432,41 +454,64 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
         rows_by_provider_ticker_timestamp[(row.ticker_id, row.provider_id, row.timestamp)] = row
         bar_key_by_ticker_timestamp[(row.ticker_id, row.timestamp)] = bar_key
 
-    # croicu/quant-data#31: fetch_staging_rows_for_reconciliation now admits bar_keys where the
-    # whistleblower never reported at all (only candidates are required). Such a bar_key is only
-    # genuinely ready for evaluation if ingestion_coverage confirms the whistleblower's absence is
-    # a real "nothing here," not "not ingested yet" -- otherwise it must be treated exactly like a
-    # bar missing any other required provider: not evaluated, not marked pending, left alone for a
-    # future run to pick up once coverage resolves the ambiguity. Filtering here (rather than only
-    # deciding whether to synthesize a placeholder later) keeps every downstream step -- graduation
-    # counting, the fixed-point loop, pending-marking -- automatically correct with no special-casing.
+    # croicu/quant-data#31 (whistleblower) + croicu/quant-data#49 (generalized to every candidate
+    # too): fetch_staging_rows_for_reconciliation now admits bar_keys missing the whistleblower
+    # and/or one or more candidates -- only requires at least one candidate present at all. A
+    # bar_key is only genuinely ready for evaluation once every *individually missing* required
+    # provider (the whistleblower, or any candidate) is either present, or ingestion_coverage
+    # confirms its absence is a real "nothing here," not "not ingested yet" -- a provider's
+    # ingested data for a covered (ticker, date) is immutable once acquired, so a confirmed-absent
+    # minute is a fact about that provider, not an ambiguous pending state. If even one required
+    # provider is missing and unconfirmed, the whole bar_key is left alone exactly like a bar
+    # missing any provider always was: not evaluated, not marked pending, picked up on a future run
+    # once coverage resolves the ambiguity. algorithm.py needs no changes for this -- every tier
+    # already iterates whatever candidates happen to be present in `bars`, so a bar_key that makes
+    # it through this filter with (say) only `ibkr` and not `massive` present is automatically
+    # resolved using `ibkr` alone, subject to the same whistleblower validation as any other bar.
+    # Filtering here (not deferred) keeps every downstream step -- graduation counting, the
+    # fixed-point loop, pending-marking -- automatically correct with no special-casing.
+    required_provider_ids: list[int] = list(candidate_provider_ids)
     if whistleblower_provider_id is not None:
-        unready_bar_keys: list[tuple[int, int, int]] = []
-        for bar_key, rows in bars.items():
-            whistleblower_present = False
-            for row in rows:
-                if row.provider_id == whistleblower_provider_id:
-                    whistleblower_present = True
-                    break
-            if whistleblower_present:
-                continue
-            unready_ticker_id, unready_date_id, _unready_time_id = bar_key
-            if not _is_date_covered(coverage_ranges, unready_ticker_id, whistleblower_provider_id, unready_date_id):
-                unready_bar_keys.append(bar_key)
-        for bar_key in unready_bar_keys:
-            del bars[bar_key]
+        required_provider_ids.append(whistleblower_provider_id)
 
-    # Per-ticker graduation gate (croicu/quant-data#28): a ticker with no provider_pair_disagreement
-    # rows yet is "ungraduated" -- its bars sit in staging completely unevaluated (no Tier 1-4
-    # attempt, no partial stats update) until it accumulates GRADUATION_THRESHOLD_MATCHED_BARS
-    # matched bars, at which point its tolerance is computed once from that full batch and the
+    unready_bar_keys: list[tuple[int, int, int]] = []
+    for bar_key, rows in bars.items():
+        present_provider_ids: set[int] = set()
+        for row in rows:
+            present_provider_ids.add(row.provider_id)
+
+        unready_ticker_id, unready_date_id, _unready_time_id = bar_key
+        for required_provider_id in required_provider_ids:
+            if required_provider_id in present_provider_ids:
+                continue
+            if not _is_date_covered(coverage_ranges, unready_ticker_id, required_provider_id, unready_date_id):
+                unready_bar_keys.append(bar_key)
+                break
+    for bar_key in unready_bar_keys:
+        del bars[bar_key]
+
+    # Per-ticker eligibility gate (croicu/quant-data#28): a ticker with no provider_pair_disagreement
+    # rows at all yet is wholly "ungraduated" -- its bars sit in staging completely unevaluated (no
+    # Tier 1-4 attempt, no partial stats update) until at least one candidate accumulates
+    # GRADUATION_THRESHOLD_MATCHED_BARS matched bars and graduates below, at which point the
     # ticker's entire currently-fetched backlog (matched and unmatched together, so Tier 1
     # completeness -- which only ever fires on unmatched bars -- isn't stranded) is evaluated
-    # through the standard Tier 1-4 stack below. "Graduated" is derived, not stored separately:
-    # those rows are created only here or by a later Tier-2 update, never before.
+    # through the standard Tier 1-4 stack. Coarse (per-ticker) on purpose: once a ticker has ever
+    # graduated for any candidate, it stays eligible for Tier 1-4 permanently -- a second,
+    # later-added candidate's own graduation (below) must not re-gate it.
     graduated_ticker_ids: set[int] = set()
     for stats_provider_id, stats_ticker_id, stats_field_id in stats_by_key:
         graduated_ticker_ids.add(stats_ticker_id)
+
+    # Per-(candidate, ticker, field) graduation key (croicu/quant-data#44) -- deliberately the same
+    # shape as stats_by_key's own key, not projected down to ticker_id alone. The projection used
+    # to be exactly that: "has this ticker ever graduated for *any* candidate" also gated whether
+    # the batch-computation block below ran at all, so a second candidate added to an
+    # already-graduated ticker (e.g. massive joining ibkr on SPY) could never reach its own
+    # graduation batch -- tolerances.get(candidate.provider_id) would stay None forever, locking it
+    # out of Tier 2/3 permanently, not just until it "caught up." graduated_keys tracks the finer
+    # granularity that actually matches what tolerances are looked up by.
+    graduated_keys: set[tuple[int, int, int]] = set(stats_by_key.keys())
 
     bar_keys_by_ticker: dict[int, list[tuple[int, int, int]]] = {}
     for bar_key in bars:
@@ -475,8 +520,18 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
             bar_keys_by_ticker[ticker_id] = []
         bar_keys_by_ticker[ticker_id].append(bar_key)
 
+    # Only needed inside the loop below -- guarded so a run with nothing at all in staging (no
+    # bars, nothing to graduate) doesn't require dim_field to be resolvable. candidate_provider_ids
+    # itself was already computed above (used by the eligibility filter too), no dim_field
+    # dependency, so it's always safe to reuse as-is.
+    ohlc_field_ids: list[int] = []
+    if bar_keys_by_ticker:
+        for field_name in fields_for_group(FIELD_GROUP_OHLC):
+            ohlc_field_ids.append(field_ids_by_name[field_name])
+
     for ticker_id, ticker_bar_keys in bar_keys_by_ticker.items():
-        if ticker_id in graduated_ticker_ids:
+        missing_keys = _missing_graduation_keys(ticker_id, candidate_provider_ids, ohlc_field_ids, graduated_keys)
+        if not missing_keys:
             continue
 
         matched_bar_keys: list[tuple[int, int, int]] = []
@@ -487,6 +542,10 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
         if len(matched_bar_keys) < GRADUATION_THRESHOLD_MATCHED_BARS:
             continue
 
+        # Only accumulate diffs for the specific (candidate, field) combinations this ticker is
+        # still missing -- an already-graduated candidate (e.g. ibkr, once massive is the one
+        # missing keys) must not have its mature, Welford-accumulated stats silently recomputed
+        # and overwritten just because it's also present in these same matched bars.
         diffs_by_candidate_field: dict[tuple[int, str], list[float]] = {}
         for bar_key in matched_bar_keys:
             matched_provider_bars: list[ProviderBar] = []
@@ -500,16 +559,25 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
                     continue
                 diffs = relative_diffs_for_stats_update(matched_candidate_bar, matched_whistleblower_bar, FIELD_GROUP_OHLC)
                 for field_name, diff in zip(fields_for_group(FIELD_GROUP_OHLC), diffs):
+                    field_id = field_ids_by_name[field_name]
+                    if (matched_candidate_bar.provider_id, ticker_id, field_id) not in missing_keys:
+                        continue
                     diff_key = (matched_candidate_bar.provider_id, field_name)
                     if diff_key not in diffs_by_candidate_field:
                         diffs_by_candidate_field[diff_key] = []
                     diffs_by_candidate_field[diff_key].append(diff)
+
+        if not diffs_by_candidate_field:
+            # Every missing candidate simply never reported at any of this ticker's matched bars
+            # this run (e.g. massive not ingested for this ticker yet) -- nothing to graduate.
+            continue
 
         graduation_rows: list[tuple[int, int, int, int, float, float, float]] = []
         for (candidate_provider_id, field_name), diffs in diffs_by_candidate_field.items():
             graduation_stats = batch_stats(diffs)
             field_id = field_ids_by_name[field_name]
             stats_by_key[(candidate_provider_id, ticker_id, field_id)] = graduation_stats
+            graduated_keys.add((candidate_provider_id, ticker_id, field_id))
             graduation_rows.append(
                 (
                     candidate_provider_id,
@@ -524,7 +592,10 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
         database.save_provider_pair_disagreement_batch(graduation_rows)
 
         graduated_ticker_ids.add(ticker_id)
-        Logger.info(f"quant-reconcile: ticker {ticker_id} graduated at {len(matched_bar_keys)} matched bars.", category=CATEGORY_RECONCILE)
+        Logger.info(
+            f"quant-reconcile: ticker {ticker_id} graduated {len(graduation_rows)} (provider, field) combination(s) at {len(matched_bar_keys)} matched bars.",
+            category=CATEGORY_RECONCILE,
+        )
 
     eligible_bars: dict[tuple[int, int, int], list[StagingRow]] = {}
     for bar_key, rows in bars.items():

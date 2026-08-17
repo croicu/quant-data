@@ -13,6 +13,7 @@ from tests.mocks.reconcile_database import FakeReconcileDatabase
 
 IBKR = 1
 YFINANCE = 2
+MASSIVE = 3
 OHLC = 1
 FIELD_OPEN = 1
 FIELD_HIGH = 2
@@ -23,6 +24,7 @@ PROVIDERS = [
     ProviderRow(provider_id=IBKR, name="ibkr", role="candidate"),
     ProviderRow(provider_id=YFINANCE, name="yfinance", role="whistleblower"),
 ]
+PROVIDERS_WITH_MASSIVE = PROVIDERS + [ProviderRow(provider_id=MASSIVE, name="massive", role="candidate")]
 FIELD_GROUPS = [
     FieldGroupRow(field_group_id=OHLC, name="ohlc"),
 ]
@@ -83,6 +85,20 @@ def _matched_bar_rows(count: int, ticker_id: int = 1, start_time_id: int = 100) 
         timestamp = datetime(2026, 7, 24, 4, 0) + timedelta(minutes=i)
         result.append(_staging_row(IBKR, ticker_id=ticker_id, time_id=time_id, timestamp=timestamp))
         result.append(_staging_row(YFINANCE, ticker_id=ticker_id, time_id=time_id, timestamp=timestamp))
+    return result
+
+
+def _matched_bar_rows_with_massive(count: int, ticker_id: int = 1, start_time_id: int = 100) -> list[StagingRow]:
+    """Same shape as _matched_bar_rows, but for a three-provider (ibkr, yfinance, massive) run --
+    all three report identical, non-incomplete OHLC (zero diff), so agreement/graduation outcomes
+    are fully predictable."""
+    result: list[StagingRow] = []
+    for i in range(count):
+        time_id = start_time_id + i
+        timestamp = datetime(2026, 7, 24, 4, 0) + timedelta(minutes=i)
+        result.append(_staging_row(IBKR, ticker_id=ticker_id, time_id=time_id, timestamp=timestamp))
+        result.append(_staging_row(YFINANCE, ticker_id=ticker_id, time_id=time_id, timestamp=timestamp))
+        result.append(_staging_row(MASSIVE, ticker_id=ticker_id, time_id=time_id, timestamp=timestamp))
     return result
 
 
@@ -536,6 +552,150 @@ def test_finalize_alone_with_nothing_pending_does_nothing():
     assert stuck == 0
     assert database.fact_market_data == {}
     assert len(database.staging_rows) == 2  # untouched
+
+
+def test_two_candidates_confirmed_absent_whistleblower_resolves_unadjudicated_and_skips_welford():
+    # Regression tests 2+3 (croicu/quant-data#44): two already-graduated candidates agree with
+    # each other; the whistleblower is confirmed absent (ingestion_coverage covers the date, no
+    # staging row at all). Must resolve automatically via the new unadjudicated fallback -- not
+    # get stuck the way an un-gated Tier 2 comparison against a synthetic placeholder would -- and
+    # must NOT feed provider_pair_disagreement's Welford variance, since no real agreement was
+    # ever observed.
+    staging_rows = [
+        _staging_row(IBKR, open=100.0, high=101.0, low=99.0, close=100.5, volume=500),
+        _staging_row(MASSIVE, open=100.0, high=101.0, low=99.0, close=100.5, volume=500),
+    ]
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    disagreement_stats += _seed_disagreement_stats(MASSIVE, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    ingestion_coverage = [IngestionCoverageRow(ticker_id=1, provider_id=YFINANCE, start_date_id=5, end_date_id=15)]
+    database = FakeReconcileDatabase(
+        PROVIDERS_WITH_MASSIVE,
+        FIELD_GROUPS,
+        staging_rows,
+        fields=FIELDS,
+        disagreement_stats=disagreement_stats,
+        ingestion_coverage=ingestion_coverage,
+    )
+    stats_before = dict(database.disagreement_stats)
+
+    resolved, stuck = run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"], preferred_provider="ibkr"), finalize=False)
+
+    assert resolved == 1
+    assert stuck == 0
+    fact_row = database.fact_market_data[(1, 10, 20)]
+    _timestamp, open_, high, low, close, volume, _data_quality = fact_row
+    assert (open_, high, low, close, volume) == (100.0, 101.0, 99.0, 100.5, 500)
+    for _, _, _, _, winning_provider_id, resolution_path in database.fact_reconciliation:
+        assert resolution_path == "unadjudicated"
+        assert winning_provider_id == IBKR
+    assert database.disagreement_stats == stats_before  # Welford untouched
+
+
+def test_second_candidate_graduates_on_already_graduated_ticker():
+    # Regression test 6 (croicu/quant-data#44): ibkr is already graduated on ticker 1 with mature,
+    # Welford-accumulated stats. massive joins as a second candidate and accumulates enough
+    # matched bars (all three providers agreeing) to graduate on its own in this run --
+    # preferredProvider is set to massive so ibkr never wins a Tier 2 tiebreak here, isolating the
+    # assertion to the graduation *batch* itself: ibkr's stats must come out byte-for-byte
+    # unchanged, not silently recomputed just because ibkr is present in the same matched bars
+    # massive's graduation batch scans (the bug the old per-ticker-only gate had).
+    ibkr_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=5000, running_mean=0.0001, running_m2=0.02)
+    staging_rows = _matched_bar_rows_with_massive(GRADUATION_THRESHOLD_MATCHED_BARS)
+    database = FakeReconcileDatabase(PROVIDERS_WITH_MASSIVE, FIELD_GROUPS, staging_rows, fields=FIELDS, disagreement_stats=ibkr_stats)
+    ibkr_stats_before = {}
+    for field in FIELDS:
+        ibkr_stats_before[field.field_id] = database.disagreement_stats[(IBKR, 1, field.field_id)]
+
+    run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"], preferred_provider="massive"), finalize=False)
+
+    for field in FIELDS:
+        assert database.disagreement_stats[(IBKR, 1, field.field_id)] == ibkr_stats_before[field.field_id]
+    assert database.disagreement_stats[(MASSIVE, 1, FIELD_OPEN)].sample_count >= GRADUATION_THRESHOLD_MATCHED_BARS
+
+
+def test_second_candidate_graduates_missing_field_without_touching_already_graduated_fields():
+    # Regression test 5 (croicu/quant-data#44), asserted at the tolerance lookup key's own
+    # granularity: massive already has mature stats for open/high/low but is missing close -- the
+    # only way to exercise per-field graduation today, since a normal graduation batch always
+    # computes all 4 fields atomically. The fix must fill in exactly the missing key without
+    # disturbing the three already-present ones. preferredProvider is ibkr so massive never wins a
+    # Tier 2 tiebreak, isolating the assertion to the graduation batch itself.
+    ibkr_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=5000, running_mean=0.0, running_m2=0.02)
+    massive_partial_stats = [
+        DisagreementStatsRow(provider_id=MASSIVE, ticker_id=1, field_id=FIELD_OPEN, sample_count=5000, running_mean=0.0, running_m2=0.02),
+        DisagreementStatsRow(provider_id=MASSIVE, ticker_id=1, field_id=FIELD_HIGH, sample_count=5000, running_mean=0.0, running_m2=0.02),
+        DisagreementStatsRow(provider_id=MASSIVE, ticker_id=1, field_id=FIELD_LOW, sample_count=5000, running_mean=0.0, running_m2=0.02),
+        # FIELD_CLOSE deliberately absent -- massive's own graduation gap.
+    ]
+    staging_rows = _matched_bar_rows_with_massive(GRADUATION_THRESHOLD_MATCHED_BARS)
+    database = FakeReconcileDatabase(PROVIDERS_WITH_MASSIVE, FIELD_GROUPS, staging_rows, fields=FIELDS, disagreement_stats=ibkr_stats + massive_partial_stats)
+    massive_open_before = database.disagreement_stats[(MASSIVE, 1, FIELD_OPEN)]
+    massive_high_before = database.disagreement_stats[(MASSIVE, 1, FIELD_HIGH)]
+    massive_low_before = database.disagreement_stats[(MASSIVE, 1, FIELD_LOW)]
+    assert (MASSIVE, 1, FIELD_CLOSE) not in database.disagreement_stats
+
+    run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"], preferred_provider="ibkr"), finalize=False)
+
+    assert database.disagreement_stats[(MASSIVE, 1, FIELD_OPEN)] == massive_open_before
+    assert database.disagreement_stats[(MASSIVE, 1, FIELD_HIGH)] == massive_high_before
+    assert database.disagreement_stats[(MASSIVE, 1, FIELD_LOW)] == massive_low_before
+    assert database.disagreement_stats[(MASSIVE, 1, FIELD_CLOSE)].sample_count >= GRADUATION_THRESHOLD_MATCHED_BARS
+
+
+def test_candidate_resolves_using_remaining_candidate_when_other_candidate_confirmed_absent():
+    # croicu/quant-data#49: massive never reported for this bar at all, but ingestion_coverage
+    # confirms its date range was actually ingested for this ticker -- a real "nothing here," not
+    # "not ingested yet." ibkr alone (subject to whistleblower validation) must still resolve the
+    # bar via ordinary Tier 2 agreement, exactly the "choose the candidate with data" behavior --
+    # algorithm.py needs no special-casing since it never assumed a fixed candidate count.
+    staging_rows = [
+        _staging_row(IBKR, open=100.0, high=101.0, low=99.0, close=100.5, volume=1000),
+        _staging_row(YFINANCE, open=100.01, high=101.01, low=99.01, close=100.51, volume=1002),
+        # no massive row for this bar at all
+    ]
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    ingestion_coverage = [IngestionCoverageRow(ticker_id=1, provider_id=MASSIVE, start_date_id=5, end_date_id=15)]
+    database = FakeReconcileDatabase(
+        PROVIDERS_WITH_MASSIVE,
+        FIELD_GROUPS,
+        staging_rows,
+        fields=FIELDS,
+        disagreement_stats=disagreement_stats,
+        ingestion_coverage=ingestion_coverage,
+    )
+
+    resolved, stuck = run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"]), finalize=False)
+
+    assert resolved == 1
+    assert stuck == 0
+    fact_row = database.fact_market_data[(1, 10, 20)]
+    _timestamp, open_, high, low, close, volume, _data_quality = fact_row
+    assert (open_, high, low, close, volume) == (100.0, 101.0, 99.0, 100.5, 1000)  # ibkr's own values
+    for _, _, _, _, winning_provider_id, resolution_path in database.fact_reconciliation:
+        assert winning_provider_id == IBKR
+        assert resolution_path == "agreement"
+
+
+def test_candidate_stays_untouched_when_other_candidate_not_yet_confirmed_absent():
+    # Same shape as above, but no ingestion_coverage row for massive at all -- too early to
+    # conclude anything, so the bar must be left alone exactly like a bar missing any other
+    # required provider: not evaluated, and critically not marked pending.
+    staging_rows = [
+        _staging_row(IBKR, open=100.0, high=101.0, low=99.0, close=100.5, volume=1000),
+        _staging_row(YFINANCE, open=100.01, high=101.01, low=99.01, close=100.51, volume=1002),
+    ]
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    database = FakeReconcileDatabase(
+        PROVIDERS_WITH_MASSIVE, FIELD_GROUPS, staging_rows, fields=FIELDS, disagreement_stats=disagreement_stats
+    )  # no ingestion_coverage at all
+
+    resolved, stuck = run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"]), finalize=False)
+
+    assert resolved == 0
+    assert stuck == 0
+    assert database.fact_reconciliation == []
+    assert len(database.staging_rows) == 2  # untouched
+    assert database.pending_manual_resolution == set()
 
 
 def test_parse_args_defaults_finalize_to_false():

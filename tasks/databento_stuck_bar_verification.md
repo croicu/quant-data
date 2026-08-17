@@ -25,6 +25,31 @@ conversation rather than assuming it's already settled — the prior decision sh
 on purpose, not silently overridden by a differently-scoped feature that ends up doing the same
 thing by another name.
 
+**2026-08-16 update — the Massive integration (croicu/quant-data#44) meaningfully broadens the
+motivating case, beyond just the existing pending queue.** Live-testing `massive` as a second real
+candidate against `SPY` surfaced two situations where the automatic pass currently makes a
+zero-evidence call instead of ever reaching a human (or a third source):
+
+- **`RESOLUTION_UNADJUDICATED`** (no `ACCEPTED` whistleblower to adjudicate between two-or-more
+  valid candidates — `_resolve_unadjudicated`, added with #44) resolves straight to
+  `settings.reconcile.preferredProvider`, no comparison ever attempted. On the live `SPY` data this
+  fired for **5,249 of 9,598 resolved bars** — the large majority, not an edge case. None of these
+  ever reach `fact_pending_manual_resolution` today, so DataBento-as-pending-queue-only would never
+  even see them.
+- **Candidate-vs-candidate disagreement threshold** (proposed 2026-08-16, not yet built as of this
+  update — see the "candidate-disagreement threshold" work landing alongside this note): when two
+  agreeing candidates disagree with *each other* beyond a materiality floor, the plan is to demote
+  that bar to `fact_pending_manual_resolution` rather than silently picking `preferredProvider`.
+  Once built, *these* bars will land in the existing pending queue this task already targets — but
+  on the live `SPY` data checked today, `ibkr`/`massive` diverged by at most 6 cents (p99 ~1 cent)
+  across 3,894 dual-agreement bars, so this path is expected to fire rarely in practice, not be the
+  primary source of DataBento-worthy bars.
+
+Net effect: the *volume* of "automatic tiers had no real adjudicator" bars is now dominated by
+`unadjudicated` (whistleblower-absent), not classic stuck/pending bars — worth re-scoping this
+task's "only bars already in the pending queue" framing before converging further, since most of
+the actual zero-evidence resolutions this task cares about don't currently reach that queue at all.
+
 ## Design decisions
 
 <!-- Not yet converged -- open questions below need resolving first. -->

@@ -13,6 +13,7 @@ from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
 from quant_data._internal.shared.providers.ibkr import CATEGORY_IBKR, IBKRIntraDay
+from quant_data._internal.shared.providers.massive import CATEGORY_MASSIVE, MassiveIntraDay
 from quant_data._internal.shared.providers.yfinance import CATEGORY_YFINANCE, YahooFinanceIntraDay
 from quant_data._internal.shared.settings import PostgresSettings, RateLimitSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
@@ -28,6 +29,7 @@ CATEGORY_INGEST = "ingest"
 _FETCH_FAILURE_CATEGORY: dict[str, str] = {
     "yfinance": CATEGORY_YFINANCE,
     "ibkr": CATEGORY_IBKR,
+    "massive": CATEGORY_MASSIVE,
 }
 
 
@@ -144,7 +146,11 @@ def _build_provider(name: str, settings: Settings) -> IntraDayProvider:
         return YahooFinanceIntraDay()
     if name == "ibkr":
         return IBKRIntraDay(host=settings.ibkr.host, port=settings.ibkr.port, client_id=settings.ibkr.client_id)
-    raise AppError(f"Unknown provider '{name}' in settings.providers -- expected one of: yfinance, ibkr.")
+    if name == "massive":
+        if settings.massive is None:
+            raise AppError("'massive' is in settings.providers but settings.massive.apiKey is not configured.")
+        return MassiveIntraDay(api_key=settings.massive.api_key)
+    raise AppError(f"Unknown provider '{name}' in settings.providers -- expected one of: yfinance, ibkr, massive.")
 
 
 def _default_providers(settings: Settings) -> dict[str, IntraDayProvider]:
@@ -159,6 +165,8 @@ def _rate_limit_for(name: str, settings: Settings) -> RateLimitSettings | None:
         return settings.ibkr.rate_limit
     if name == "yfinance":
         return settings.yfinance.rate_limit
+    if name == "massive":
+        return settings.massive.rate_limit if settings.massive is not None else None
     return None
 
 
@@ -221,6 +229,19 @@ def _ingest_one(
                 category=CATEGORY_INGEST,
             )
             continue
+
+        # Coverage is recorded only after both fetch and write succeeded -- a provider's fetch
+        # completing without raising (any bar count, including zero) is what "covered" means
+        # (croicu/quant-data#31), and the write must have actually landed too. Failing to record
+        # coverage is recoverable (the bars themselves are already safely in staging either way) --
+        # logged and skipped, not fatal to this (ticker, date) pair.
+        try:
+            database.record_ingestion_coverage(provider_name, ticker, target_date)
+        except AppError as error:
+            Logger.warning(
+                f"quant-ingest: failed to record ingestion coverage for '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
+                category=CATEGORY_INGEST,
+            )
 
         any_provider_succeeded = True
         total_written += written

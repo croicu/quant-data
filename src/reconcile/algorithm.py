@@ -25,6 +25,7 @@ DATA_QUALITY_REJECTED = "rejected"
 RESOLUTION_COMPLETENESS = "completeness"
 RESOLUTION_AGREEMENT = "agreement"
 RESOLUTION_BOUNDARY_FIX = "boundary_fix"
+RESOLUTION_UNADJUDICATED = "unadjudicated"
 RESOLUTION_FINALIZED = "finalized"
 RESOLUTION_MANUAL_OVERRIDE = "manual_override"
 
@@ -91,13 +92,17 @@ def _reference_value(bar: ProviderBar, field_group: str) -> float:
     return total / len(fields)
 
 
+def _materiality_floor(candidate: ProviderBar, field_group: str, field_tolerance: FieldTolerance) -> float:
+    if field_tolerance.floor_type == FLOOR_TYPE_BPS_OF_REFERENCE:
+        reference_value = _reference_value(candidate, field_group)
+        return field_tolerance.floor_value * reference_value / 10000.0
+    return field_tolerance.floor_value
+
+
 def _tolerance(candidate: ProviderBar, field_group: str, field_tolerance: FieldTolerance, k: float) -> float:
     reference_value = _reference_value(candidate, field_group)
     computed = k * field_tolerance.stddev * reference_value
-    if field_tolerance.floor_type == FLOOR_TYPE_BPS_OF_REFERENCE:
-        floor = field_tolerance.floor_value * reference_value / 10000.0
-    else:
-        floor = field_tolerance.floor_value
+    floor = _materiality_floor(candidate, field_group, field_tolerance)
     return max(computed, floor)
 
 
@@ -122,8 +127,16 @@ def _agrees_within_tolerance(
 
 
 def _find_whistleblower(bars: list[ProviderBar]) -> ProviderBar | None:
+    """Only an ACCEPTED whistleblower counts as a usable adjudicator -- an outlier-REJECTED or
+    confirmed-absent/INCOMPLETE whistleblower row is a known-bad or synthetic placeholder value,
+    never a real reference. With exactly one candidate this distinction was moot (Tier 1
+    completeness always resolved the bar first, before Tier 2/3 could ever look at the
+    whistleblower's own data_quality); with two or more candidates present it stops being moot --
+    see resolve_automatic's use of this filtered result to fall through to
+    RESOLUTION_UNADJUDICATED instead of ever comparing a candidate against a value already known
+    to be wrong."""
     for bar in bars:
-        if bar.role == ROLE_WHISTLEBLOWER:
+        if bar.role == ROLE_WHISTLEBLOWER and bar.data_quality == DATA_QUALITY_ACCEPTED:
             return bar
     return None
 
@@ -160,6 +173,39 @@ def _resolve_completeness(bars: list[ProviderBar]) -> Resolution | None:
     return None
 
 
+def _candidates_disagree_materially(
+    winner: ProviderBar,
+    agreeing: list[ProviderBar],
+    field_group: str,
+    tolerances: dict[int, dict[str, FieldTolerance]],
+) -> bool:
+    """True if any other agreeing candidate diverges from the winner by more than the winner's own
+    materiality floor for that field (croicu/quant-data#50). Both candidates already individually
+    passed their own tolerance-vs-whistleblower check -- this catches the case where that's true
+    but they still disagree with *each other* by an economically meaningful amount, which the
+    preferredProvider tiebreak would otherwise paper over silently. Reuses the winner's own
+    already-computed materiality floor rather than a new stat -- a floor of 0.0 (unconfigured for
+    this (winner, ticker, field)) means the check simply doesn't engage for that field, preserving
+    today's tiebreak behavior wherever no floor was ever seeded."""
+    winner_field_tolerances = tolerances.get(winner.provider_id)
+    if winner_field_tolerances is None:
+        return False
+    for other in agreeing:
+        if other.provider_id == winner.provider_id:
+            continue
+        for field_name in fields_for_group(field_group):
+            field_tolerance = winner_field_tolerances.get(field_name)
+            if field_tolerance is None:
+                continue
+            floor = _materiality_floor(winner, field_group, field_tolerance)
+            if floor <= 0:
+                continue
+            diff = abs(getattr(other, field_name) - getattr(winner, field_name))
+            if diff > floor:
+                return True
+    return False
+
+
 def _resolve_agreement(
     bars: list[ProviderBar],
     field_group: str,
@@ -182,6 +228,8 @@ def _resolve_agreement(
     if not agreeing:
         return None
     winner = _pick_preferred(agreeing, preferred_provider_id)
+    if len(agreeing) > 1 and _candidates_disagree_materially(winner, agreeing, field_group, tolerances):
+        return None
     return Resolution(winning_provider_id=winner.provider_id, resolution_path=RESOLUTION_AGREEMENT)
 
 
@@ -247,6 +295,27 @@ def _resolve_boundary_fix(
     return None
 
 
+def _resolve_unadjudicated(bars: list[ProviderBar], preferred_provider_id: int | None) -> Resolution | None:
+    """Fires only when Tier 1 didn't resolve (more than one valid candidate present, so
+    completeness alone can't pick a winner) and no ACCEPTED whistleblower exists to adjudicate
+    between them (checked by the caller via _find_whistleblower). Falls through to
+    settings.reconcile.preferredProvider's raw value -- the same fallback --finalize's
+    resolve_finalize uses, but tagged with its own resolution_path (RESOLUTION_UNADJUDICATED, not
+    RESOLUTION_AGREEMENT) since no comparison against a reference value was ever attempted: reusing
+    'agreement' here would corrupt provider_pair_disagreement's Welford variance (which only
+    genuine Tier 2 in-band agreements should feed) and fact_reconciliation_participant's reputation
+    trail (a non-winning candidate here didn't lose a comparison, it was never compared) with
+    observations that carry no information. Returns None (still stuck, Tier 4) if
+    preferredProvider itself didn't report as a candidate for this bar -- same defensive shape as
+    resolve_finalize."""
+    if preferred_provider_id is None:
+        return None
+    for bar in bars:
+        if bar.provider_id == preferred_provider_id and bar.role == ROLE_CANDIDATE:
+            return Resolution(winning_provider_id=bar.provider_id, resolution_path=RESOLUTION_UNADJUDICATED)
+    return None
+
+
 def resolve_automatic(
     bars: list[ProviderBar],
     field_group: str,
@@ -264,6 +333,13 @@ def resolve_automatic(
     resolution = _resolve_completeness(bars)
     if resolution is not None:
         return resolution
+
+    if _find_whistleblower(bars) is None:
+        # No ACCEPTED whistleblower to adjudicate between two or more valid candidates (Tier 1
+        # already ruled out the single-candidate case above) -- Tiers 2/3 would only ever compare
+        # against a known-bad or synthetic placeholder value, so skip straight to the
+        # preferredProvider fallback rather than risk a false agreement/disagreement against it.
+        return _resolve_unadjudicated(bars, preferred_provider_id)
 
     resolution = _resolve_agreement(bars, field_group, tolerances, k, preferred_provider_id)
     if resolution is not None:

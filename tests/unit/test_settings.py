@@ -330,6 +330,64 @@ def test_load_raises_when_yfinance_settings_is_not_an_object(tmp_path):
         Settings.load(path=settings_path)
 
 
+def test_load_defaults_massive_settings_to_none(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.massive is None
+
+
+def test_load_parses_massive_api_key(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"massive": {"apiKey": "abc123"}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.massive.api_key == "abc123"
+
+
+def test_load_raises_when_massive_settings_is_not_an_object(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"massive": "not-an-object"})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_raises_when_massive_api_key_missing(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"massive": {}})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_defaults_massive_rate_limit_when_massive_block_present_but_rate_limit_omitted(tmp_path):
+    # Like IBKR (and unlike yfinance), "unspecified" for Massive does not mean unlimited -- it has
+    # a documented real ceiling that always applies once settings.massive is configured at all.
+    settings_path = _write_settings(tmp_path / "settings.json", {"massive": {"apiKey": "abc123"}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.massive.rate_limit is not None
+    assert settings.massive.rate_limit.requests_per_window == 5
+    assert settings.massive.rate_limit.window_seconds == 60
+
+
+def test_load_parses_massive_rate_limit_override(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"massive": {"apiKey": "abc123", "rateLimit": {"requestsPerWindow": 10, "windowSeconds": 120}}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.massive.rate_limit.requests_per_window == 10
+    assert settings.massive.rate_limit.window_seconds == 120
+
+
+def test_load_raises_when_massive_rate_limit_is_missing_a_key(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"massive": {"apiKey": "abc123", "rateLimit": {"requestsPerWindow": 10}}})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
 def test_load_defaults_reconcile_settings(tmp_path):
     settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
 

@@ -8,6 +8,7 @@ from reconcile.algorithm import (
     RESOLUTION_BOUNDARY_FIX,
     RESOLUTION_COMPLETENESS,
     RESOLUTION_FINALIZED,
+    RESOLUTION_UNADJUDICATED,
     ROLE_CANDIDATE,
     ROLE_WHISTLEBLOWER,
     DisagreementStats,
@@ -22,10 +23,23 @@ from reconcile.algorithm import (
 
 IBKR = 1
 YFINANCE = 2
+MASSIVE = 3
 
 
 def _uniform_tolerance(stddev: float) -> dict[str, FieldTolerance]:
     return {"open": FieldTolerance(stddev), "high": FieldTolerance(stddev), "low": FieldTolerance(stddev), "close": FieldTolerance(stddev)}
+
+
+def _tolerance_with_close_floor(stddev: float, floor_value: float) -> dict[str, FieldTolerance]:
+    return {
+        "open": FieldTolerance(stddev),
+        "high": FieldTolerance(stddev),
+        "low": FieldTolerance(stddev),
+        "close": FieldTolerance(stddev, floor_value=floor_value, floor_type="absolute"),
+    }
+
+
+_PROVIDER_NAMES = {IBKR: "ibkr", YFINANCE: "yfinance", MASSIVE: "massive"}
 
 
 def _bar(
@@ -40,7 +54,7 @@ def _bar(
 ) -> ProviderBar:
     return ProviderBar(
         provider_id=provider_id,
-        provider_name="ibkr" if provider_id == IBKR else "yfinance",
+        provider_name=_PROVIDER_NAMES.get(provider_id, "other"),
         role=role,
         open=open_,
         high=high,
@@ -76,6 +90,119 @@ def test_completeness_does_not_resolve_when_candidate_incomplete():
     resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: _uniform_tolerance(0.001)}, k=3.0, preferred_provider_id=None)
 
     assert resolution is None
+
+
+def test_unadjudicated_resolves_via_preferred_provider_when_whistleblower_rejected_with_two_candidates():
+    # Regression test 1 (croicu/quant-data#44): two ACCEPTED candidates, whistleblower present but
+    # REJECTED with a value suspiciously close to MASSIVE's -- must not be used as a reference at
+    # all (Tier 2 would otherwise let MASSIVE "win" by coincidental proximity to a value already
+    # known to be wrong). Resolves to preferredProvider (IBKR here) instead, tagged
+    # RESOLUTION_UNADJUDICATED, not RESOLUTION_AGREEMENT.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.02, high=101.02, low=99.02, close=100.52),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.02, high=101.02, low=99.02, close=100.52, data_quality="rejected"),
+    ]
+
+    resolution = resolve_automatic(
+        bars,
+        FIELD_GROUP_OHLC,
+        windows={},
+        tolerances={IBKR: _uniform_tolerance(0.01), MASSIVE: _uniform_tolerance(0.01)},
+        k=3.0,
+        preferred_provider_id=IBKR,
+    )
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == IBKR
+    assert resolution.resolution_path == RESOLUTION_UNADJUDICATED
+
+
+def test_unadjudicated_resolves_when_whistleblower_confirmed_absent_with_two_candidates():
+    # Two candidates agree with each other, but no whistleblower bar exists at all (mirrors
+    # reconcile/cli.py's confirmed-absent synthetic placeholder, which is INCOMPLETE rather than
+    # simply missing from `bars` -- both shapes must resolve the same way). Under the old
+    # single-candidate assumption this would have gotten stuck (Tier 2 would compare against an
+    # all-zero placeholder); now it resolves automatically via preferredProvider.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={}, k=3.0, preferred_provider_id=MASSIVE)
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == MASSIVE
+    assert resolution.resolution_path == RESOLUTION_UNADJUDICATED
+
+
+def test_unadjudicated_resolves_when_whistleblower_incomplete_with_two_candidates():
+    # Same as above, but the whistleblower row is present with data_quality=incomplete (the actual
+    # shape of reconcile/cli.py's _synthetic_absent_whistleblower_bar), not simply absent from
+    # `bars` -- must resolve identically.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=0.0, high=0.0, low=0.0, close=0.0, data_quality="incomplete"),
+    ]
+
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={}, k=3.0, preferred_provider_id=MASSIVE)
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == MASSIVE
+    assert resolution.resolution_path == RESOLUTION_UNADJUDICATED
+
+
+def test_unadjudicated_returns_none_when_preferred_provider_did_not_report():
+    # Two candidates present, no valid whistleblower, but neither candidate is preferredProvider --
+    # must stay stuck (Tier 4), not silently pick one of the two present candidates.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={}, k=3.0, preferred_provider_id=999)
+
+    assert resolution is None
+
+
+def test_single_candidate_with_rejected_whistleblower_still_resolves_via_completeness():
+    # Regression test 4 (croicu/quant-data#44): with exactly one candidate, Tier 1 completeness
+    # must still catch an invalid whistleblower before the new unadjudicated path is ever reached
+    # -- the "composes with Tier 1 for free" claim, checked directly rather than assumed.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=200.0, high=201.0, low=199.0, close=200.5, data_quality="rejected"),
+    ]
+
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={IBKR: _uniform_tolerance(0.001)}, k=3.0, preferred_provider_id=IBKR)
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == IBKR
+    assert resolution.resolution_path == RESOLUTION_COMPLETENESS
+
+
+def test_agreement_still_wins_over_unadjudicated_when_whistleblower_is_accepted():
+    # Sanity check that a valid (ACCEPTED) whistleblower among two real candidates still goes
+    # through the normal Tier 2 comparison, not the new no-adjudicator fallback.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=110.0, high=111.0, low=109.0, close=110.5),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.01, high=101.01, low=99.01, close=100.51),
+    ]
+
+    resolution = resolve_automatic(
+        bars,
+        FIELD_GROUP_OHLC,
+        windows={},
+        tolerances={IBKR: _uniform_tolerance(0.01), MASSIVE: _uniform_tolerance(0.01)},
+        k=3.0,
+        preferred_provider_id=MASSIVE,
+    )
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == IBKR
+    assert resolution.resolution_path == RESOLUTION_AGREEMENT
 
 
 def test_agreement_promotes_candidate_within_tolerance():
@@ -290,6 +417,83 @@ def test_agreement_tie_breaks_via_preferred_provider():
 
     assert resolution is not None
     assert resolution.winning_provider_id == other_candidate_id
+
+
+def test_agreement_falls_through_when_agreeing_candidates_disagree_materially():
+    # Both ibkr and massive individually agree with the whistleblower (well within their own
+    # stddev-based tolerance), but ibkr (the preferred winner) and massive disagree with EACH
+    # OTHER by more than ibkr's own materiality floor for close -- must not silently pick ibkr via
+    # the tiebreak; falls through to Tier 3/4 instead (croicu/quant-data#50).
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.50),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.65),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.55),
+    ]
+
+    resolution = resolve_automatic(
+        bars,
+        FIELD_GROUP_OHLC,
+        windows={},
+        tolerances={
+            IBKR: _tolerance_with_close_floor(stddev=0.01, floor_value=0.05),
+            MASSIVE: _uniform_tolerance(0.01),
+        },
+        k=3.0,
+        preferred_provider_id=IBKR,
+    )
+
+    assert resolution is None
+
+
+def test_agreement_tie_breaks_normally_when_disagreement_is_within_materiality_floor():
+    # Same shape as above, but ibkr and massive's own disagreement (0.03) stays inside ibkr's
+    # materiality floor (0.05) -- not economically meaningful, so the ordinary preferredProvider
+    # tiebreak still applies.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.50),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.53),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.52),
+    ]
+
+    resolution = resolve_automatic(
+        bars,
+        FIELD_GROUP_OHLC,
+        windows={},
+        tolerances={
+            IBKR: _tolerance_with_close_floor(stddev=0.01, floor_value=0.05),
+            MASSIVE: _uniform_tolerance(0.01),
+        },
+        k=3.0,
+        preferred_provider_id=IBKR,
+    )
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == IBKR
+    assert resolution.resolution_path == RESOLUTION_AGREEMENT
+
+
+def test_agreement_ignores_material_disagreement_check_when_floor_unconfigured():
+    # Same large divergence (0.15) as the "falls through" test above, but ibkr has no materiality
+    # floor configured (the existing 0.0 default) -- the new check must not engage at all,
+    # preserving today's tiebreak behavior exactly wherever no floor was ever seeded.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.50),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.65),
+        _bar(YFINANCE, ROLE_WHISTLEBLOWER, open_=100.0, high=101.0, low=99.0, close=100.55),
+    ]
+
+    resolution = resolve_automatic(
+        bars,
+        FIELD_GROUP_OHLC,
+        windows={},
+        tolerances={IBKR: _uniform_tolerance(0.01), MASSIVE: _uniform_tolerance(0.01)},
+        k=3.0,
+        preferred_provider_id=IBKR,
+    )
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == IBKR
+    assert resolution.resolution_path == RESOLUTION_AGREEMENT
 
 
 def test_resolve_finalize_promotes_preferred_provider():

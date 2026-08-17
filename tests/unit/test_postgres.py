@@ -457,8 +457,7 @@ def test_fetch_staging_rows_for_reconciliation_scopes_by_provider_names(mock_psy
     mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
     call_args = mock_cursor.execute.call_args
     assert call_args.args[1]["names"] == ["yfinance", "ibkr"]
-    assert call_args.args[1]["required_names"] == ["ibkr"]
-    assert call_args.args[1]["required_count"] == 1
+    assert call_args.args[1]["candidate_names"] == ["ibkr"]
 
 
 @patch("quant_data._internal.shared.postgres.psycopg")
@@ -830,5 +829,106 @@ def test_clear_pending_manual_resolution_rolls_back_on_error(mock_psycopg):
 
     with pytest.raises(AppError):
         database.clear_pending_manual_resolution(1, 10, 20, 1)
+
+    mock_connection.rollback.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_record_ingestion_coverage_inserts_new_range_when_nothing_touches(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [(1,), (2,), (10,)])  # ticker_id, provider_id, date_id
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.fetchall.return_value = []  # no existing range touches date_id=10
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.record_ingestion_coverage("massive", "spy", date(2026, 7, 23))
+
+    insert_call = mock_cursor.execute.call_args_list[-1]
+    assert "INSERT INTO ingestion_coverage" in insert_call.args[0]
+    assert insert_call.args[1] == (1, 2, 10, 10)
+    mock_connection.commit.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_record_ingestion_coverage_extends_one_adjacent_range(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [(1,), (2,), (15,)])  # ticker_id, provider_id, date_id
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.fetchall.return_value = [(99, 10, 14)]  # coverage_id=99, existing range [10, 14]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.record_ingestion_coverage("massive", "spy", date(2026, 7, 28))
+
+    update_call = mock_cursor.execute.call_args_list[-1]
+    assert "UPDATE ingestion_coverage" in update_call.args[0]
+    assert update_call.args[1] == (10, 15, 99)  # extended end_date_id from 14 to 15
+    mock_connection.commit.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_record_ingestion_coverage_is_a_no_op_when_date_already_covered(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [(1,), (2,), (12,)])  # date_id=12, already inside [10, 14]
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.fetchall.return_value = [(99, 10, 14)]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.record_ingestion_coverage("massive", "spy", date(2026, 7, 25))
+
+    # Only the three lookup SELECTs and the touching-ranges SELECT -- no INSERT/UPDATE/DELETE.
+    for call in mock_cursor.execute.call_args_list:
+        sql = call.args[0]
+        assert "INSERT" not in sql
+        assert "UPDATE" not in sql
+        assert "DELETE" not in sql
+    mock_connection.commit.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_record_ingestion_coverage_merges_two_bridged_ranges(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [(1,), (2,), (15,)])  # date_id=15 bridges the two ranges
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.fetchall.return_value = [(97, 10, 14), (98, 16, 20)]
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    database.record_ingestion_coverage("massive", "spy", date(2026, 7, 28))
+
+    calls = mock_cursor.execute.call_args_list
+    delete_calls = []
+    update_calls = []
+    for call in calls:
+        sql = call.args[0]
+        if "DELETE FROM ingestion_coverage" in sql:
+            delete_calls.append(call)
+        elif "UPDATE ingestion_coverage" in sql:
+            update_calls.append(call)
+    assert len(delete_calls) == 1
+    assert delete_calls[0].args[1] == (98,)
+    assert len(update_calls) == 1
+    assert update_calls[0].args[1] == (10, 20, 97)  # merged range spans both, keeps the first coverage_id
+    mock_connection.commit.assert_called_once()
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_record_ingestion_coverage_raises_on_unknown_ticker(mock_psycopg):
+    _connect(mock_psycopg, [None])  # dim_ticker lookup returns nothing
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    with pytest.raises(AppError):
+        database.record_ingestion_coverage("massive", "not-a-real-ticker", date(2026, 7, 23))
+
+
+@patch("quant_data._internal.shared.postgres.psycopg")
+def test_record_ingestion_coverage_rolls_back_on_error(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+    mock_psycopg.Error = Exception
+    mock_connection.cursor.return_value.__enter__.return_value.execute.side_effect = mock_psycopg.Error("boom")
+
+    database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
+
+    with pytest.raises(AppError):
+        database.record_ingestion_coverage("massive", "spy", date(2026, 7, 23))
 
     mock_connection.rollback.assert_called_once()

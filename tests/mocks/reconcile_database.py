@@ -93,7 +93,7 @@ class FakeReconcileDatabase:
             result.add((ticker_id, date_id, time_id))
         return result
 
-    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str], required_provider_names: list[str]) -> list[StagingRow]:
+    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str], candidate_provider_names: list[str]) -> list[StagingRow]:
         provider_name_by_id: dict[int, str] = {}
         for provider in self.providers:
             provider_name_by_id[provider.provider_id] = provider.name
@@ -111,17 +111,18 @@ class FakeReconcileDatabase:
                 rows_by_bar[bar_key] = []
             rows_by_bar[bar_key].append(row)
 
+        # At least one candidate present -- not every candidate (croicu/quant-data#49). A bar with
+        # zero candidate rows at all is excluded (nothing could ever resolve it); reconcile.cli's
+        # own coverage-confirmation filter decides whether a *specific* missing candidate leaves
+        # the bar untouched or lets it proceed with whoever did report.
         result: list[StagingRow] = []
         for rows in rows_by_bar.values():
-            reporting_names: set[str] = set()
+            has_any_candidate = False
             for row in rows:
-                reporting_names.add(provider_name_by_id[row.provider_id])
-            has_all_required = True
-            for required_name in required_provider_names:
-                if required_name not in reporting_names:
-                    has_all_required = False
+                if provider_name_by_id[row.provider_id] in candidate_provider_names:
+                    has_any_candidate = True
                     break
-            if has_all_required:
+            if has_any_candidate:
                 result.extend(rows)
         return result
 

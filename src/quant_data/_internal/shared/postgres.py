@@ -415,6 +415,94 @@ class PostgresDatabase:
         self._logger.perf(f"write_staging_bars({normalized_provider_name}, {written} bars)", time.perf_counter() - started)
         return written
 
+    def record_ingestion_coverage(self, provider_name: str, ticker: str, target_date: date) -> None:
+        """Marks (ticker, provider, target_date) as successfully ingested, coalescing into
+        ingestion_coverage's existing contiguous-range rows rather than adding one row per day
+        (croicu/quant-data#31 -- the write path that was missing until now; the table previously
+        only ever reflected whatever staging held at migration 008's one-time backfill moment, and
+        went stale the instant real ingestion resumed). Callers should only invoke this after both
+        the fetch and the write for this (ticker, provider, date) already succeeded -- a provider's
+        fetch completing without raising, regardless of resulting bar count (including zero), is
+        what "covered" means here, matching ingestion_coverage's own existing definition."""
+        normalized_ticker = ticker.upper()
+        normalized_provider_name = provider_name.lower()
+        started = time.perf_counter()
+
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT ticker_id FROM dim_ticker WHERE ticker = %s", (normalized_ticker,))
+                ticker_row = cursor.fetchone()
+                if ticker_row is None:
+                    raise AppError(f"No dim_ticker row for '{normalized_ticker}'.")
+                ticker_id = ticker_row[0]
+
+                cursor.execute("SELECT provider_id FROM dim_provider WHERE name = %s", (normalized_provider_name,))
+                provider_row = cursor.fetchone()
+                if provider_row is None:
+                    raise AppError(f"No dim_provider row for '{normalized_provider_name}'.")
+                provider_id = provider_row[0]
+
+                cursor.execute("SELECT date_id FROM dim_date WHERE date = %s", (target_date,))
+                date_row = cursor.fetchone()
+                if date_row is None:
+                    raise DateOutOfRangeError(f"No dim_date row for {target_date.isoformat()} -- outside the populated date range.")
+                date_id = date_row[0]
+
+                # Every existing range that already contains date_id, or is immediately adjacent to
+                # it (dim_date.date_id increments by exactly 1 per calendar day, including weekends
+                # -- migrations/008's own "gaps and islands" comment) -- 0, 1, or 2 rows in the
+                # normal case (2 only when date_id exactly bridges two previously-separate ranges).
+                cursor.execute(
+                    """
+                    SELECT coverage_id, start_date_id, end_date_id
+                    FROM ingestion_coverage
+                    WHERE ticker_id = %s AND provider_id = %s
+                      AND start_date_id <= %s + 1 AND end_date_id >= %s - 1
+                    ORDER BY start_date_id
+                    """,
+                    (ticker_id, provider_id, date_id, date_id),
+                )
+                touching_rows = cursor.fetchall()
+
+                already_covered = False
+                for _coverage_id, start_date_id, end_date_id in touching_rows:
+                    if start_date_id <= date_id <= end_date_id:
+                        already_covered = True
+                        break
+
+                if already_covered:
+                    pass
+                elif len(touching_rows) == 0:
+                    cursor.execute(
+                        "INSERT INTO ingestion_coverage (ticker_id, provider_id, start_date_id, end_date_id) VALUES (%s, %s, %s, %s)",
+                        (ticker_id, provider_id, date_id, date_id),
+                    )
+                else:
+                    all_starts: list[int] = [date_id]
+                    all_ends: list[int] = [date_id]
+                    for _coverage_id, start_date_id, end_date_id in touching_rows:
+                        all_starts.append(start_date_id)
+                        all_ends.append(end_date_id)
+                    new_start = min(all_starts)
+                    new_end = max(all_ends)
+
+                    keep_coverage_id = touching_rows[0][0]
+                    for row in touching_rows[1:]:
+                        cursor.execute("DELETE FROM ingestion_coverage WHERE coverage_id = %s", (row[0],))
+                    cursor.execute(
+                        "UPDATE ingestion_coverage SET start_date_id = %s, end_date_id = %s, updated_at = CURRENT_TIMESTAMP WHERE coverage_id = %s",
+                        (new_start, new_end, keep_coverage_id),
+                    )
+            self._connection.commit()
+        except AppError:
+            self._connection.rollback()
+            raise
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to record ingestion coverage: {error}") from error
+
+        self._logger.perf(f"record_ingestion_coverage({normalized_ticker}, {normalized_provider_name})", time.perf_counter() - started)
+
     def fetch_dataset_inception_date(self) -> date:
         """The date the dataset is meant to start from -- --backfill's target. Raises rather than
         returning None when the table is empty (croicu/quant-data#28's schema-only slice
@@ -662,17 +750,23 @@ class PostgresDatabase:
             result.append(IngestionCoverageRow(ticker_id=ticker_id, provider_id=provider_id, start_date_id=start_date_id, end_date_id=end_date_id))
         return result
 
-    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str], required_provider_names: list[str]) -> list[StagingRow]:
-        """Every staging_market_data_1min row belonging to a bar where every name in
-        required_provider_names has a row -- eligibility requires only the candidate providers
-        (croicu/quant-data#31: the whistleblower's absence no longer blocks a bar from being
-        fetched at all -- reconcile.cli decides, using ingestion_coverage, whether a missing
-        whistleblower row means "confirmed absent" or "not ingested yet"). expected_provider_names
-        (still the full configured set) controls which providers' rows come back for an eligible
-        bar -- the whistleblower's row is included when it happens to exist. Also excludes any bar
-        with a fact_pending_manual_resolution row, i.e. one that's already exhausted the automatic
-        pass and been handed off to --finalize (tasks/quant_reconcile.md's "Updated (2026-08-03)"
-        section)."""
+    def fetch_staging_rows_for_reconciliation(self, expected_provider_names: list[str], candidate_provider_names: list[str]) -> list[StagingRow]:
+        """Every staging_market_data_1min row belonging to a bar where *at least one* name in
+        candidate_provider_names has a row -- eligibility no longer requires every candidate
+        present (croicu/quant-data#49: with two or more real candidates, e.g. ibkr + massive, a
+        genuine per-minute coverage difference between them -- one candidate simply never reported
+        that exact minute -- must not make the bar invisible to Tier 1-4 entirely; reconcile.cli
+        decides, using ingestion_coverage, whether each individually-missing required provider
+        (whistleblower or candidate) means "confirmed absent" or "not ingested yet", removing the
+        bar_key only in the latter case. This mirrors croicu/quant-data#31's whistleblower-absence
+        mechanism, generalized to candidates too -- previously the whistleblower's absence alone
+        didn't block fetch, but a missing candidate still did, unconditionally). Requiring *every*
+        candidate was only ever correct by coincidence when exactly one candidate existed.
+        expected_provider_names (still the full configured set) controls which providers' rows come
+        back for an eligible bar -- any provider's row is included when it happens to exist. Also
+        excludes any bar with a fact_pending_manual_resolution row, i.e. one that's already
+        exhausted the automatic pass and been handed off to --finalize (tasks/quant_reconcile.md's
+        "Updated (2026-08-03)" section)."""
         started = time.perf_counter()
         try:
             with self._connection.cursor() as cursor:
@@ -687,9 +781,8 @@ class PostgresDatabase:
                           SELECT s2.ticker_id, s2.date_id, s2.time_id
                           FROM staging_market_data_1min s2
                           JOIN dim_provider p2 ON p2.provider_id = s2.provider_id
-                          WHERE p2.name = ANY(%(required_names)s)
+                          WHERE p2.name = ANY(%(candidate_names)s)
                           GROUP BY s2.ticker_id, s2.date_id, s2.time_id
-                          HAVING COUNT(DISTINCT s2.provider_id) = %(required_count)s
                       )
                       AND NOT EXISTS (
                           SELECT 1 FROM fact_pending_manual_resolution fpmr
@@ -698,8 +791,7 @@ class PostgresDatabase:
                     """,
                     {
                         "names": expected_provider_names,
-                        "required_names": required_provider_names,
-                        "required_count": len(required_provider_names),
+                        "candidate_names": candidate_provider_names,
                     },
                 )
                 rows = cursor.fetchall()

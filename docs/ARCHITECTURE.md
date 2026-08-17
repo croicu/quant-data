@@ -104,8 +104,9 @@ independent top-level packages.
   entry per (bar, field group, provider) rather than a single `OHLCV`, letting a caller see the
   actual disagreement instead of just that a bar is stuck. `role` (sourced from
   `dim_provider.role`) is what actually lets a caller identify the reference value among possibly
-  several candidates — today's data is exactly one whistleblower (`yfinance`) plus one candidate
-  (`ibkr`), but `dim_provider` isn't hardcoded to two rows, so don't assume exactly one candidate.
+  several candidates — one whistleblower (`yfinance`) plus two real candidates (`ibkr`, `massive`
+  as of croicu/quant-data#44) as of this writing, but `dim_provider` isn't hardcoded to any
+  particular candidate count, so don't assume exactly one or two.
   Re-exported at the `quant_data` top level.
 - `RejectedWhistleblowerBar`: `provider` (`str`), `bar` (`OHLCV`) — a whistleblower-reported
   staging value with `data_quality=REJECTED`. Deliberately separate from `PendingResolutionBar`:
@@ -188,7 +189,10 @@ independent top-level packages.
   sizes `quant-ingest --catch-up`'s trailing re-fetch window. `Settings.providers` (`providers`,
   default `["yfinance"]`, lowercased) is the global list `quant-ingest` runs each invocation;
   `Settings.ibkr` (`IbkrSettings`: `host`/`port`/`client_id`, parsed from `ibkr`) only matters
-  when `"ibkr"` is configured. `Settings.reconcile` (`ReconcileSettings`: `preferred_provider`
+  when `"ibkr"` is configured, and `Settings.massive` (`MassiveSettings`: `api_key`/`rate_limit`,
+  parsed from `massive`, `None` by default — no usable local default for a credential) only
+  matters when `"massive"` is configured; `api_key` is required if the `massive` object is present
+  at all. `Settings.reconcile` (`ReconcileSettings`: `preferred_provider`
   default `"ibkr"`, `k` default `3.0`, parsed from a `reconcile` object —
   `preferredProvider`/`k`) configures `quant-reconcile`'s tie-break/fallback provider and its
   tolerance multiplier; `k` must be positive.
@@ -306,6 +310,24 @@ independent top-level packages.
   and `settings.ibkr` control this. Reconciliation itself (staging -> `fact_market_data_1min`) is
   built as of `quant-reconcile` (see `tasks/quant-reconcile.md`) — see the `reconcile` section
   below.
+- `providers/massive.py` — `MassiveIntraDay`, an `IntraDayProvider` implementation wrapping
+  Massive's (formerly Polygon.io) REST API directly via `requests` — no SDK — adapted from
+  `quant-scratch`'s own confirmed-working prototype (`croicu/quant-scratch#24`,
+  `shared/providers/massive.py`). Stateless per-call HTTP like `YahooFinanceIntraDay` —
+  `connect()`/`close()` are no-ops, unlike `IBKRIntraDay`'s persistent Gateway connection. Like
+  IBKR, only returns bars it actually has trade data for (no synthetic/NaN placeholder rows), so
+  every fetched bar is `DataQuality.ACCEPTED`. Free Basic tier documents a 5 calls/minute rate
+  limit; `settings.massive.rateLimit` (defaulting to `5`/`60`, always applied like IBKR's own
+  default) paces calls pre-emptively via the same `RateLimiter` mechanism as `ingest`'s other
+  providers, and `MassiveIntraDay` itself also retries on HTTP 429 (3 attempts, 15s apart) as a
+  fallback, since live testing found the documented limit isn't strictly enforced in practice.
+  The second real `candidate` provider added to `dim_provider` (`016_add_massive_provider`,
+  croicu/quant-data#44) — see the `reconcile` section below for what having two real candidates
+  changes about reconciliation. **Wired into `ingest`** the same way as `ibkr` — add `"massive"`
+  to `settings.providers` (requires `settings.massive.apiKey` to also be configured) to have
+  `quant-ingest` run it alongside the others. Tested via `tests/unit/test_massive_provider.py`
+  (offline, `request_fn`/`sleep_fn` injected per rule 7 — no live integration test, unlike
+  `ibkr`'s, since there's no local gateway process to probe).
 
 ### `ingest`
 
@@ -354,16 +376,39 @@ this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests
   provider failed it. `_ingest_one` logs the fetch step and the write step separately, and fetch
   failures are tagged by provider (`_FETCH_FAILURE_CATEGORY`: `yfinance` ->
   `quant_data._internal.shared.providers.yfinance.CATEGORY_YFINANCE`, `ibkr` ->
-  `quant_data._internal.shared.providers.ibkr.CATEGORY_IBKR`) so a Yahoo vs. IBKR fetch problem
-  stays filterable apart from a Postgres write problem — both still count the same toward the exit
-  code today (see `tasks/ingest_error_classification.md` for the postponed work on making that
-  distinction affect the exit code itself).
+  `quant_data._internal.shared.providers.ibkr.CATEGORY_IBKR`, `massive` ->
+  `quant_data._internal.shared.providers.massive.CATEGORY_MASSIVE`) so a fetch problem stays
+  filterable by which provider it came from, apart from a Postgres write problem — all still count
+  the same toward the exit code today (see `tasks/ingest_error_classification.md` for the postponed
+  work on making that distinction affect the exit code itself).
+- **`ingestion_coverage` write path** (croicu/quant-data#31, shipped 2026-08-16) — right after a
+  provider's fetch *and* write both succeed for a `(ticker, date)`, `_ingest_one` calls
+  `database.record_ingestion_coverage(provider_name, ticker, target_date)`. Before this, the table
+  was only ever populated by `008`'s one-time migration backfill and went stale the moment real
+  ingestion resumed — concretely surfaced twice in one session live-testing `massive` (issue #44):
+  `SPY` then `QQQ` each needed a hand-written `INSERT` before `quant-reconcile`'s
+  candidate-confirmed-absence path (issue #49) could do anything, since it depends entirely on
+  `ingestion_coverage` actually reflecting reality. `PostgresDatabase.record_ingestion_coverage`
+  resolves `(ticker_id, provider_id, date_id)`, finds every existing range that already contains or
+  is immediately adjacent to `date_id` (0, 1, or 2 rows — 2 only when the new date exactly bridges
+  two previously-separate ranges), and either no-ops (already covered), extends the one touching
+  range, or merges two touching ranges into one — never leaves one row per day. Recording coverage
+  failing on its own (a separate round trip from the staging write) is logged and skipped, not
+  fatal to that `(ticker, date)` pair — matching this file's existing per-step fetch/write failure
+  tolerance. Live-verified against CroicuWS1: ingesting one more day for an already-covered
+  `(SPY, massive)` range extended the existing row in place (`2026-07-23`-`2026-08-05` →
+  `2026-07-23`-`2026-08-06`) rather than creating a second one.
 - `settings.providers` (`list[str]`, lowercased, default `["yfinance"]`) is a flat global list —
   the same providers run for every ticker in a given invocation; there's no per-ticker provider
   override (see `tasks/ibkr-provider-reconciliation.md`'s now-resolved "currently configured
-  providers" question). `_build_provider` raises `AppError` for any name that isn't `"yfinance"` or
-  `"ibkr"`. `settings.ibkr` (`IbkrSettings`: `host`/`port`/`client_id`, all defaulting to
-  `IBKRIntraDay`'s own module-level defaults) is only consulted when `"ibkr"` is configured.
+  providers" question, and croicu/quant-data#44's explicit decision not to add a `--providers` CLI
+  override either — scoping a provider to a subset of tickers, e.g. a pilot rollout, means a
+  separate invocation against a separate settings file, not new code). `_build_provider` raises
+  `AppError` for any name that isn't `"yfinance"`, `"ibkr"`, or `"massive"`, and also for
+  `"massive"` itself if `settings.massive` isn't configured. `settings.ibkr` (`IbkrSettings`:
+  `host`/`port`/`client_id`, all defaulting to `IBKRIntraDay`'s own module-level defaults) is only
+  consulted when `"ibkr"` is configured; `settings.massive` (`MassiveSettings`: `api_key` required,
+  `rate_limit` defaulting to `5`/`60`) is only consulted when `"massive"` is configured.
 - **`--backfill`** — a fourth, mutually-exclusive way to pick dates (croicu/quant-data#28), for
   extending existing coverage backward toward `dataset_inception.inception_date` rather than
   fetching a caller-specified range. Per invocation, for each configured ticker: fetch that
@@ -394,7 +439,13 @@ this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests
   requests / `600` seconds even when `settings.ibkr.rateLimit` is entirely absent from
   `settings.json` — deliberately under IBKR's documented `60`/`600` ceiling for margin, and
   deliberately *not* "unspecified means unlimited" like every other provider, since IBKR has a
-  known real ceiling that should always apply. `YfinanceSettings.rate_limit` defaults to `None`
+  known real ceiling that should always apply. `MassiveSettings.rate_limit` defaults to `5`
+  requests / `60` seconds the same way, whenever `settings.massive` is configured at all —
+  Massive's free Basic tier documents that ceiling. `MassiveIntraDay` also retries on HTTP 429
+  internally (3 attempts, 15s apart) as a fallback, since croicu/quant-scratch#24's live testing
+  found the documented limit isn't strictly enforced in practice — the pre-emptive `RateLimiter`
+  here is the primary defense, the provider's own retry is a backstop for the cases it doesn't
+  strictly hold. `YfinanceSettings.rate_limit` defaults to `None`
   (unlimited), matching yfinance's current unbounded behavior.
 
 ### `reconcile`
@@ -424,6 +475,47 @@ the full design (field consistency groups, the candidate/whistleblower model, th
     now per-field. `fields_for_group(field_group)` (public — `cli.py` needs it directly for the
     stats fan-out below and for the graduation batch) is the one place the group→fields mapping
     lives.
+
+    Candidate-selection flow for one not-yet-resolved `(bar, field_group)`, first branch that
+    resolves wins:
+
+    ```
+    TIER 1 -- completeness (_resolve_completeness)
+      exactly one bar with data_quality == accepted, and >=1 other bar present but invalid?
+        yes -> RESOLUTION_COMPLETENESS, done
+        no  -> continue
+
+    Whistleblower validity gate (croicu/quant-data#44 -- _find_whistleblower filters to
+    role == whistleblower AND data_quality == accepted; an outlier-REJECTED or confirmed-absent/
+    INCOMPLETE whistleblower row does not count)
+      an ACCEPTED whistleblower bar exists?
+        no  -> preferredProvider reported as a CANDIDATE for this bar? (_resolve_unadjudicated)
+                 yes -> RESOLUTION_UNADJUDICATED, done
+                 no  -> STUCK (Tier 4) -- fact_pending_manual_resolution
+        yes -> continue
+
+    TIER 2 -- agreement (_resolve_agreement)
+      >=1 candidate within its own per-field tolerance (tolerance = k * stddev * reference_value,
+      materiality-floor-bounded below) of the whistleblower's value?
+        yes -> pick preferred_provider_id among the agreeing candidates (falls back to the first
+               agreeing candidate if preferredProvider isn't one of them)
+               RESOLUTION_AGREEMENT, done
+        no  -> continue
+
+    TIER 3 -- boundary-fix (_resolve_boundary_fix)
+      windowed (t-1, t, t+1) average agrees within tolerance, for any candidate with a full
+      3-bar window on both sides?
+        yes -> RESOLUTION_BOUNDARY_FIX, done
+        no  -> STUCK (Tier 4) -- fact_pending_manual_resolution
+    ```
+
+    Two things this makes explicit: Tier 1 runs unconditionally before the whistleblower-validity
+    gate, so "only one real candidate present" is always caught there regardless of whistleblower
+    state — the gate only ever has to handle the case Tier 1 couldn't (more than one valid
+    candidate). And there is still no candidate-vs-candidate comparison anywhere in this flow —
+    every comparison in Tiers 2/3 is candidate-vs-whistleblower; when two candidates both agree
+    with the whistleblower, `preferred_provider_id` is a tiebreak, not a judgment about which
+    candidate was actually more correct.
   - `FieldTolerance(stddev, floor_value=0.0, floor_type=FLOOR_TYPE_ABSOLUTE)` — one field's Tier
     2/3 input, added by `013_add_materiality_floor` (`tasks/materiality_floor_tolerance.md`).
     `_tolerance()` computes `max(k * stddev * reference_value, floor)`, where `floor` is
@@ -517,29 +609,114 @@ the full design (field consistency groups, the candidate/whistleblower model, th
     a non-`"accepted"` bar as "reported but unusable," so this reuses that exact path with **zero
     changes to `algorithm.py`**: a confirmed-absent whistleblower behaves identically to one that
     reported and was flagged `incomplete`, including the resolution_path (`'completeness'`, not a
-    new label). The dummy values are never actually compared against — Tier 2/3 measure tolerance using
-    the *candidate's* own reference value, never the whistleblower's, and both fail closed
-    (correctly) if ever reached with placeholder zeros instead of Tier 1 catching it first. Live
+    new label) *when exactly one candidate is present* — with a single candidate, `_resolve_completeness`
+    always resolves the bar before Tiers 2/3 could ever look at the placeholder. Live
     motivating case: 6,939 of 7,192 `ibkr` rows stuck in staging on CroicuWS1 were exactly this —
     `yfinance`'s day was successfully ingested but had no row for that specific minute.
-  - **Per-ticker graduation gate** (croicu/quant-data#28) — before any Tier 1-4 attempt, a ticker
-    must have accumulated `GRADUATION_THRESHOLD_MATCHED_BARS` (`1400`) *matched* bars (every
-    configured provider reported real, non-incomplete data for that minute — same definition
-    already used for Tier 1/2 eligibility). "Graduated" is derived, not stored separately: a ticker
-    is graduated iff `provider_pair_disagreement` already has at least one row for it, since those
-    rows are created only by the one-time graduation batch or by a later Tier-2 update, never
-    before. Below the threshold, a ticker's bars sit in staging completely unevaluated (no partial
-    stats update either — nothing to protect a partial estimate from outlier contamination, since
-    nothing is computed until the full batch is in). At the threshold, `relative_diffs_for_stats_update`
-    is called unconditionally (the one deliberate exception to "only Tier 2 observations update
-    stats" — there's no tolerance yet to gate on) over every matched bar, `batch_stats` computes
-    each field's mean/stddev in one pass, and the ticker's *entire currently-fetched staging
-    backlog* (matched and unmatched together, not just the graduation batch) is evaluated through
-    the standard Tier 1-4 stack in the very same run — required so Tier 1 completeness (which only
-    ever fires on unmatched bars) isn't stranded at exactly the moment a tolerance becomes
-    available. `_run_finalize_pass` needs no equivalent logic: an ungraduated ticker's bars are
-    never Tier-1-4-attempted, so they never reach `fact_pending_manual_resolution` in the first
-    place.
+  - **Candidate-absence handling** (croicu/quant-data#49, generalizes the mechanism above to every
+    required provider, not just the whistleblower) — surfaced live-testing `massive` against real
+    data: a one-week `SPY` pilot ingest left 449 real `ibkr` bars silently unevaluated because
+    `massive` simply never reported those exact minutes (small session-edge coverage differences
+    between providers), even though `ibkr` (and often `yfinance`) had perfectly good data. Before
+    this fix, `fetch_staging_rows_for_reconciliation` hard-required *every* candidate present
+    (`HAVING COUNT(DISTINCT provider_id) = required_count`) — correct only by coincidence when
+    exactly one candidate ever existed. Now requires only **at least one** candidate present (the
+    `HAVING`/count-match dropped entirely; a `GROUP BY` behind a `WHERE p2.name = ANY(candidate_names)`
+    filter already excludes bar_keys with zero matching rows on its own). `_run_automatic_pass`'s
+    unready-bar_key filter (the mechanism above) is generalized the same way: it now loops every
+    *individually* required provider — the whistleblower and each candidate — checking
+    `ingestion_coverage` per missing one, removing the bar_key only if a missing provider's absence
+    isn't confirmed. Core assumption, stated explicitly: a provider's ingested data for a covered
+    `(ticker, date)` is immutable once acquired — a confirmed-absent minute is a real fact about
+    that provider, not an ambiguous pending state. **`algorithm.py` needed zero changes here
+    either** — none of `_resolve_completeness`/`_resolve_agreement`/`_resolve_boundary_fix`/
+    `_resolve_unadjudicated` ever assumed a fixed candidate count, so a bar_key that survives the
+    filter with (say) only `ibkr` present and not `massive` is automatically resolved using `ibkr`
+    alone, subject to the same whistleblower validation as any other bar — exactly "choose the
+    candidate with data." Deliberately out of scope for this fix: matched-bar/graduation counting
+    (`_is_matched_bar`, `GRADUATION_THRESHOLD_MATCHED_BARS`) is untouched — a bar resolved via a
+    confirmed-absent candidate doesn't count toward that candidate's own graduation batch (correct,
+    there's no comparison to measure). The properly-correct version would make matched-bar counting
+    per-(candidate, whistleblower) pair rather than requiring the full provider set, since that pair
+    is exactly what seeds each candidate's own variance — left as a deferred refinement, not part
+    of this fix.
+  - **Whistleblower-validity gate** (croicu/quant-data#44, added when `massive` became a second real
+    candidate) — `_find_whistleblower` now filters to `data_quality == "accepted"` (role match alone
+    used to be sufficient). With exactly one candidate this changed nothing observable — completeness
+    already resolved the bar first in every case Tiers 2/3 would otherwise have seen an invalid
+    whistleblower. With two or more candidates, completeness can no longer pick a winner on its own
+    (more than one valid candidate present), so the old behavior would have let Tiers 2/3 run anyway
+    — silently "fail closed" against a synthetic all-zero placeholder (harmless by luck, not by
+    design) or, worse, actually compare live candidate values against an outlier-`REJECTED`
+    whistleblower's own real, already-known-bad value (a genuine correctness bug: a candidate could
+    win or lose Tier 2 by coincidental proximity to a value `outlier_detection.py` already rejected).
+    `resolve_automatic` now checks `_find_whistleblower(bars) is None` immediately after Tier 1 and,
+    if so, calls `_resolve_unadjudicated` instead of ever attempting Tiers 2/3: promotes
+    `preferred_provider_id`'s candidate bar outright (same fallback shape as `resolve_finalize`) with
+    a dedicated `RESOLUTION_UNADJUDICATED` path — deliberately not `RESOLUTION_AGREEMENT`, so
+    `provider_pair_disagreement`'s Welford update (gated on `resolution_path ==
+    RESOLUTION_AGREEMENT` in `cli.py`) and `fact_reconciliation_participant`'s reputation trail both
+    stay unaffected, since no comparison against a reference value was ever attempted. Deliberately
+    does **not** treat "N candidates agree with each other" as its own resolvable case — candidate-
+    vs-candidate agreement is absent from this design by construction (every comparison in
+    `_resolve_agreement`/`_resolve_boundary_fix` is candidate-vs-whistleblower, never
+    candidate-vs-candidate), and two candidates agreeing isn't evidence of correctness on its own
+    (the three-cornered-hat problem doesn't dissolve just because both sides happen to be
+    candidates).
+  - **Material-disagreement check on the Tier 2 tiebreak** (croicu/quant-data#50) — the tiebreak
+    above (`_pick_preferred`, invoked when more than one candidate agrees with the whistleblower)
+    used to promote `preferredProvider` outright with no check on how far it actually diverges from
+    the *other* agreeing candidate(s). Live-tested on `SPY`: `ibkr` won that tiebreak in 3,892 of
+    3,894 dual-agreement bars, `massive` only the 2 where `ibkr` itself was the outlier — harmless
+    on that data (median divergence $0.00, p99 ~1 cent, max 6 cents), but nothing previously would
+    have caught it if the divergence had been real. `_candidates_disagree_materially` now checks,
+    for every other agreeing candidate, whether it diverges from the winner by more than the
+    *winner's own* `materiality_floor`-derived floor for that field (`_materiality_floor`, factored
+    out of `_tolerance` for reuse here) — reusing the existing per-`(provider, ticker, field)` floor
+    rather than a new stat. A floor of `0.0` (the existing "unconfigured" default) means the check
+    doesn't engage for that field, preserving prior behavior exactly wherever no floor was ever
+    seeded. If it does engage and trips, `_resolve_agreement` returns `None` for that `(bar,
+    field_group)` — the same as any other Tier 2 failure — falling through to Tier 3, and if that
+    also fails, Tier 4 (`fact_pending_manual_resolution`), for an actual person to look at instead
+    of a static preference silently deciding. Deliberately scoped to Tier 2 only, not Tier 3
+    (`_resolve_boundary_fix`, which already has its own unrelated "first agreeing candidate wins"
+    quirk, out of scope here) — Tier 3 fired only 6 times out of 9,598 resolved `SPY` bars, a small
+    fraction, so leaving it unguarded for now is a bounded, documented gap, not a blind spot on the
+    bulk of real traffic.
+  - **Eligibility gate (per ticker) and graduation gate (per candidate/ticker/field)** — before any
+    Tier 1-4 attempt, a ticker must have at least one candidate that has accumulated
+    `GRADUATION_THRESHOLD_MATCHED_BARS` (`1400`) *matched* bars (every configured provider reported
+    real, non-incomplete data for that minute — same definition already used for Tier 1/2
+    eligibility) at some point. `graduated_ticker_ids` (coarse, "has this ticker ever graduated for
+    *any* candidate") gates `eligible_bars` — once true, it stays true permanently, so a ticker's
+    Tier 1-4 evaluation is never re-gated by a later candidate's own graduation timeline. A separate,
+    finer-grained `graduated_keys: set[(provider_id, ticker_id, field_id)]` (croicu/quant-data#44,
+    deliberately the same key shape as `stats_by_key`/`provider_pair_disagreement` itself) drives
+    the graduation *batch* computation: `_missing_graduation_keys` finds which
+    `(candidate, ticker, field)` combinations a ticker still lacks stats for, and the batch only
+    runs (and only accumulates diffs) for those specific missing keys. This replaced an earlier,
+    buggy per-ticker-only projection — `if ticker_id in graduated_ticker_ids: continue` gated the
+    *entire* batch-computation block, so once any one candidate graduated on a ticker (`ibkr` on
+    `SPY`, historically the only candidate that ever existed), the block would never run again for
+    that ticker, for *any* candidate — a second candidate (`massive`) joining later would have
+    `tolerances.get(candidate.provider_id)` stay `None` forever, locking it out of Tier 2/3
+    permanently rather than "until it catches up." The batch body itself is also scoped to
+    `missing_keys`, not just the gating check: without that, a candidate already graduated (`ibkr`)
+    would have its mature, Welford-accumulated stats silently recomputed and overwritten by a
+    smaller one-shot batch from whatever's currently in staging, just because it's present in the
+    same matched bars a newly-graduating candidate's batch scans. Below threshold, a ticker's bars
+    sit in staging completely unevaluated (no partial stats update either — nothing to protect a
+    partial estimate from outlier contamination, since nothing is computed until the full batch is
+    in). At the threshold, `relative_diffs_for_stats_update` is called unconditionally (the one
+    deliberate exception to "only Tier 2 observations update stats" — there's no tolerance yet to
+    gate on) over every matched bar for the still-missing keys, `batch_stats` computes each missing
+    field's mean/stddev in one pass, and — the first time a ticker graduates at all — its *entire
+    currently-fetched staging backlog* (matched and unmatched together, not just the graduation
+    batch) is evaluated through the standard Tier 1-4 stack in the very same run, required so Tier 1
+    completeness (which only ever fires on unmatched bars) isn't stranded at exactly the moment a
+    tolerance becomes available. `_run_finalize_pass` needs no equivalent logic: an ineligible
+    ticker's bars are never Tier-1-4-attempted, so they never reach `fact_pending_manual_resolution`
+    in the first place.
   - **`_run_finalize_pass`** (`--finalize`) — fetches only staging rows for bars that already have
     a `fact_pending_manual_resolution` row, and only the specific `(bar, field_group)` keys that
     are actually pending (`fetch_pending_manual_resolution_keys`). Calls `resolve_finalize`
@@ -595,8 +772,9 @@ the full design (field consistency groups, the candidate/whistleblower model, th
   Accepted tradeoff: unbounded storage growth for a provider whose individual bars are never
   promoted. Once a bar's candidate rows are gone, its orphaned whistleblower row becomes
   permanently inert for reconcile's purposes — `fetch_staging_rows_for_reconciliation`'s
-  every-configured-provider-reported check can never be satisfied again for that bar_key, so it
-  never resurfaces, needing no compensating logic.
+  at-least-one-candidate-present check (croicu/quant-data#49; originally every-candidate-required,
+  same conclusion either way) can never be satisfied again for that bar_key once every candidate
+  row is gone, so it never resurfaces, needing no compensating logic.
 - **Archive-then-delete (croicu/quant-data#35).** `purge_staging_bar` no longer just deletes a
   candidate's staging rows — in the same transaction, it first inserts each one into
   `market_data_archive` (a permanent, append-only table), then writes that new `archive_id` back
@@ -643,9 +821,9 @@ the full design (field consistency groups, the candidate/whistleblower model, th
 ## Data flow
 
 ```
-   yfinance (whistleblower)                 ibkr (candidate)
-            |                                       |
-            +--------------------+------------------+
+   yfinance (whistleblower)     ibkr (candidate)     massive (candidate)
+            |                          |                     |
+            +--------------------------+---------------------+
                                  |
                                  v   quant-ingest (quant_writer)
                  +---------------------------------+      +--------------------------+

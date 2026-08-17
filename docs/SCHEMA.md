@@ -35,10 +35,12 @@ field_id)`; the pipeline-accuracy-hardening algorithm/CLI changes that consume t
 per-ticker graduation gate, per-field tolerance, `--backfill`) shipped as a follow-up, no further
 schema change — see those sections below and
 [croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)/#29.
-`008_add_ingestion_coverage` added `ingestion_coverage`. `quant-reconcile` now consumes it (a
+`008_add_ingestion_coverage` added `ingestion_coverage`. `quant-reconcile` consumes it (a
 candidate can promote via Tier 1 completeness when the whistleblower is confirmed absent for a
-bar, not just when it reported incomplete); `quant-ingest`'s write path (recording + coalescing
-coverage on every successful fetch) is still outstanding — see its own section below and
+bar, not just when it reported incomplete); `quant-ingest`'s own write path (recording + coalescing
+coverage on every successful fetch, `record_ingestion_coverage`) shipped 2026-08-16, closing the
+gap where this table only ever reflected `008`'s one-time backfill and went stale the instant real
+ingestion resumed — see its own section below and
 [croicu/quant-data#31](https://github.com/croicu/quant-data/issues/31).
 `009_replace_incomplete_with_data_quality` replaced `staging_market_data_1min.incomplete`/
 `fact_market_data_1min.incomplete` (boolean) with a tri-state `data_quality` column (`accepted`/
@@ -66,6 +68,19 @@ bounding `quant-reconcile`'s Tier 2/3 tolerance below by an economically meaning
 actively-ingested tickers; `015_relax_materiality_floor_psq_dog` overrode `PSQ`/`DOG` with their
 own observed-distribution P90 after live validation found `014`'s cross-ticker model under-fit
 them badly (see its own section below and `tasks/materiality_floor_tolerance.md`).
+`016_add_massive_provider` seeded `'massive'` (formerly Polygon.io) as a second `role = 'candidate'`
+`dim_provider` row alongside `'ibkr'` — the first time reconciliation has ever had two real
+candidates competing for the same bar. `017_add_unadjudicated_resolution_path` widened
+`fact_reconciliation.resolution_path`'s `CHECK` with a new value, `'unadjudicated'`: tracing exactly
+how two real candidates would be adjudicated surfaced a bug only reachable with more than one
+candidate present (an outlier-`REJECTED` or confirmed-absent whistleblower used to be caught by
+Tier 1 completeness before Tiers 2/3 ever saw it, but that assumption silently broke with a second
+candidate, since completeness can no longer pick a winner between two valid candidates on its own)
+— `resolve_automatic` now checks whether an `ACCEPTED` whistleblower exists at all before ever
+attempting Tiers 2/3, falling through to `settings.reconcile.preferredProvider`'s raw value with
+this distinct reason code (never comparing against a whistleblower value already known to be
+invalid) rather than either tier's silent no-op. See
+[croicu/quant-data#44](https://github.com/croicu/quant-data/issues/44) for the full design.
 
 ## `dim_ticker`
 
@@ -108,13 +123,15 @@ populated once, not per ticker/date.
 Data-source dimension, added in `003_add_dim_provider_and_staging`. Seeded with `'yfinance'` and
 `'ibkr'` — IBKR's real and paper accounts return identical market data, so both share the single
 `'ibkr'` row; the account used is an execution detail, not a distinct data identity. `011` added
-`'manual'` and `'databento'`, both `role = 'advisor'`. Not hardcoded to exactly these rows — more
-providers can be added later without a design change.
+`'manual'` and `'databento'`, both `role = 'advisor'`. `016_add_massive_provider` added `'massive'`
+(formerly Polygon.io), a second `role = 'candidate'` row alongside `'ibkr'`. Not hardcoded to
+exactly these rows — more providers can be added later without a design change; `dim_provider.role`
+has no cap on how many rows may hold `role = 'candidate'` at once.
 
-`role` distinguishes real candidate providers (`'ibkr'` today — data that can actually be promoted
-into `fact_market_data_1min`) from a whistleblower provider (`'yfinance'` — compared against to
-derive reconciliation's tolerance and completeness signals, never promoted except via a person's
-manual correction; see `tasks/quant-reconcile.md`) from an advisor provider (`'manual'`,
+`role` distinguishes real candidate providers (`'ibkr'`/`'massive'` — data that can actually be
+promoted into `fact_market_data_1min`) from a whistleblower provider (`'yfinance'` — compared
+against to derive reconciliation's tolerance and completeness signals, never promoted except via a
+person's manual correction; see `tasks/quant-reconcile.md`) from an advisor provider (`'manual'`,
 `'databento'` — can suggest a value but has no autonomous authoring rights; unlike `'candidate'`,
 an advisor can never win a bar through the automatic Tier 1-3 pass, only through an explicit human
 action). This is the single source of truth for that distinction — deliberately not duplicated as
@@ -180,15 +197,18 @@ Added in `008_add_ingestion_coverage` ([croicu/quant-data#31](https://github.com
 One row per *contiguous* date range successfully ingested for a (ticker, provider) pair — explicit
 tracking rather than deriving coverage from `staging_market_data_1min`'s presence/absence, since
 staging rows get purged over time (candidates once resolved; the whistleblower never, per its
-permanent purge exemption) and wouldn't stay a reliable long-term coverage signal. `quant-ingest`'s
-write path (recording a date as covered whenever a provider's fetch completes without raising —
-regardless of resulting bar count, including zero — and coalescing each new date into any existing
-adjacent/overlapping range) is still outstanding; today this table is only ever populated by
-`008`'s one-time backfill from whatever was in staging at migration-apply time. A raised
-`AppError`, including a confirmed-empty whole day (e.g. Yahoo's `history.empty` case for a
-weekend), will not mark coverage once the write path lands — distinguishing that from a genuine
-fetch failure is deliberately left to the postponed `tasks/ingest_error_classification.md`, not
-solved here.
+permanent purge exemption) and wouldn't stay a reliable long-term coverage signal.
+`PostgresDatabase.record_ingestion_coverage` (`quant-ingest`'s write path, the piece #31 originally
+shipped without) now keeps this table live: called once per `(ticker, provider, date)` right after
+both the fetch and the staging write for it succeed, marking that date covered — coalescing into
+any existing adjacent/overlapping range (extending one range, or merging two if the new date
+exactly bridges a previously-separate pair) rather than adding one row per day. A raised
+`AppError` from either the fetch or the write — including a confirmed-empty whole day (e.g.
+Yahoo's `history.empty` case for a weekend) — does *not* mark coverage; distinguishing that from a
+genuine fetch failure is deliberately left to the postponed `tasks/ingest_error_classification.md`,
+not solved here. Recording coverage failing on its own (a separate DB round trip from the staging
+write) is logged and skipped, not fatal to that `(ticker, date)` — the bars themselves are already
+safely written either way.
 
 **Motivating case, and consumed by `quant-reconcile` today**: Tier 1 (completeness) could
 previously only promote a candidate's value when the whistleblower reported but was flagged
@@ -252,16 +272,23 @@ change.
 | `time_id` | `INT NOT NULL` | FK → `dim_time` |
 | `field_group_id` | `INT NOT NULL` | FK → `dim_field_group` |
 | `winning_provider_id` | `INT NOT NULL` | FK → `dim_provider` |
-| `resolution_path` | `TEXT NOT NULL` | One of `'completeness'` / `'agreement'` / `'boundary_fix'` / `'finalized'` / `'manual_override'`, enforced by a `CHECK` constraint |
+| `resolution_path` | `TEXT NOT NULL` | One of `'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'` / `'finalized'` / `'manual_override'`, enforced by a `CHECK` constraint. `'unadjudicated'` added in `017_add_unadjudicated_resolution_path` |
 | `resolved_at` | `TIMESTAMP` | Defaults to insert time |
 
 Primary key: `(ticker_id, date_id, time_id, field_group_id)`. Added in
 `004_add_reconciliation_tables`. One row per (bar, field group) once `quant-reconcile` resolves it
 — presence of a row *is* "resolved"; a bar with no row here for one of its groups is still stuck in
 `staging_market_data_1min`. `resolution_path` distinguishes `quant-reconcile`'s automatic pass
-(`'completeness'` / `'agreement'` / `'boundary_fix'`) from `--finalize`'s `preferredProvider`
-algorithm (`'finalized'`) from an actual person directly correcting a bar (`'manual_override'` —
-the only path a whistleblower provider's value can ever reach `fact_market_data_1min` through).
+(`'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'`) from `--finalize`'s
+`preferredProvider` algorithm (`'finalized'`) from an actual person directly correcting a bar
+(`'manual_override'` — the only path a whistleblower provider's value can ever reach
+`fact_market_data_1min` through). `'unadjudicated'` (added alongside `'massive'` becoming a second
+real candidate, croicu/quant-data#44) fires automatically, mid-automatic-pass, whenever no
+`ACCEPTED` whistleblower exists to adjudicate between two or more valid candidates — resolves to
+`settings.reconcile.preferredProvider`'s raw value like `'finalized'` does, but kept as its own
+label since no tolerance comparison was ever attempted (unlike `'agreement'`/`'boundary_fix'`) and
+no human was involved (unlike `'manual_override'`); `fact_reconciliation_participant`'s non-winning
+rows for an `'unadjudicated'` resolution reflect "never compared," not "lost a comparison."
 Since `005_remove_volume_field_group`, rows here only ever exist for the `'ohlc'` group — a bar
 promotes to fact as soon as `'ohlc'` resolves, with `volume` taken directly from the winning
 provider's own staging row (see `tasks/volume_reconciliation.md`). See `tasks/quant-reconcile.md`
@@ -389,14 +416,18 @@ dimension: `DOG`'s real disagreement band is wider than `SPY`/`QQQ`/`DIA`'s (tra
 letting the noisy fields set the band for the stable ones). `stddev` is relative/fractional, scaled
 against an actual reference value at comparison time to get `quant-reconcile`'s bar-specific
 absolute tolerance (`tolerance = k * stddev * reference_value`, `k = 3`). Only in-band
-(raw-agreement) observations update this — `finalized`/`manual_override` resolutions are excluded
-so outliers can't gradually widen "normal." `007` discards the table's pre-existing pooled rows
-rather than migrating them forward — every `(provider, ticker, field)` starts at zero and earns its
-own real history; no seed value this time (contrast with `004`'s illustrative seed), since a
-ticker's first real stats computation only ever happens over a full batch of actually-observed
-matched bars (see the per-ticker graduation design in
+(raw-agreement) observations update this — `finalized`/`manual_override`/`unadjudicated`
+resolutions are excluded so outliers can't gradually widen "normal" (`'unadjudicated'` in
+particular never compared a candidate against a reference value at all, so it carries no
+information about disagreement one way or the other). `007` discards the table's pre-existing
+pooled rows rather than migrating them forward — every `(provider, ticker, field)` starts at zero
+and earns its own real history; no seed value this time (contrast with `004`'s illustrative seed),
+since a ticker's first real stats computation only ever happens over a full batch of
+actually-observed matched bars (see the per-ticker graduation design in
 [croicu/quant-data#28](https://github.com/croicu/quant-data/issues/28)), so there's no cold-start
-gap to seed in the first place.
+gap to seed in the first place. `croicu/quant-data#44` widened graduation from a per-ticker gate to
+per-`(candidate, ticker, field)`, so a second candidate (`massive`) added to an already-graduated
+ticker still reaches its own graduation batch instead of being permanently locked out.
 
 ## `data_quality_thresholds`
 
