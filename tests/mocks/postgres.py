@@ -14,6 +14,7 @@ class MockPostgresDatabase:
     ) -> None:
         self.written_bars: list[OHLCV] = []
         self.written_staging_bars: list[tuple[str, OHLCV]] = []
+        self.recorded_coverage: list[tuple[str, str, date]] = []
         self.pending_resolution_bars: list[PendingResolutionBar] = []
         self.rejected_whistleblower_bars: list[RejectedWhistleblowerBar] = []
         self.inception_date = inception_date
@@ -69,6 +70,9 @@ class MockPostgresDatabase:
             self.written_staging_bars.append((provider_name, bar))
 
         return len(bars)
+
+    def record_ingestion_coverage(self, provider_name: str, ticker: str, target_date: date) -> None:
+        self.recorded_coverage.append((provider_name.lower(), ticker.upper(), target_date))
 
     def close(self) -> None:
         self.closed = True

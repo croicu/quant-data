@@ -76,6 +76,23 @@ class YfinanceSettings:
     rate_limit: RateLimitSettings | None = None
 
 
+def _default_massive_rate_limit() -> RateLimitSettings:
+    # Massive's free Basic tier documents 5 calls/minute -- like IBKR above (and unlike yfinance),
+    # "unspecified" does not mean unlimited: this is the dataclass default even when
+    # settings.json omits massive.rateLimit entirely. croicu/quant-scratch#24's prototype found
+    # this limit isn't strictly enforced in practice, which is why MassiveIntraDay also retries on
+    # HTTP 429 rather than relying on pre-emptive limiting alone.
+    return RateLimitSettings(requests_per_window=5, window_seconds=60)
+
+
+@dataclass
+class MassiveSettings:
+    # No default -- a free-tier account credential, no usable local default, same reasoning as
+    # DatabentoSettings.api_key in quant-scratch's own settings.
+    api_key: str
+    rate_limit: RateLimitSettings | None = field(default_factory=_default_massive_rate_limit)
+
+
 @dataclass
 class ReconcileSettings:
     preferred_provider: str = DEFAULT_PREFERRED_PROVIDER
@@ -96,6 +113,7 @@ class Settings:
     providers: list[str] = field(default_factory=_default_providers)
     ibkr: IbkrSettings = field(default_factory=IbkrSettings)
     yfinance: YfinanceSettings = field(default_factory=YfinanceSettings)
+    massive: MassiveSettings | None = None
     reconcile: ReconcileSettings = field(default_factory=ReconcileSettings)
     backfill_chunk_days: int = 1
 
@@ -291,6 +309,21 @@ class Settings:
                 yfinance_rate_limit = _parse_rate_limit_payload(yfinance_rate_limit_payload, "settings.yfinance")
             yfinance_settings = YfinanceSettings(rate_limit=yfinance_rate_limit)
 
+        massive_settings: MassiveSettings | None = None
+        massive_payload = settings_payload.get("massive")
+        if massive_payload is not None:
+            if not isinstance(massive_payload, dict):
+                raise TaskError("'settings.massive' must be a JSON object.")
+            if "apiKey" not in massive_payload:
+                raise TaskError("'settings.massive' is missing required key(s): apiKey")
+            massive_rate_limit = _default_massive_rate_limit()
+            massive_rate_limit_payload = massive_payload.get("rateLimit")
+            if massive_rate_limit_payload is not None:
+                if not isinstance(massive_rate_limit_payload, dict):
+                    raise TaskError("'settings.massive.rateLimit' must be a JSON object.")
+                massive_rate_limit = _parse_rate_limit_payload(massive_rate_limit_payload, "settings.massive")
+            massive_settings = MassiveSettings(api_key=str(massive_payload["apiKey"]), rate_limit=massive_rate_limit)
+
         reconcile_settings = ReconcileSettings()
         reconcile_payload = settings_payload.get("reconcile")
         if reconcile_payload is not None:
@@ -317,6 +350,7 @@ class Settings:
             providers=providers,
             ibkr=ibkr_settings,
             yfinance=yfinance_settings,
+            massive=massive_settings,
             reconcile=reconcile_settings,
             backfill_chunk_days=backfill_chunk_days,
         )

@@ -8,7 +8,8 @@ import pytest
 
 from ingest import cli
 from quant_data._internal.shared.errors import AppError
-from quant_data._internal.shared.settings import Settings
+from quant_data._internal.shared.providers.massive import MassiveIntraDay
+from quant_data._internal.shared.settings import MassiveSettings, Settings
 from tests.mocks.postgres import MockPostgresDatabase
 from tests.mocks.yfinance import MockIntraDayProvider
 
@@ -466,6 +467,32 @@ def test_main_writes_staging_bars_tagged_with_provider_name():
         assert provider_name == "yfinance"
 
 
+def test_main_records_ingestion_coverage_on_successful_fetch_and_write():
+    database = MockPostgresDatabase()
+
+    cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": MockIntraDayProvider()},
+        database_factory=_use_database(database),
+    )
+
+    assert database.recorded_coverage == [("yfinance", "AAPL", date(2026, 1, 2))]
+
+
+def test_main_does_not_record_coverage_when_fetch_fails():
+    database = MockPostgresDatabase()
+
+    cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": _FailingProvider()},
+        database_factory=_use_database(database),
+    )
+
+    assert database.recorded_coverage == []
+
+
 def test_main_connects_and_closes_every_provider():
     database = MockPostgresDatabase()
     yfinance_provider = MockIntraDayProvider()
@@ -539,3 +566,36 @@ def test_build_provider_raises_on_unknown_provider_name():
 
     with pytest.raises(AppError):
         cli._build_provider("not-a-real-provider", settings)
+
+
+def test_build_provider_returns_massive_intraday_with_configured_api_key():
+    settings = Settings.load(path=SETTINGS_PATH)
+    settings.massive = MassiveSettings(api_key="test-key")
+
+    provider = cli._build_provider("massive", settings)
+
+    assert isinstance(provider, MassiveIntraDay)
+
+
+def test_build_provider_raises_when_massive_in_providers_without_settings_massive():
+    settings = Settings.load(path=SETTINGS_PATH)  # settings.massive is None
+
+    with pytest.raises(AppError):
+        cli._build_provider("massive", settings)
+
+
+def test_rate_limit_for_massive_returns_configured_default():
+    settings = Settings.load(path=SETTINGS_PATH)
+    settings.massive = MassiveSettings(api_key="test-key")
+
+    rate_limit = cli._rate_limit_for("massive", settings)
+
+    assert rate_limit is not None
+    assert rate_limit.requests_per_window == 5
+    assert rate_limit.window_seconds == 60
+
+
+def test_rate_limit_for_massive_returns_none_when_not_configured():
+    settings = Settings.load(path=SETTINGS_PATH)
+
+    assert cli._rate_limit_for("massive", settings) is None

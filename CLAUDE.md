@@ -505,36 +505,6 @@ under `/local/` to the box:
   CroicuWS1 with a custom logger object (not quant-data's own `Logger`), confirming every internal
   log call landed there instead.
 
-- **`quant-ingest`'s `ingestion_coverage` write path** — issue #31, opened by the repo owner.
-  `status:implementation`. The schema + one-time backfill (this issue's original scope) and
-  `quant-reconcile`'s consuming side (checking coverage before treating a missing whistleblower row
-  as "confirmed absent," synthesizing the placeholder bar) already shipped. What's still missing:
-  `quant-ingest` itself never records/coalesces coverage on a successful fetch, so the table only
-  ever reflects whatever was in staging at the one-time backfill's moment — it goes stale the
-  instant real ingestion resumes. Confirmed live 2026-08-14 testing `croicu/quant-data#35`'s archive
-  work on a restored snapshot: ~8,900 candidate bars sat stuck in staging (neither resolved nor
-  pending) purely because their dates predated the backfill; re-deriving coverage unstuck 7,950 of
-  them in the next run. **Whoever implements this must derive coverage from
-  `staging_market_data_1min UNION market_data_archive`, not staging alone** — a candidate's staging
-  row can now be archived-and-purged once resolved (`market_data_archive`, #35), so a staging-only
-  query silently understates coverage for any date that's already fully resolved and purged
-  (confirmed: 7 real `(ticker, provider, date)` combos existed only in the archive, invisible to
-  staging). See `tasks/quant_reconcile.md` and the 2026-08-14 comment on issue #31 for the full
-  finding.
-
-- **Candidate-missing bars have no resolution path at all** — found 2026-08-14, same investigation
-  as above, no issue opened yet. Unlike a missing *whistleblower* row (issue #31's exact concern),
-  `fetch_staging_rows_for_reconciliation` requires every configured *candidate* provider to have
-  reported before a bar becomes eligible for reconciliation in the first place — if a candidate
-  (`ibkr` today) simply never writes a row for a minute (e.g. a thin pre-market minute with no
-  trades), that bar_key is invisible to the whole Tier 1-4 pass, and since it's never evaluated it
-  also never reaches `fact_pending_manual_resolution` for a person to see. Concrete case: `PSQ`
-  2026-08-04 08:00 UTC — `yfinance` reported (flagged `incomplete`), `ibkr` never wrote a row at
-  all; the bar is permanently stuck with zero automatic or manual path forward. Not a data-loss
-  concern (the raw `yfinance` row is preserved forever, same as any other whistleblower row) but a
-  completeness gap — needs its own design pass (e.g. should a candidate-confirmed-absent bar at
-  least surface in the pending queue?) before it's implementable; deliberately not bundled into
-  issue #31's fix since the two need different mechanisms.
 
 - **File**: [Scheduled jobs](tasks/scheduled_jobs.md)
 - **Status**: Brainstorm, postponed (see issue #3) — deprioritized, not actively worked
@@ -863,3 +833,65 @@ under `/local/` to the box:
   Tiers 1-3 against the pending queue with current stats" mechanism would be needed to close that
   gap — not built here. The volume/noise correlation itself also surfaced a real, still-unresolved
   tension with an earlier investigation — see Pending Tasks above.
+- **`quant-ingest`'s `ingestion_coverage` write path** — issue #31, opened by the repo owner.
+  `status:implementation`, fix pushed — **left open**, per this file's "Who closes an issue" rule:
+  the opener verifies and closes it themselves. The schema, one-time backfill, and
+  `quant-reconcile`'s consuming side shipped earlier; what was still missing was `quant-ingest`
+  itself ever recording/coalescing coverage on a successful fetch, so the table only ever reflected
+  the one-time backfill's moment and went stale the instant real ingestion resumed. Surfaced
+  concretely twice in the same session live-testing `massive` as a second candidate (issue #44):
+  both `SPY` and `QQQ` needed a hand-written `INSERT` before `quant-reconcile`'s
+  candidate-confirmed-absence path (issue #49) could do anything, since that fix depends entirely
+  on `ingestion_coverage` reflecting reality. `PostgresDatabase.record_ingestion_coverage`
+  (`ingest/cli.py`'s `_ingest_one` calls it once fetch *and* write both succeed for a
+  `(ticker, date)`) resolves `(ticker_id, provider_id, date_id)`, finds every existing range that
+  already contains or is immediately adjacent to that `date_id`, and either no-ops (already
+  covered), extends the one touching range, or merges two touching ranges into one — never leaves
+  one row per day. Recording coverage failing on its own is logged and skipped, not fatal to that
+  `(ticker, date)` pair, matching `_ingest_one`'s existing per-step fetch/write failure tolerance.
+  Live-verified against CroicuWS1: ingesting one more day for an already-covered `(SPY, massive)`
+  range extended the existing row in place (`2026-07-23`–`2026-08-05` → `2026-07-23`–`2026-08-06`)
+  rather than creating a second one.
+- **Candidate-confirmed-absent bars have no resolution path at all** — closed issue #49, opened and
+  closed by Claude mid-task per this file's "Who closes an issue" exception. This is exactly the
+  gap this file previously tracked as "Candidate-missing bars have no resolution path at all"
+  (found 2026-08-14, no issue opened yet at the time) — `fetch_staging_rows_for_reconciliation`
+  required *every* configured candidate provider present before a bar_key became eligible at all;
+  live-tested with `massive` as a second candidate (issue #44), this left 449 real `ibkr` `SPY`
+  bars silently unevaluated because `massive` simply never reported those exact minutes (small
+  session-edge coverage differences between providers). Fix generalizes issue #31's own
+  whistleblower-confirmed-absent mechanism to every required provider: `postgres.py`'s
+  `fetch_staging_rows_for_reconciliation` now requires only *at least one* candidate present (the
+  exact-count `HAVING` dropped entirely), and `reconcile/cli.py`'s per-bar readiness filter checks
+  each individually-missing required provider — whistleblower or candidate — against
+  `ingestion_coverage`, removing the bar_key only if a missing provider's absence isn't confirmed.
+  **`algorithm.py` needed zero changes** — every tier already iterated whatever candidates happened
+  to be present in `bars`, never assuming a fixed count, so a bar_key that survives the filter with
+  only `ibkr` present resolves using `ibkr` alone, subject to the same whistleblower validation as
+  any other bar. Deliberately kept simple, per explicit discussion: matched-bar/graduation counting
+  stays untouched (a confirmed-absent-candidate resolution doesn't feed that candidate's own
+  calibration — correct, since there's no comparison to measure — but the properly-precise version
+  would make matched-bar counting per-(candidate, whistleblower) pair rather than requiring the
+  full provider set; left as a deferred refinement). Live-verified against CroicuWS1 after manually
+  seeding the missing `ingestion_coverage` row: all 449 previously-orphaned `SPY` bars resolved via
+  `completeness` in the very next run, 0 newly pending.
+- **Material-disagreement check on the Tier 2 tiebreak** — closed issue #50, opened and closed by
+  Claude mid-task per this file's "Who closes an issue" exception. Before this, when more than one
+  candidate agreed with the whistleblower, `_pick_preferred` promoted
+  `settings.reconcile.preferredProvider` outright with no check on how far it actually diverges
+  from the *other* agreeing candidate(s). Live-tested on `SPY`: `ibkr` won that tiebreak in 3,892 of
+  3,894 dual-agreement bars, `massive` only the 2 where `ibkr` itself was the outlier — harmless on
+  that data (checked: median divergence $0.00, p99 ~1 cent, max 6 cents), but nothing would have
+  caught it if the divergence had been real. New `_candidates_disagree_materially` reuses the
+  winner's own already-computed `materiality_floor`-derived floor (`_materiality_floor`, factored
+  out of `_tolerance` for reuse) rather than a new stat — a floor of `0.0` (the existing
+  "unconfigured" default) means the check doesn't engage, preserving prior behavior exactly
+  wherever no floor was ever seeded. Deliberately scoped to Tier 2 only, not Tier 3
+  (`_resolve_boundary_fix`'s own unrelated "first agreeing candidate wins" quirk is out of scope
+  here) — Tier 3 fired only 6 times out of 9,598 resolved `SPY` bars, a small fraction. Live-tested
+  against CroicuWS1: re-ran reconciliation from the same pre-reconcile snapshot with the fix in
+  place and confirmed zero bars actually flipped — traced the one candidate top-divergence case
+  found earlier and confirmed it was never a genuine dual-agreement bar to begin with (`massive`
+  had already failed its own tolerance check against the whistleblower, so it was never in Tier 2's
+  `agreeing` set for the new check to even consider) — a reassuring null result on real data, not
+  an untested code path.
