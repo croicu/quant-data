@@ -219,6 +219,22 @@ def test_load_postgres_settings_raises_when_only_ssh_key_path_given(tmp_path):
         Settings.load(path=settings_path)
 
 
+def test_load_postgres_settings_defaults_archive_dbname_to_none(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload()})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.postgres.archive_dbname is None
+
+
+def test_load_postgres_settings_parses_archive_dbname_when_given(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload(archiveDbname="quant_ingest")})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.postgres.archive_dbname == "quant_ingest"
+
+
 def test_load_defaults_providers_to_yfinance_only(tmp_path):
     settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
 

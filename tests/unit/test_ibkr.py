@@ -136,7 +136,7 @@ def test_fetch_bars_maps_bars_to_ohlcv(mock_ib_class):
         ),
     ]
 
-    bars = provider.fetch_bars("aapl", date(2026, 7, 24))
+    bars = provider.fetch_bars("aapl", date(2026, 7, 24)).bars
 
     assert len(bars) == 2
     assert bars[0].ticker == "AAPL"
@@ -163,7 +163,7 @@ def test_fetch_bars_normalizes_naive_timestamp_to_utc(mock_ib_class):
         ),
     ]
 
-    bars = provider.fetch_bars("AAPL", date(2026, 7, 24))
+    bars = provider.fetch_bars("AAPL", date(2026, 7, 24)).bars
 
     assert bars[0].timestamp.tzinfo is not None
     assert bars[0].timestamp == datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc)

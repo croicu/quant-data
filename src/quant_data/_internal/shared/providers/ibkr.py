@@ -7,10 +7,12 @@ from zoneinfo import ZoneInfo
 
 from ib_async import IB, StartupFetchNONE, Stock
 
+from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
 from quant_data.protocols import OHLCV, DataQuality
 
 from ..diagnostics import Logger
 from ..errors import AppError
+from .payload import parsed_bars_payload
 
 CATEGORY_IBKR = "ibkr"
 
@@ -30,6 +32,8 @@ class IBKRIntraDay:
     updates costly enough -- see StartupFetchNONE below) that it's meant to be amortized across a
     batch: call connect() once before a run of fetch_bars() calls, close() when done.
     """
+
+    FETCH_VERSION = "1"
 
     def __init__(
         self,
@@ -64,7 +68,7 @@ class IBKRIntraDay:
         self._ib.disconnect()
         self._ib = None
 
-    def fetch_bars(self, ticker: str, target_date: date) -> list[OHLCV]:
+    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
         if self._ib is None:
             raise AppError("IBKRIntraDay.fetch_bars called before connect() -- call connect() once per batch before fetching.")
 
@@ -121,4 +125,4 @@ class IBKRIntraDay:
             f"quant-ingest: fetched {len(bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()} via IBKR.",
             category=CATEGORY_IBKR,
         )
-        return bars
+        return ProviderFetchResult(bars=bars, payload=parsed_bars_payload(bars), payload_kind=PayloadKind.PARSED_BARS)

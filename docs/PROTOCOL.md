@@ -16,7 +16,9 @@ CLI signature and file format schemas for `quant-data`.
   `tasks/quant-reconcile.md`); `quant-ingest`'s job ends at staging. Also updates `ingestion_coverage`
   (`record_ingestion_coverage`, croicu/quant-data#31) once a provider's fetch and write both succeed
   for a `(ticker, date)` — `quant-reconcile`'s candidate-confirmed-absence handling depends on this
-  table actually reflecting what's been ingested, not just a one-time backfill. See
+  table actually reflecting what's been ingested, not just a one-time backfill. Before the staging
+  write, also archives the provider's fetch into the separate `quant_ingest` database
+  (`settings.postgres.archiveDbname`, croicu/quant-data#52) when configured — see
   `docs/ARCHITECTURE.md` for the full design.
 - `--ticker` — single ticker (e.g. `AAPL`); omit to use every ticker in `settings.tickers` instead.
 - `--start-date` — first trading date, `YYYY-MM-DD`; omit to use `settings.startDate`.
@@ -57,7 +59,14 @@ CLI signature and file format schemas for `quant-data`.
   apart) since Massive's documented rate limit isn't strictly enforced in practice
   (croicu/quant-scratch#24's live testing) — the pre-emptive `RateLimiter` above is the primary
   defense, this is a fallback for the cases it doesn't strictly hold. `settings.backfillChunkDays`
-  (default `1`, must be `>= 1`) — only consulted by `--backfill`.
+  (default `1`, must be `>= 1`) — only consulted by `--backfill`. `settings.postgres.archiveDbname`
+  (optional, croicu/quant-data#52) — a second database on the same server/role as
+  `settings.postgres`'s existing `host`/`port`/`user`/`password`/`sshUser`/`sshKeyPath`, just a
+  different `dbname`. When set, every successful provider fetch is archived into it immediately,
+  before the staging write, as an immutable record of exactly what the provider returned (see
+  `docs/SCHEMA.md`'s `quant_ingest` section). Omitted (the default) disables archiving entirely —
+  `quant-ingest` still writes to staging exactly as before; a failed connection or a failed archive
+  write is logged and skipped, never fatal to the run.
 - Exit codes: `0` every (ticker, date) pair had at least one provider succeed; `1` settings load
   failure, no ticker/date-range configured at all, every configured provider failing to connect,
   `dataset_inception` empty (`--backfill` only), or one or more (ticker, date) pairs where every
@@ -166,3 +175,9 @@ four-table star schema (`dim_ticker`, `dim_date`, `dim_time`, `fact_market_data_
 Plain numbered SQL files (`NNN_description.sql`), applied manually via `psql` in order — see
 `docs/DATABASE.md`. Each migration wraps its DDL in a single transaction and records itself in the
 `schema_migrations` table on success.
+
+`migrations/quant_ingest/*.sql` (croicu/quant-data#52) is a separate, independently-numbered
+sequence for the `quant_ingest` database — a different database on the same server, with its own
+`schema_migrations` table. Applied the same way (`psql ... -d quant_ingest -f
+migrations/quant_ingest/NNN_description.sql`), just never mixed into the main `migrations/`
+sequence, since the two databases' schema histories are unrelated.
