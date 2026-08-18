@@ -8,11 +8,10 @@ from zoneinfo import ZoneInfo
 from ib_async import IB, StartupFetchNONE, Stock
 
 from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
-from quant_data.protocols import OHLCV, DataQuality
 
 from ..diagnostics import Logger
 from ..errors import AppError
-from .payload import parsed_bars_payload
+from .payload import raw_bars_payload
 
 CATEGORY_IBKR = "ibkr"
 
@@ -69,6 +68,7 @@ class IBKRIntraDay:
         self._ib = None
 
     def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
+        # Pure fetch -- no OHLCV parsing here (croicu/quant-data#56).
         if self._ib is None:
             raise AppError("IBKRIntraDay.fetch_bars called before connect() -- call connect() once per batch before fetching.")
 
@@ -98,7 +98,7 @@ class IBKRIntraDay:
         if not raw_bars:
             raise AppError(f"No data available for '{normalized_ticker}' on {target_date.isoformat()}.")
 
-        bars: list[OHLCV] = []
+        serialized_bars: list[dict] = []
         for raw_bar in raw_bars:
             timestamp_utc = raw_bar.date
             if timestamp_utc.tzinfo is None:
@@ -106,23 +106,19 @@ class IBKRIntraDay:
             else:
                 timestamp_utc = timestamp_utc.astimezone(timezone.utc)
 
-            bar = OHLCV(
-                ticker=normalized_ticker,
-                timestamp=timestamp_utc,
-                open=float(raw_bar.open),
-                high=float(raw_bar.high),
-                low=float(raw_bar.low),
-                close=float(raw_bar.close),
-                volume=int(raw_bar.volume),
-                # Unlike Yahoo, IBKR only returns bars it actually has trade data for -- no
-                # synthetic/NaN placeholder rows -- so no zero-volume-as-incomplete heuristic
-                # applies here; a zero-volume bar is a real "no trades that minute" fact.
-                data_quality=DataQuality.ACCEPTED,
+            serialized_bars.append(
+                {
+                    "timestamp": timestamp_utc.isoformat(),
+                    "open": float(raw_bar.open),
+                    "high": float(raw_bar.high),
+                    "low": float(raw_bar.low),
+                    "close": float(raw_bar.close),
+                    "volume": int(raw_bar.volume),
+                }
             )
-            bars.append(bar)
 
         Logger.info(
-            f"quant-ingest: fetched {len(bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()} via IBKR.",
+            f"quant-ingest: fetched {len(serialized_bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()} via IBKR.",
             category=CATEGORY_IBKR,
         )
-        return ProviderFetchResult(bars=bars, payload=parsed_bars_payload(bars), payload_kind=PayloadKind.PARSED_BARS)
+        return ProviderFetchResult(payload=raw_bars_payload(serialized_bars), payload_kind=PayloadKind.PARSED_BARS)

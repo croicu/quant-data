@@ -8,7 +8,6 @@ import pytest
 
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.providers.yfinance import YahooFinanceIntraDay
-from quant_data.protocols import DataQuality
 
 
 def _history_frame(rows: list[dict]) -> pandas.DataFrame:
@@ -40,7 +39,10 @@ def _history_frame(rows: list[dict]) -> pandas.DataFrame:
 
 
 @patch("quant_data._internal.shared.providers.yfinance.yfinance")
-def test_fetch_bars_flags_nan_rows_as_incomplete(mock_yfinance):
+def test_fetch_bars_preserves_nan_as_none_in_raw_payload(mock_yfinance):
+    # Pure fetch (croicu/quant-data#56) -- no incomplete/data-quality determination here anymore,
+    # that moved to stage's yfinance parser (see tests/unit/test_stage_parsers.py). NaN is
+    # preserved as JSON null rather than coerced to 0.0, so the parser sees the genuine raw signal.
     history = _history_frame(
         [
             {
@@ -63,19 +65,17 @@ def test_fetch_bars_flags_nan_rows_as_incomplete(mock_yfinance):
     )
     mock_yfinance.Ticker.return_value.history.return_value = history
 
-    bars = YahooFinanceIntraDay().fetch_bars("aapl", date(2026, 7, 24)).bars
+    payload = YahooFinanceIntraDay().fetch_bars("aapl", date(2026, 7, 24)).payload
+    raw_bars = payload["bars"]
 
-    assert len(bars) == 2
-    assert bars[0].ticker == "AAPL"
-    assert bars[0].data_quality == DataQuality.ACCEPTED
-    assert bars[0].volume == 1000
-    assert bars[1].data_quality == DataQuality.INCOMPLETE
-    assert bars[1].volume == 0
-    assert bars[1].open == 0.0
+    assert len(raw_bars) == 2
+    assert raw_bars[0]["volume"] == 1000
+    assert raw_bars[1]["open"] is None
+    assert raw_bars[1]["volume"] is None
 
 
 @patch("quant_data._internal.shared.providers.yfinance.yfinance")
-def test_fetch_bars_flags_literal_zero_volume_as_incomplete(mock_yfinance):
+def test_fetch_bars_preserves_literal_zero_volume_in_raw_payload(mock_yfinance):
     history = _history_frame(
         [
             {
@@ -90,14 +90,14 @@ def test_fetch_bars_flags_literal_zero_volume_as_incomplete(mock_yfinance):
     )
     mock_yfinance.Ticker.return_value.history.return_value = history
 
-    bars = YahooFinanceIntraDay().fetch_bars("aapl", date(2026, 7, 24)).bars
+    payload = YahooFinanceIntraDay().fetch_bars("aapl", date(2026, 7, 24)).payload
+    raw_bars = payload["bars"]
 
-    assert len(bars) == 1
-    assert bars[0].volume == 0
-    assert bars[0].data_quality == DataQuality.INCOMPLETE
-    # A literal 0 is a real (if suspicious) OHLC reading, unlike the NaN case -- only volume
-    # drives incomplete here, open/high/low/close shouldn't be coerced to 0.0.
-    assert bars[0].open == 100.0
+    assert len(raw_bars) == 1
+    # A literal 0 is a real reading, distinct from NaN -- preserved as-is; whether it counts as
+    # incomplete is the parser's call, not the provider's.
+    assert raw_bars[0]["volume"] == 0
+    assert raw_bars[0]["open"] == 100.0
 
 
 @patch("quant_data._internal.shared.providers.yfinance.yfinance")

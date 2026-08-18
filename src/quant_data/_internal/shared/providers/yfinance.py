@@ -6,26 +6,25 @@ import pandas
 import yfinance
 
 from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
-from quant_data.protocols import OHLCV, DataQuality
 
 from ..diagnostics import Logger
 from ..errors import AppError
-from .payload import parsed_bars_payload
+from .payload import raw_bars_payload
 from .yfinance_logging import CATEGORY_YFINANCE, install_log_capture
 
 install_log_capture()
 
 
-def _safe_float(value: float) -> tuple[float, bool]:
+def _safe_float_or_none(value: float) -> float | None:
     if pandas.isna(value):
-        return 0.0, True
-    return float(value), False
+        return None
+    return float(value)
 
 
-def _safe_int(value: float) -> tuple[int, bool]:
+def _safe_volume_or_none(value: float) -> int | None:
     if pandas.isna(value):
-        return 0, True
-    return int(value), False
+        return None
+    return int(value)
 
 
 class YahooFinanceIntraDay:
@@ -41,6 +40,10 @@ class YahooFinanceIntraDay:
         pass
 
     def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
+        # Pure fetch -- no OHLCV parsing here (croicu/quant-data#56). NaN values are preserved as
+        # JSON null (not coerced to 0.0), so quant-stage's yfinance parser can make its own
+        # incomplete/data-quality determination from the genuine raw signal, not a value this repo
+        # already interpreted at fetch time.
         normalized_ticker = ticker.upper()
         start = datetime.combine(target_date, datetime.min.time())
         end = start + timedelta(days=1)
@@ -53,37 +56,22 @@ class YahooFinanceIntraDay:
         if history.empty:
             raise AppError(f"No data available for '{normalized_ticker}' on {target_date.isoformat()}.")
 
-        bars: list[OHLCV] = []
+        raw_bars: list[dict] = []
         for row_timestamp, row in history.iterrows():
             timestamp_utc = row_timestamp.tz_convert("UTC").to_pydatetime()
-
-            open_value, open_incomplete = _safe_float(row["Open"])
-            high_value, high_incomplete = _safe_float(row["High"])
-            low_value, low_incomplete = _safe_float(row["Low"])
-            close_value, close_incomplete = _safe_float(row["Close"])
-            volume_value, volume_incomplete = _safe_int(row["Volume"])
-            if volume_value == 0:
-                # A real tick can't have zero volume — yfinance reports both genuine data gaps
-                # (NaN, handled above) and "no trade data" (a literal 0) for the same underlying
-                # problem, most often pre-market/after-hours minutes with no trades recorded.
-                volume_incomplete = True
-
-            incomplete = open_incomplete or high_incomplete or low_incomplete or close_incomplete or volume_incomplete
-
-            bar = OHLCV(
-                ticker=normalized_ticker,
-                timestamp=timestamp_utc,
-                open=open_value,
-                high=high_value,
-                low=low_value,
-                close=close_value,
-                volume=volume_value,
-                data_quality=DataQuality.INCOMPLETE if incomplete else DataQuality.ACCEPTED,
+            raw_bars.append(
+                {
+                    "timestamp": timestamp_utc.isoformat(),
+                    "open": _safe_float_or_none(row["Open"]),
+                    "high": _safe_float_or_none(row["High"]),
+                    "low": _safe_float_or_none(row["Low"]),
+                    "close": _safe_float_or_none(row["Close"]),
+                    "volume": _safe_volume_or_none(row["Volume"]),
+                }
             )
-            bars.append(bar)
 
         Logger.info(
-            f"quant-ingest: fetched {len(bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()}.",
+            f"quant-ingest: fetched {len(raw_bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()}.",
             category=CATEGORY_YFINANCE,
         )
-        return ProviderFetchResult(bars=bars, payload=parsed_bars_payload(bars), payload_kind=PayloadKind.PARSED_BARS)
+        return ProviderFetchResult(payload=raw_bars_payload(raw_bars), payload_kind=PayloadKind.PARSED_BARS)
