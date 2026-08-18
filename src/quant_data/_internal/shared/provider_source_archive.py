@@ -149,3 +149,80 @@ class ProviderSourceArchiveWriter:
             "UPDATE archive_coverage SET start_date = %s, end_date = %s, updated_at = CURRENT_TIMESTAMP WHERE coverage_id = %s",
             (new_start, new_end, keep_coverage_id),
         )
+
+
+class ProviderSourceArchiveReader:
+    """Read-only client for the quant_ingest database -- used by `stage` (croicu/quant-data#56) to
+    turn archived fetches back into staging_market_data_1min rows. Deliberately a separate class
+    from ProviderSourceArchiveWriter, not a shared read/write class: the writer's own docstring
+    is explicit about being write-only, matching quant_writer's DB-level grants (INSERT only, plus
+    the later, deliberate DELETE relaxation -- never intended to also mean 'and reads'). Connection
+    setup mirrors ProviderSourceArchiveWriter's exactly."""
+
+    def __init__(self, transport: ConnectionTransport, user: str, password: str, dbname: str, logger: LoggingSink = Logger) -> None:
+        self._transport = transport
+        self._logger = logger
+
+        open_started = time.perf_counter()
+        effective_host, effective_port = transport.open()
+        self._logger.perf("transport.open()", time.perf_counter() - open_started)
+
+        if effective_host == "localhost":
+            # Same libpq dual-stack pitfall as PostgresDatabase -- see quant-data#19.
+            effective_host = "127.0.0.1"
+
+        self._logger.info(f"Connecting to quant_ingest at {effective_host}:{effective_port}/{dbname} as '{user}'...", category=CATEGORY_ARCHIVE)
+
+        connect_started = time.perf_counter()
+        try:
+            self._connection = psycopg.connect(
+                host=effective_host,
+                port=effective_port,
+                user=user,
+                password=password,
+                dbname=dbname,
+                options="-c TimeZone=UTC",
+            )
+        except psycopg.Error as error:
+            transport.close()
+            raise AppError(f"Failed to connect to quant_ingest at {effective_host}:{effective_port}/{dbname}: {error}") from error
+        self._logger.perf("psycopg.connect()", time.perf_counter() - connect_started)
+
+        self._logger.info(f"Connected to quant_ingest at {effective_host}:{effective_port}/{dbname}.", category=CATEGORY_ARCHIVE)
+
+    def close(self) -> None:
+        self._connection.close()
+        self._transport.close()
+
+    def fetch_latest_bars(self, ticker: str, provider: str, trading_date: date) -> tuple[PayloadKind, dict] | None:
+        """The most recently archived fetch for (ticker, provider, trading_date), or None if
+        nothing's been archived for that key. provider_source_archive has no uniqueness constraint
+        on that key (a re-fetch is a new row, never an upsert -- see migrations/quant_ingest/
+        001_init_provider_source_archive.sql), so this picks the row with the latest fetched_at as
+        the one worth staging."""
+        normalized_ticker = ticker.upper()
+        normalized_provider = provider.lower()
+        started = time.perf_counter()
+
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT payload_kind, payload
+                    FROM provider_source_archive
+                    WHERE ticker = %s AND provider = %s AND trading_date = %s
+                    ORDER BY fetched_at DESC
+                    LIMIT 1
+                    """,
+                    (normalized_ticker, normalized_provider, trading_date),
+                )
+                row = cursor.fetchone()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to read provider source archive for '{normalized_ticker}' via '{normalized_provider}': {error}") from error
+
+        self._logger.perf(f"fetch_latest_bars({normalized_ticker}, {normalized_provider})", time.perf_counter() - started)
+
+        if row is None:
+            return None
+        payload_kind_value, payload = row
+        return PayloadKind(payload_kind_value), payload

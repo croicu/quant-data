@@ -57,14 +57,13 @@ class PayloadKind(Enum):
 
 @dataclass
 class ProviderFetchResult:
-    """IntraDayProvider.fetch_bars()'s return value -- the parsed bars ingest actually writes to
-    staging, plus whatever's closest to the original provider response, for archiving into
-    quant_ingest before anything else (parsing bugs included) can lose it (croicu/quant-data#52).
-    Colocated with IntraDayProvider itself as the one data shape this module holds, rather than in
-    protocols.py: it's purely internal, never exposed to a consumer implementing a public
-    Protocol."""
+    """IntraDayProvider.fetch_bars()'s return value -- whatever's closest to the original provider
+    response, for archiving into quant_ingest (croicu/quant-data#52). Providers are pure fetchers
+    (croicu/quant-data#56): no OHLCV parsing happens here -- that's the `stage` process's job,
+    reading this same payload back out of quant_ingest.provider_source_archive. Colocated with
+    IntraDayProvider itself as the one data shape this module holds, rather than in protocols.py:
+    it's purely internal, never exposed to a consumer implementing a public Protocol."""
 
-    bars: list[OHLCV]
     payload: dict
     payload_kind: PayloadKind
 
@@ -85,9 +84,10 @@ class IntraDayProvider(Protocol):
         ...
 
     def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
-        """Fetch 1-minute OHLCV bars for a single session day from an external data provider.
-        Raises AppError if the ticker is invalid, the network call fails, or no bars are
-        available for that date."""
+        """Fetch 1-minute bars for a single session day from an external data provider, returned
+        as an archivable payload -- no OHLCV parsing (croicu/quant-data#56; see `stage` for that).
+        Raises AppError if the ticker is invalid, the network call fails, or no bars are available
+        for that date."""
         ...
 
     def close(self) -> None:

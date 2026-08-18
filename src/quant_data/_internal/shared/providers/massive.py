@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import time as time_module
 from collections.abc import Callable
-from datetime import date, datetime, timezone
+from datetime import date
 
 import requests
 from requests.exceptions import HTTPError
 
 from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
-from quant_data.protocols import OHLCV, DataQuality
 
 from ..diagnostics import Logger
 from ..errors import AppError
@@ -105,37 +104,14 @@ class MassiveIntraDay:
         if not raw_bars:
             raise AppError(f"No data available for '{normalized_ticker}' on {target_date.isoformat()}.")
 
-        bars: list[OHLCV] = []
-        for raw_bar in raw_bars:
-            timestamp_utc = datetime.fromtimestamp(raw_bar["t"] / 1000, tz=timezone.utc)
-            bar = OHLCV(
-                ticker=normalized_ticker,
-                timestamp=timestamp_utc,
-                open=float(raw_bar["o"]),
-                high=float(raw_bar["h"]),
-                low=float(raw_bar["l"]),
-                close=float(raw_bar["c"]),
-                # 'v' comes back as a float from the API (observed fractional values in practice,
-                # e.g. odd-lot/computed volume) -- OHLCV.volume is int, so this truncates, same as
-                # every other provider's int(...) cast on its own raw volume field.
-                volume=int(raw_bar["v"]),
-                # Massive -- like IBKR -- only returns bars it actually has trade data for, no
-                # synthetic/NaN placeholder rows, so no incomplete heuristic applies here.
-                data_quality=DataQuality.ACCEPTED,
-            )
-            bars.append(bar)
-
-        bars.sort(key=_bar_timestamp)
-
+        # Pure fetch -- no OHLCV parsing here (croicu/quant-data#56). The raw API response
+        # (already sorted ascending by "sort": "asc" above) is archived as-is; quant-stage's
+        # massive parser owns turning `results` into OHLCV.
         Logger.info(
-            f"quant-ingest: fetched {len(bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()} via Massive.",
+            f"quant-ingest: fetched {len(raw_bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()} via Massive.",
             category=CATEGORY_MASSIVE,
         )
-        return ProviderFetchResult(bars=bars, payload=payload, payload_kind=PayloadKind.RAW_API_RESPONSE)
-
-
-def _bar_timestamp(bar: OHLCV) -> datetime:
-    return bar.timestamp
+        return ProviderFetchResult(payload=payload, payload_kind=PayloadKind.RAW_API_RESPONSE)
 
 
 def _request(url: str, params: dict) -> dict:

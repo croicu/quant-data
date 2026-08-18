@@ -8,39 +8,33 @@ CLI signature and file format schemas for `quant-data`.
 
 ### `quant-ingest`
 
-- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up | --backfill] [--ticker TICKER] [--debug]`
-- Fetches 1-minute OHLCV bars from every provider in `settings.providers` (default: just
-  `yfinance`; add `ibkr`/`massive` to also run those) and writes each provider's bars independently
-  into `staging_market_data_1min` — **not** `fact_market_data_1min` directly. Promoting agreeing
-  staging rows into `fact_market_data_1min` is a separate tool, `quant-reconcile` (see below and
-  `tasks/quant-reconcile.md`); `quant-ingest`'s job ends at staging. Also updates `ingestion_coverage`
-  (`record_ingestion_coverage`, croicu/quant-data#31) once a provider's fetch and write both succeed
-  for a `(ticker, date)` — `quant-reconcile`'s candidate-confirmed-absence handling depends on this
-  table actually reflecting what's been ingested, not just a one-time backfill. Before the staging
-  write, also archives the provider's fetch into the separate `quant_ingest` database
-  (`settings.postgres.archiveDbname`, croicu/quant-data#52) when configured — see
-  `docs/ARCHITECTURE.md` for the full design.
+- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]`
+- Fetches 1-minute bars from every provider in `settings.providers` (default: just `yfinance`; add
+  `ibkr`/`massive` to also run those) and archives each provider's fetch into the separate
+  `quant_ingest` database's `provider_source_archive` (`settings.postgres.archiveDbname`, required
+  — croicu/quant-data#52). **As of croicu/quant-data#56, this is `quant-ingest`'s entire job — it
+  writes to `quant_ingest` only and no longer touches `quant_data` at all**, not even
+  `staging_market_data_1min`. A separate command, `quant-stage` (see below), reads what's archived
+  here and writes `staging_market_data_1min`; `quant-reconcile` (see further below) then promotes
+  agreeing staging rows into `fact_market_data_1min`. See `docs/ARCHITECTURE.md` for the full design
+  and the reasoning behind the split.
 - `--ticker` — single ticker (e.g. `AAPL`); omit to use every ticker in `settings.tickers` instead.
 - `--start-date` — first trading date, `YYYY-MM-DD`; omit to use `settings.startDate`.
 - `--end-date` — last trading date (inclusive); omit (with `--start-date` given) for a single day.
   Requires `--start-date` — rejected on its own.
 - `--catch-up` — re-fetches the trailing `settings.catchUpLookbackDays` days (default 7),
   excluding today, instead of a `--start-date`/`--end-date` range. Rejected in combination with
-  `--start-date`/`--end-date`/`--backfill`. Meant for an unattended nightly run (cron/systemd
-  timer, set up outside this repo — see `tasks/scheduled_jobs.md`) that catches up any day a prior
-  run only partially ingested (e.g. `quant-ingest` run manually mid-session); safe to run against
-  already-complete days too, since `write_staging_bars` upserts are idempotent.
-- `--backfill` (croicu/quant-data#28) — walks each configured ticker backward from its current
-  earliest covered date toward `dataset_inception.inception_date`, one `settings.backfillChunkDays`
-  chunk (default `1`) per ticker per invocation (round-robin, not one ticker drained to completion
-  before the next starts). Rejected in combination with `--start-date`/`--end-date`/`--catch-up`. A
-  never-ingested ticker auto-bootstraps its first chunk from today backward; a ticker already at
-  `inception_date` is a no-op. Requires `dataset_inception` to have a row — fails with exit `1` if
-  it's empty (see `docs/DATABASE.md`'s setup notes). See `docs/ARCHITECTURE.md` for the full chunk
-  formula.
+  `--start-date`/`--end-date`. Meant for an unattended nightly run (cron/systemd timer, set up
+  outside this repo — see `tasks/scheduled_jobs.md`) that re-covers any day a prior run only
+  partially archived; safe to run against already-archived days too — `provider_source_archive` has
+  no uniqueness constraint on `(ticker, provider, trading_date)`, a re-fetch is simply a new row.
+- `--backfill` is **not currently supported** here (removed by croicu/quant-data#56's split — its
+  old bookkeeping, `dataset_inception`/earliest-covered-date, spanned both `quant_data` and
+  `quant_ingest` in a way the split didn't resolve on its own; see `docs/ARCHITECTURE.md`'s `ingest`
+  section for why, and the issue for the follow-up).
 - `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
   instead of printing a one-line error, for upfront failures (settings load, no ticker/date
-  configured at all, every configured provider failing to connect).
+  configured at all, every configured provider failing to connect, `archiveDbname` unconfigured).
 - `settings.providers` (array of strings, default `["yfinance"]`) — which providers to run each
   invocation, applied uniformly across every ticker in `settings.tickers` (no per-ticker override —
   there is no `--providers` CLI flag; scoping a provider to a subset of tickers, e.g. a pilot
@@ -58,24 +52,51 @@ CLI signature and file format schemas for `quant-data`.
   unlimited when omitted. `MassiveIntraDay` also retries on HTTP 429 internally (3 attempts, 15s
   apart) since Massive's documented rate limit isn't strictly enforced in practice
   (croicu/quant-scratch#24's live testing) — the pre-emptive `RateLimiter` above is the primary
-  defense, this is a fallback for the cases it doesn't strictly hold. `settings.backfillChunkDays`
-  (default `1`, must be `>= 1`) — only consulted by `--backfill`. `settings.postgres.archiveDbname`
-  (optional, croicu/quant-data#52) — a second database on the same server/role as
-  `settings.postgres`'s existing `host`/`port`/`user`/`password`/`sshUser`/`sshKeyPath`, just a
-  different `dbname`. When set, every successful provider fetch is archived into it immediately,
-  before the staging write, as an immutable record of exactly what the provider returned (see
-  `docs/SCHEMA.md`'s `quant_ingest` section). Omitted (the default) disables archiving entirely —
-  `quant-ingest` still writes to staging exactly as before; a failed connection or a failed archive
-  write is logged and skipped, never fatal to the run.
+  defense, this is a fallback for the cases it doesn't strictly hold. `settings.postgres.archiveDbname`
+  (croicu/quant-data#52) — a second database on the same server/role as `settings.postgres`'s
+  existing `host`/`port`/`user`/`password`/`sshUser`/`sshKeyPath`, just a different `dbname`.
+  **Required** as of croicu/quant-data#56 (`quant-ingest` raises at startup if unconfigured — there
+  is nowhere else for it to write).
 - Exit codes: `0` every (ticker, date) pair had at least one provider succeed; `1` settings load
-  failure, no ticker/date-range configured at all, every configured provider failing to connect,
-  `dataset_inception` empty (`--backfill` only), or one or more (ticker, date) pairs where every
+  failure, no ticker/date-range configured at all, `archiveDbname` unconfigured or unreachable,
+  every configured provider failing to connect, or one or more (ticker, date) pairs where every
   provider failed (an individual provider failing for one pair — bad ticker on that source, gateway
-  unreachable — logs a warning and the run continues with whatever providers/pairs still work,
-  rather than aborting — `1` here can mean "partial success", not necessarily "nothing happened");
-  `2` argument parsing error (argparse's default behavior on missing/bad args, e.g. malformed dates
-  or `--end-date` without `--start-date`, or combining `--backfill` with another date-selection
-  flag).
+  unreachable, its own archive write failing — logs a warning and the run continues with whatever
+  providers/pairs still work, rather than aborting — `1` here can mean "partial success", not
+  necessarily "nothing happened"); `2` argument parsing error (argparse's default behavior on
+  missing/bad args, e.g. malformed dates or `--end-date` without `--start-date`).
+
+### `quant-stage`
+
+- Usage: `quant-stage [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]`
+- The second half of what used to be a single `quant-ingest` process (croicu/quant-data#56). For
+  every provider in `settings.providers`, reads the most recently archived fetch for each (ticker,
+  date) from `quant_ingest`'s `provider_source_archive`, parses it into `OHLCV` bars
+  (`stage.parsers`, one module per provider — this is where the old provider-side data-quality
+  determination, e.g. yfinance's NaN/zero-volume-as-incomplete heuristic, now lives), and writes the
+  result into `quant_data.staging_market_data_1min`. Also updates `ingestion_coverage`
+  (`record_ingestion_coverage`, croicu/quant-data#31, moved here from `quant-ingest` by the split)
+  once a provider's parse and staging write both succeed for a `(ticker, date)` —
+  `quant-reconcile`'s candidate-confirmed-absence handling depends on this table actually reflecting
+  what's been staged. A `(ticker, provider, date)` with nothing archived is skipped, not an error —
+  fetching it is `quant-ingest`'s job. **Weekend dates are skipped outright**, before ever reading
+  the archive — `quant-ingest` still fetches/archives them (IBKR returns the prior trading day's
+  session for a weekend request rather than failing), but staging that would just be a redundant
+  re-upsert of a day already staged correctly under its own date. Does **not** write
+  `fact_market_data_1min` directly — promoting agreeing staging rows there is `quant-reconcile`'s
+  job (see below).
+- `--ticker`/`--start-date`/`--end-date`/`--catch-up`/`--debug` — identical semantics to
+  `quant-ingest`'s own flags above, just applied to the archive-read/staging-write step instead of
+  the provider-fetch step. `--backfill` is not supported here either, for the same reason as
+  `quant-ingest`.
+- `settings.providers`/`settings.postgres.archiveDbname` are read the same way as `quant-ingest`
+  (which providers to process; where to read archived fetches from — **required** here too, same
+  reasoning). `settings.postgres` (the primary `quant_data` connection) is also required, same as
+  every other command in this repo.
+- Exit codes: `0` every (ticker, date) pair had at least one provider stage successfully; `1`
+  settings load failure, no ticker/date-range configured at all, either database unconfigured or
+  unreachable, or one or more (ticker, date) pairs where every provider either had nothing archived
+  or failed to parse/write; `2` argument parsing error, same shape as `quant-ingest`'s.
 
 ### `quant-reconcile`
 
@@ -151,10 +172,10 @@ CLI signature and file format schemas for `quant-data`.
   exists) as part of the same manual edit — nothing else does this automatically for a hand
   correction the way `--finalize` does for its own resolutions.
 
-There is no generic `quant-data` command — `quant-ingest`/`quant-reconcile` (write side, packages
-`ingest`/`reconcile`, outside the `quant_data` namespace — no importable surface, console script
-only) and `quant_data.MarketData` (read side — a library, not a CLI) are the consumer-facing entry
-points. `MarketData`, `OHLCV`, `DataQuality`, `LoggingSink`, `PendingResolutionBar`, `ProviderRole`,
+There is no generic `quant-data` command — `quant-ingest`/`quant-stage`/`quant-reconcile` (write
+side, packages `ingest`/`stage`/`reconcile`, outside the `quant_data` namespace — no importable
+surface, console script only) and `quant_data.MarketData` (read side — a library, not a CLI) are the
+consumer-facing entry points. `MarketData`, `OHLCV`, `DataQuality`, `LoggingSink`, `PendingResolutionBar`, `ProviderRole`,
 `RejectedWhistleblowerBar`, and `create_postgres_provider` are re-exported at the `quant_data` top
 level (`from quant_data import MarketData, OHLCV, create_postgres_provider, ...`);
 `quant_data._internal.*` is private (nested, not a separate package) and should not be imported

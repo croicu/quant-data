@@ -1,24 +1,10 @@
 from __future__ import annotations
 
-from quant_data.protocols import OHLCV
 
-
-def parsed_bars_payload(bars: list[OHLCV]) -> dict:
-    """JSON-serializable form of already-parsed OHLCV bars, for providers with no genuine raw
-    payload for quant_ingest to archive (PayloadKind.PARSED_BARS -- see
-    quant_data._internal.contracts.ProviderFetchResult)."""
-    serialized_bars: list[dict] = []
-    for bar in bars:
-        serialized_bars.append(
-            {
-                "ticker": bar.ticker,
-                "timestamp": bar.timestamp.isoformat(),
-                "open": bar.open,
-                "high": bar.high,
-                "low": bar.low,
-                "close": bar.close,
-                "volume": bar.volume,
-                "data_quality": bar.data_quality.value,
-            }
-        )
-    return {"bars": serialized_bars}
+def raw_bars_payload(bars: list[dict]) -> dict:
+    """JSON-serializable wrapper around a provider's own raw per-bar dicts, for archiving payloads
+    with no genuine raw API response to store (PayloadKind.PARSED_BARS -- see
+    quant_data._internal.contracts.ProviderFetchResult). Each provider builds its own bar dicts,
+    since the raw field shape differs per provider; this just standardizes the top-level wrapper
+    quant-stage's parsers read back out (croicu/quant-data#56)."""
+    return {"bars": bars}

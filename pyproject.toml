@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 quant-ingest = "ingest.cli:main"
+quant-stage = "stage.cli:main"
 quant-reconcile = "reconcile.cli:main"
 
 [project.optional-dependencies]

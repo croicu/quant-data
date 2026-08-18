@@ -25,6 +25,13 @@ Two top-level packages under `src/`:
       `transports/` (`ConnectionTransport` implementations, e.g. `DirectTransport`,
       `SshTunnelTransport`).
 - `src/ingest/` — the ingest CLI. Console script: `quant-ingest`, no importable surface at all.
+  Fetches from providers and archives to `quant_ingest` only (croicu/quant-data#56) — does not
+  write to `quant_data` at all.
+- `src/stage/` — the staging CLI (croicu/quant-data#56), same shape as `src/ingest/`: console
+  script `quant-stage`, no importable surface. Reads `quant_ingest.provider_source_archive`,
+  parses each archived payload into `OHLCV` (via `stage/parsers/`), and writes
+  `quant_data.staging_market_data_1min` — the second half of what used to be a single
+  `quant-ingest` process.
 
 **Public surface**: external consumers (`quant-scratch`) should only depend on the `quant_data`
 top level — `from quant_data import MarketData, OHLCV, LoggingSink, create_postgres_provider`. Since
@@ -162,21 +169,25 @@ independent top-level packages.
   `YahooFinanceIntraDay`, but real lifecycle methods for a provider with an expensive connection
   handshake to amortize across a batch — `ingest` calls `connect()` once per provider at the start
   of a run and `close()` once at the end, uniformly across every configured provider.
-  `fetch_bars`'s return type changed from a bare `list[OHLCV]` to `ProviderFetchResult` (croicu/
-  quant-data#52) — a small dataclass colocated with `IntraDayProvider` in this module (the one
-  deliberate exception to this module's own "not data" framing, since it's purely internal and
-  tightly coupled to this one Protocol method) holding `bars: list[OHLCV]` (unchanged, what `ingest`
-  writes to staging) plus `payload: dict` and `payload_kind: PayloadKind` (`RAW_API_RESPONSE` or
-  `PARSED_BARS`) for archiving into the separate `quant_ingest` database before the staging write —
-  see the `ingest` section below and `docs/SCHEMA.md`'s `quant_ingest database` section.
-  `FETCH_VERSION` is a plain string (not numeric) each concrete provider bumps by hand whenever its
-  own request construction changes in a way that could change what comes back.
+  `ProviderFetchResult` (croicu/quant-data#52) is a small dataclass colocated with `IntraDayProvider`
+  in this module (the one deliberate exception to this module's own "not data" framing, since it's
+  purely internal and tightly coupled to this one Protocol method) holding `payload: dict` and
+  `payload_kind: PayloadKind` (`RAW_API_RESPONSE` or `PARSED_BARS`) for archiving into the separate
+  `quant_ingest` database. As of croicu/quant-data#56, providers are pure fetchers — the dataclass
+  no longer carries a `bars: list[OHLCV]` field at all; every concrete provider's `fetch_bars`
+  returns only the archivable payload, with `OHLCV` parsing (and any data-quality determination,
+  e.g. NaN/zero-volume handling) moved entirely into `stage`'s per-provider parsers (see the
+  `stage` section below), which read the same payload back out of
+  `quant_ingest.provider_source_archive`. `FETCH_VERSION` is a plain string (not numeric) each
+  concrete provider bumps by hand whenever its own request construction changes in a way that could
+  change what comes back.
 - `ConnectionTransport(Protocol)`: `open() -> tuple[str, int]` (establish whatever's needed to
   reach Postgres, returning the `(host, port)` to connect to) plus `close() -> None`. Introduced so
   `PostgresDatabase` never needs to know *how* Postgres is actually reached (direct TCP vs. an SSH
-  tunnel) — see `postgres.py`/`transports/` below. `create_postgres_provider` and `ingest/cli.py`'s
-  database factory both build a concrete transport and hand it to `PostgresDatabase`, rather than
-  `PostgresDatabase` depending on either concrete transport itself.
+  tunnel) — see `postgres.py`/`transports/` below. `create_postgres_provider`, `stage/cli.py`'s
+  database factory, and both `ingest/cli.py`'s and `stage/cli.py`'s archive reader/writer factories
+  all build a concrete transport and hand it to `PostgresDatabase`/`ProviderSourceArchiveWriter`/
+  `ProviderSourceArchiveReader`, rather than any of those depending on a concrete transport itself.
 
 ### `quant_data._internal.shared`
 
@@ -269,39 +280,46 @@ independent top-level packages.
     `ssh -N -L ...`/systemd unit before the Python client could connect at all (see
     `docs/DATABASE.md`; direct `psql` access still needs that manual tunnel, since `psql` never
     goes through this transport abstraction).
-- `provider_source_archive.py` — `ProviderSourceArchiveWriter` (croicu/quant-data#52): a write-only
-  client for the separate `quant_ingest` database, deliberately not a method on `PostgresDatabase`
+- `provider_source_archive.py` — `ProviderSourceArchiveWriter` (croicu/quant-data#52), used by
+  `ingest`, and `ProviderSourceArchiveReader` (croicu/quant-data#56), used by `stage`: both are
+  clients for the separate `quant_ingest` database, deliberately not methods on `PostgresDatabase`
   since `quant_ingest` has no relationship to `quant_data`'s star schema at all (Postgres has no
-  cross-database foreign keys) — this class owns its own `psycopg` connection and never touches
-  `dim_ticker`/`dim_provider`/`dim_date`. Same connection-setup shape as `PostgresDatabase`
-  (`ConnectionTransport`, `TimeZone=UTC` pinning, the `"localhost"` -> `"127.0.0.1"` normalization,
-  injectable `LoggingSink`), duplicated rather than shared, since the two classes' actual query
-  logic has nothing in common beyond that setup. One real method, `record_fetch(ticker, provider,
-  trading_date, fetch_version, payload_kind, payload)`, writing `provider_source_archive` and
-  coalescing `archive_coverage` in one transaction (same gaps-and-islands coalescing as
+  cross-database foreign keys) — neither touches `dim_ticker`/`dim_provider`/`dim_date`. Same
+  connection-setup shape as `PostgresDatabase` (`ConnectionTransport`, `TimeZone=UTC` pinning, the
+  `"localhost"` -> `"127.0.0.1"` normalization, injectable `LoggingSink`), duplicated across both
+  rather than shared, since their actual query logic has nothing in common beyond that setup.
+  `ProviderSourceArchiveWriter`'s one real method, `record_fetch(ticker, provider, trading_date,
+  fetch_version, payload_kind, payload)`, writes `provider_source_archive` and coalesces
+  `archive_coverage` in one transaction (same gaps-and-islands coalescing as
   `PostgresDatabase.record_ingestion_coverage`, on plain `DATE` arithmetic instead of a surrogate
-  `date_id`, and keyed by `fetch_version` too). `record_fetch` itself only ever `INSERT`s into
-  `provider_source_archive` — `quant_writer`'s grants there originally excluded `UPDATE`/`DELETE`
-  entirely (true DB-enforced immutability); `DELETE` was granted afterward for manual cleanup, at
-  the repo owner's explicit, informed request (2026-08-17). `UPDATE` remains ungranted. See
-  `docs/SCHEMA.md`'s `quant_ingest database` section for the full schema/grant history and
-  rationale.
-- `providers/payload.py` — `parsed_bars_payload(bars) -> dict`, a small shared helper used by
-  `providers/yfinance.py` and `providers/ibkr.py` (not `providers/massive.py`, which has a genuine
-  raw payload) to JSON-serialize already-parsed `OHLCV` bars for `ProviderFetchResult.payload` when
-  a provider has nothing more raw to archive.
+  `date_id`, and keyed by `fetch_version` too). It only ever `INSERT`s into `provider_source_archive`
+  — `quant_writer`'s grants there originally excluded `UPDATE`/`DELETE` entirely (true DB-enforced
+  immutability); `DELETE` was granted afterward for manual cleanup, at the repo owner's explicit,
+  informed request (2026-08-17). `UPDATE` remains ungranted.
+  `ProviderSourceArchiveReader`'s one real method, `fetch_latest_bars(ticker, provider,
+  trading_date) -> tuple[PayloadKind, dict] | None`, reads the most recently archived row for that
+  key (`ORDER BY fetched_at DESC LIMIT 1` — the table has no uniqueness constraint on that key, a
+  re-fetch is always a new row, never an upsert) and returns `None` if nothing's archived, which
+  `stage` treats as "not this process's job to go fetch," not an error. See `docs/SCHEMA.md`'s
+  `quant_ingest database` section for the full schema/grant history and rationale.
+- `providers/payload.py` — `raw_bars_payload(bars: list[dict]) -> dict`, a thin wrapper
+  (`{"bars": bars}`) each provider uses for `ProviderFetchResult.payload` when it has no genuine raw
+  API response to archive (`providers/massive.py` doesn't use this — it archives the literal raw
+  response instead). As of croicu/quant-data#56, each provider builds its own raw per-bar dicts
+  (field shape differs per provider) rather than this helper serializing already-parsed `OHLCV`
+  objects — parsing moved to `stage`, so there's nothing `OHLCV`-shaped left at this layer.
 - `providers/yfinance.py` — `YahooFinanceIntraDay`, an `IntraDayProvider` implementation wrapping
-  `yfinance`. Ported from `quant-scratch`'s `shared/providers/yahoo_finance.py`, adapted to
-  produce `OHLCV` (which carries its own `ticker`, unlike `quant-scratch`'s `DayBar`) and to set
-  `data_quality=DataQuality.INCOMPLETE` (with the value coerced to `0`/`0.0`) whenever `yfinance`
-  returns `NaN` for any OHLCV field, or a literal `0` for volume — a real tick can't have zero
-  volume, so `yfinance` reporting either NaN or a literal 0 both signal the same underlying problem (most commonly
-  pre-market/after-hours minutes with no trades recorded). This is `ingest`'s default provider
-  (`settings.providers` defaults to `["yfinance"]`), not the only one anymore — see
-  `providers/ibkr.py` below, added to close exactly this pre-/after-market zero-volume gap and
-  wired in as an additional configured provider (issue #22); `ingest` depends on
-  `IntraDayProvider`, not on `YahooFinanceIntraDay` concretely, so adding/swapping providers is a
-  `settings.providers` change, not a code change to `ingest/cli.py`'s logic.
+  `yfinance`. Ported from `quant-scratch`'s `shared/providers/yahoo_finance.py`. A pure fetcher
+  (croicu/quant-data#56): returns raw per-bar `open`/`high`/`low`/`close`/`volume`/`timestamp`
+  values, with `NaN` preserved as JSON `null` (not coerced to `0`/`0.0`) so `stage`'s yfinance
+  parser sees the genuine raw signal rather than a value this layer already interpreted. This is
+  `ingest`'s default provider (`settings.providers` defaults to `["yfinance"]`), not the only one
+  anymore — see `providers/ibkr.py` below, added to close the pre-/after-market zero-volume gap
+  yfinance has (the actual incomplete-detection logic — `NaN` or literal-zero-volume both signal a
+  gap — now lives in `stage/parsers/yfinance_parser.py`, see the `stage` section) and wired in as an
+  additional configured provider (issue #22); `ingest` depends on `IntraDayProvider`, not on
+  `YahooFinanceIntraDay` concretely, so adding/swapping providers is a `settings.providers` change,
+  not a code change to `ingest/cli.py`'s logic.
 - `providers/yfinance_logging.py` — redirects `yfinance`'s own diagnostics (it logs through the
   stdlib `logging` module, e.g. `logging.getLogger('yfinance')`, rather than raising or going
   through our `Logger`) into `Logger` instead of letting them print straight to stderr.
@@ -330,10 +348,12 @@ independent top-level packages.
   `connect()` passes `fetchFields=StartupFetchNONE` to skip `ib_async`'s default positions/open-
   and-completed-orders/account-updates fetch, which a Read-Only-API Gateway (the correct setting
   for data-only ingest) otherwise rejects — costing ~10s per connection waiting for that fetch to
-  time out. No zero-volume-as-incomplete heuristic (unlike Yahoo's): IBKR only returns bars it
-  actually has trade data for, so a zero-volume bar is a real "no trades that minute" fact, not a
-  synthesized placeholder — this is exactly the gap `YahooFinanceIntraDay` has that motivated
-  adding this provider. Tested via `tests/unit/test_ibkr.py` plus a live
+  time out. A pure fetcher like `YahooFinanceIntraDay` (croicu/quant-data#56) — returns raw
+  per-bar dicts, no `OHLCV`/data-quality determination. `stage/parsers/ibkr_parser.py` marks every
+  parsed bar `ACCEPTED`, no zero-volume-as-incomplete heuristic (unlike yfinance's parser): IBKR
+  only returns bars it actually has trade data for, so a zero-volume bar is a real "no trades that
+  minute" fact, not a synthesized placeholder — this is exactly the gap `YahooFinanceIntraDay` has
+  that motivated adding this provider. Tested via `tests/unit/test_ibkr.py` plus a live
   `tests/integration/test_ibkr.py` probe against a real Gateway (requires one running and
   reachable at the configured host/port — that test fails, not skips, without one, same as any
   other integration test in this repo hitting a real external dependency). **Wired into `ingest`**
@@ -348,7 +368,11 @@ independent top-level packages.
   `shared/providers/massive.py`). Stateless per-call HTTP like `YahooFinanceIntraDay` —
   `connect()`/`close()` are no-ops, unlike `IBKRIntraDay`'s persistent Gateway connection. Like
   IBKR, only returns bars it actually has trade data for (no synthetic/NaN placeholder rows), so
-  every fetched bar is `DataQuality.ACCEPTED`. Free Basic tier documents a 5 calls/minute rate
+  `stage/parsers/massive_parser.py` marks every parsed bar `DataQuality.ACCEPTED`. Unlike the other
+  two providers, `fetch_bars` archives the literal raw API response unchanged (croicu/
+  quant-data#56 removed the in-provider `OHLCV` parsing/sorting that used to happen here too —
+  `massive_parser.py` now owns both, sorting chronologically since the API's own `results` order
+  isn't guaranteed downstream of this layer). Free Basic tier documents a 5 calls/minute rate
   limit; `settings.massive.rateLimit` (defaulting to `5`/`60`, always applied like IBKR's own
   default) paces calls pre-emptively via the same `RateLimiter` mechanism as `ingest`'s other
   providers, and `MassiveIntraDay` itself also retries on HTTP 429 (3 attempts, 15s apart) as a
@@ -363,19 +387,20 @@ independent top-level packages.
 
 ### `ingest`
 
-`cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up | --backfill] [--ticker TICKER]`:
+`cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER]`:
 fetches bars over an inclusive date range from every provider named in `settings.providers`
 (default `["yfinance"]`; `IntraDayProvider` instances built by `_build_provider`/
 `_default_providers`, or injected directly via `main`'s `providers: dict[str, IntraDayProvider]`
-parameter) and writes each provider's bars into `staging_market_data_1min` via an injected
-`PostgresDatabase` factory (defaults to constructing one from `settings.postgres`). **Writes go to
-staging only** — `quant-ingest` never writes `fact_market_data_1min` directly (issue #22); a
-separate, not-yet-built `quant-reconcile` tool owns promoting agreeing staging rows into
-`fact_market_data_1min` (see `tasks/ibkr-provider-reconciliation.md`; supersedes that file's
-earlier "reconciliation folded into `--catch-up`" idea — reconciliation is its own CLI now, not a
-mode of `quant-ingest`). Both `providers` and the database factory are constructor-injectable per
-this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests/mocks/yfinance.py`,
-`tests/mocks/postgres.py`) instead of patching `ingest`'s own internals.
+parameter) and archives each successful fetch to `quant_ingest`'s `provider_source_archive` via an
+injected `ProviderSourceArchiveWriter` factory (defaults to constructing one from
+`settings.postgres`). **As of croicu/quant-data#56, `quant-ingest` writes to `quant_ingest` only —
+it no longer touches `quant_data` at all**, not even `staging_market_data_1min`. A separate
+`quant-stage` process (see below) reads what's archived here and turns it into staging rows; a
+further, still-separate `quant-reconcile` tool owns promoting agreeing staging rows into
+`fact_market_data_1min` (see `tasks/quant-reconcile.md`). Both `providers` and the archive-writer
+factory are constructor-injectable per this repo's DI-over-monkeypatching convention, so tests
+substitute fakes (`tests/mocks/yfinance.py`, `tests/mocks/provider_source_archive.py`) instead of
+patching `ingest`'s own internals.
 
 - `--ticker` is optional — omit it to fetch every ticker in `settings.tickers` instead of one.
 - `--end-date` is optional — omit it (with `--start-date` given) for a single day. `--end-date`
@@ -385,61 +410,50 @@ this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests
   range, it re-fetches the trailing `settings.catchUpLookbackDays` days (default 7), excluding
   today (computed via an injectable `today: Callable[[], date]` parameter on `main`, defaulting to
   `date.today`, per this repo's clock-injection convention). Deliberately does no gap
-  *detection* — it just re-runs the same per-day fetch+write for the whole window unconditionally.
-  Because `write_staging_bars` upserts on `(provider_id, ticker_id, date_id, time_id)`,
-  re-ingesting an already-complete day is a harmless no-op; a day a prior run only partially
-  ingested (e.g. `quant-ingest` run manually mid-session, or interrupted) gets filled in. This is
-  the first concrete job to come out of the scheduled-jobs brainstorm (`tasks/scheduled_jobs.md`,
+  *detection* — it just re-runs the same per-day fetch+archive for the whole window
+  unconditionally; `provider_source_archive` has no uniqueness constraint on `(ticker, provider,
+  trading_date)`, so a re-fetch of an already-archived day is simply a new row, not an error. This
+  is the first concrete job to come out of the scheduled-jobs brainstorm (`tasks/scheduled_jobs.md`,
   issue #3) — deliberately the narrowest slice of it: no jobs table, no in-DB scheduling mechanism,
   just a CLI flag. Actually running it nightly means wiring a cron/systemd timer on whatever host
   runs it, which stays outside this public repo per that brainstorm's design lean (box-specific
   scheduling detail shouldn't leak into committed source).
+- **`--backfill` is not currently supported here.** It existed before croicu/quant-data#56 (walking
+  each ticker backward toward `dataset_inception.inception_date`, tracked via
+  `PostgresDatabase.fetch_dataset_inception_date`/`fetch_earliest_covered_date` — both `quant_data`
+  reads), but that bookkeeping spans both `quant_data` and `quant_ingest` in a way the split didn't
+  resolve: `fetch_earliest_covered_date`'s `MIN` over `staging_market_data_1min` ∪
+  `fact_market_data_1min` is what `stage` now owns, not `ingest`, while "how far back has this
+  ticker been *fetched*" would need to live in `quant_ingest`'s own `archive_coverage` instead
+  (which already tracks it per-provider, unlike the old per-ticker-only query) — plus
+  `dataset_inception` itself would need duplicating into `quant_ingest` or `ingest` would need a
+  read-only `quant_data` dependency again. Deliberately left as a follow-up rather than deciding it
+  unprompted mid-split — see the issue.
 - Every configured provider is `connect()`ed once at the start of the run (see
-  `IntraDayProvider.connect()`/`close()`) and `close()`d in the `finally` alongside the database
-  connection — amortized across the whole batch, not reconnected per (ticker, date). A provider
-  that fails to `connect()` (e.g. IBKR Gateway not running) is dropped from the run entirely
-  (logged as a warning) rather than aborting it; if every configured provider fails to connect,
-  that *does* abort the run (`AppError`, no data source left to use).
-- One Postgres connection is opened for the whole run and reused across every (ticker, date) pair.
-- Fetch and write are attempted independently **per provider, per (ticker, date) pair** — one
+  `IntraDayProvider.connect()`/`close()`) and `close()`d in the `finally` alongside the archive
+  writer — amortized across the whole batch, not reconnected per (ticker, date). A provider that
+  fails to `connect()` (e.g. IBKR Gateway not running) is dropped from the run entirely (logged as
+  a warning) rather than aborting it; if every configured provider fails to connect, that *does*
+  abort the run (`AppError`, no data source left to use).
+- One `quant_ingest` connection is opened for the whole run and reused across every (ticker, date)
+  pair. `_default_archive_writer_factory` raises `AppError` if `settings.postgres.archiveDbname`
+  isn't configured — unlike before the split, there's no staging write to gracefully fall back to,
+  so an unconfigured archive database means `quant-ingest` has nothing to do at all.
+- Fetch and archive are attempted independently **per provider, per (ticker, date) pair** — one
   provider failing (bad ticker on that source, no data for that day, e.g. a weekend, a gateway
-  hiccup) doesn't stop the others from still writing their own `staging_market_data_1min` rows for
-  the same (ticker, date); a (ticker, date) pair only counts as failed if *every* configured
-  provider failed it. `_ingest_one` logs the fetch step and the write step separately, and fetch
+  hiccup, or its archive write failing) doesn't stop the others from still archiving their own data
+  for the same (ticker, date); a (ticker, date) pair only counts as failed if *every* configured
+  provider failed it. Note this is a real behavior change from before the split: archiving used to
+  be a tolerated secondary step (a failed `record_fetch` didn't sink the staging write it preceded),
+  but archiving is now the entire job, so a provider's archive-write failure is treated exactly like
+  a fetch failure. `_ingest_one` logs the fetch step and the archive step separately, and fetch
   failures are tagged by provider (`_FETCH_FAILURE_CATEGORY`: `yfinance` ->
   `quant_data._internal.shared.providers.yfinance.CATEGORY_YFINANCE`, `ibkr` ->
   `quant_data._internal.shared.providers.ibkr.CATEGORY_IBKR`, `massive` ->
   `quant_data._internal.shared.providers.massive.CATEGORY_MASSIVE`) so a fetch problem stays
-  filterable by which provider it came from, apart from a Postgres write problem — all still count
+  filterable by which provider it came from, apart from an archive-write problem — all still count
   the same toward the exit code today (see `tasks/ingest_error_classification.md` for the postponed
   work on making that distinction affect the exit code itself).
-- **`ingestion_coverage` write path** (croicu/quant-data#31, shipped 2026-08-16) — right after a
-  provider's fetch *and* write both succeed for a `(ticker, date)`, `_ingest_one` calls
-  `database.record_ingestion_coverage(provider_name, ticker, target_date)`. Before this, the table
-  was only ever populated by `008`'s one-time migration backfill and went stale the moment real
-  ingestion resumed — concretely surfaced twice in one session live-testing `massive` (issue #44):
-  `SPY` then `QQQ` each needed a hand-written `INSERT` before `quant-reconcile`'s
-  candidate-confirmed-absence path (issue #49) could do anything, since it depends entirely on
-  `ingestion_coverage` actually reflecting reality. `PostgresDatabase.record_ingestion_coverage`
-  resolves `(ticker_id, provider_id, date_id)`, finds every existing range that already contains or
-  is immediately adjacent to `date_id` (0, 1, or 2 rows — 2 only when the new date exactly bridges
-  two previously-separate ranges), and either no-ops (already covered), extends the one touching
-  range, or merges two touching ranges into one — never leaves one row per day. Recording coverage
-  failing on its own (a separate round trip from the staging write) is logged and skipped, not
-  fatal to that `(ticker, date)` pair — matching this file's existing per-step fetch/write failure
-  tolerance. Live-verified against CroicuWS1: ingesting one more day for an already-covered
-  `(SPY, massive)` range extended the existing row in place (`2026-07-23`-`2026-08-05` →
-  `2026-07-23`-`2026-08-06`) rather than creating a second one.
-- **`quant_ingest` archiving** (croicu/quant-data#52) — right after a provider's `fetch_bars` call
-  succeeds, *before* the staging write, `_ingest_one` calls `archive_writer.record_fetch(...)` if
-  `settings.postgres.archiveDbname` is configured (a `ProviderSourceArchiveWriter`, built by
-  `_default_archive_writer_factory`/injectable via `main`'s `archive_writer_factory` parameter, the
-  same DI pattern as `database_factory`). Ordered before the staging write deliberately: even a bug
-  in this repo's own parsing/staging code can't lose what the provider already returned, since it's
-  already durably archived by that point. Both a missing `archiveDbname` and a failed connection or
-  a failed `record_fetch` degrade the same way — logged and skipped, `quant-ingest` still writes to
-  staging exactly as it did before this feature existed. See `docs/SCHEMA.md`'s `quant_ingest
-  database` section for the schema this writes to.
 - `settings.providers` (`list[str]`, lowercased, default `["yfinance"]`) is a flat global list —
   the same providers run for every ticker in a given invocation; there's no per-ticker provider
   override (see `tasks/ibkr-provider-reconciliation.md`'s now-resolved "currently configured
@@ -451,25 +465,6 @@ this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests
   `host`/`port`/`client_id`, all defaulting to `IBKRIntraDay`'s own module-level defaults) is only
   consulted when `"ibkr"` is configured; `settings.massive` (`MassiveSettings`: `api_key` required,
   `rate_limit` defaulting to `5`/`60`) is only consulted when `"massive"` is configured.
-- **`--backfill`** — a fourth, mutually-exclusive way to pick dates (croicu/quant-data#28), for
-  extending existing coverage backward toward `dataset_inception.inception_date` rather than
-  fetching a caller-specified range. Per invocation, for each configured ticker: fetch that
-  ticker's current earliest covered date (`PostgresDatabase.fetch_earliest_covered_date`, `MIN`
-  over `staging_market_data_1min` ∪ `fact_market_data_1min`; `None` for a never-ingested ticker),
-  then walk backward one `settings.backfillChunkDays`-sized chunk (default `1`) —
-  `end_date = reference_date - 1 day`, `start_date = max(inception_date, end_date - chunkDays +
-  1)`, where `reference_date` is the earliest covered date, or `today` if the ticker has never
-  been ingested at all (auto-bootstrapping its first chunk from the same "excludes today"
-  convention `--catch-up` already uses, via the same injectable `today` callable). A ticker
-  already at `inception_date` is a no-op, symmetric to `--catch-up`'s no-op-on-complete-days
-  behavior. **Round-robin, not sequential-to-completion**: every configured ticker advances
-  exactly one chunk per invocation (never drained to `inception_date` before the next ticker is
-  touched), since `earliest_covered` is recomputed fresh each run — coverage depth grows evenly
-  across the whole configured universe, tolerating being interrupted or resource-capped at any
-  point. No new progress-tracking table — everything above is derived from existing data, same
-  idempotent-upsert guarantee `--catch-up` already relies on. `PostgresDatabase.fetch_dataset_inception_date`
-  raises `AppError` if `dataset_inception` has no row — that table is schema-only as of migration
-  `007`, so `--backfill` cannot run until a real `inception_date` value is inserted by hand.
 - **Internal rate limiting** — `ingest.rate_limiter.RateLimiter` (sliding window: at most
   `requests_per_window` calls per rolling `window_seconds`, `collections.deque` of recent call
   timestamps, constructor-injected `clock`/`sleep` per this repo's DI-over-monkeypatching
@@ -489,6 +484,62 @@ this repo's DI-over-monkeypatching convention, so tests substitute fakes (`tests
   here is the primary defense, the provider's own retry is a backstop for the cases it doesn't
   strictly hold. `YfinanceSettings.rate_limit` defaults to `None`
   (unlimited), matching yfinance's current unbounded behavior.
+
+### `stage`
+
+`cli.py` — `quant-stage [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER]`
+(croicu/quant-data#56): the second half of what used to be a single `quant-ingest` process. For
+every provider in `settings.providers`, reads the most recently archived fetch for each (ticker,
+date) via an injected `ProviderSourceArchiveReader` factory, dispatches the payload to
+`stage.parsers.parse_payload(provider, payload, ticker)` for `OHLCV` construction, and writes the
+result to `quant_data.staging_market_data_1min` via an injected `PostgresDatabase` factory — the
+same `write_staging_bars`/`record_ingestion_coverage` calls `ingest` used to make directly before
+the split. CLI shape (argument parsing, date-range/`--catch-up` resolution) mirrors `quant-ingest`'s
+own closely, duplicated rather than shared: both are separate top-level, console-script-only
+packages per this repo's public/private-split convention, and the argparse logic is small enough
+that extracting a shared helper across two console-only packages wasn't judged worth the added
+cross-package import (see CLAUDE.md's Coding Style — wait for real duplication pain, not the first
+instance of it). Same `--backfill` gap as `ingest` for the same reason (see above) — not supported
+here either.
+
+- **`parsers/`** — one module per provider (`yfinance_parser.py`, `ibkr_parser.py`,
+  `massive_parser.py`), each exposing `parse(payload: dict, ticker: str) -> list[OHLCV]`. This is
+  where the `OHLCV`/data-quality logic that used to live in the provider classes now lives:
+  `yfinance_parser.py` reproduces the old NaN-or-zero-volume -> `DataQuality.INCOMPLETE` heuristic,
+  now reading a raw field of `None` (yfinance's own NaN, preserved through the archive as JSON
+  `null`) instead of a value the provider already coerced; `ibkr_parser.py`/`massive_parser.py`
+  mark every parsed bar `ACCEPTED` (no synthetic/NaN placeholder rows from either source), and
+  `massive_parser.py` also does the chronological sort that used to happen in the provider.
+  `parsers/__init__.py`'s `parse_payload` dispatches by provider name (a plain dict lookup,
+  `{"yfinance": yfinance_parser.parse, "ibkr": ibkr_parser.parse, "massive":
+  massive_parser.parse}`), raising `AppError` for an unregistered provider — a safety net if a new
+  `IntraDayProvider` is ever added to `ingest` without a matching `stage` parser.
+- A `(ticker, provider, date)` with nothing archived (`ProviderSourceArchiveReader.fetch_latest_bars`
+  returns `None`) is skipped, not treated as an error — going and fetching it is `ingest`'s job, not
+  `stage`'s; a bar only actually reaches `staging_market_data_1min` once both processes have run.
+- **Weekend dates are skipped outright** (`_is_weekend`, `target_date.weekday() >= 5`), before ever
+  consulting the archive — not counted toward `succeeded`/`failed` either. `ingest` deliberately
+  still fetches/archives them (no change there): IBKR's `reqHistoricalData` doesn't fail for a
+  weekend `target_date`, it silently returns the *prior trading day's* full session instead
+  (confirmed live, 2026-08-17 — requesting `2026-08-15`/`2026-08-16` both archived `2026-08-14`'s
+  bars again under a different `trading_date` key). Since staging keys by each bar's own real
+  timestamp, not the requested date, actually staging a weekend's archived row would just be a
+  redundant re-upsert of a trading day already staged correctly under its own date — this skip
+  avoids that wasted round trip. Deliberately a plain calendar-weekday check, not a session-time
+  heuristic — doesn't reintroduce the kind of US-equities-market-hours assumption `--catch-up`'s own
+  design note (in the `ingest` section above) explicitly avoided baking into a schema with no
+  session concept.
+- **`ingestion_coverage` write path** (croicu/quant-data#31, moved here from `ingest` by
+  croicu/quant-data#56) — right after a provider's parse *and* staging write both succeed for a
+  `(ticker, date)`, `_stage_one` calls `database.record_ingestion_coverage(provider_name, ticker,
+  target_date)`. Moved here because the table describes `staging_market_data_1min` coverage, which
+  `stage` now owns writing — `ingest` writing it would no longer make sense once `ingest` stopped
+  touching `quant_data` at all. Same coalescing behavior as before the move
+  (`PostgresDatabase.record_ingestion_coverage` resolves `(ticker_id, provider_id, date_id)`, finds
+  every existing range that already contains or is immediately adjacent to `date_id`, and either
+  no-ops, extends the one touching range, or merges two touching ranges into one). Recording
+  coverage failing on its own is logged and skipped, not fatal to that `(ticker, date)` pair,
+  matching this file's existing per-step failure tolerance.
 
 ### `reconcile`
 
