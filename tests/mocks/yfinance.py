@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
 from quant_data._internal.shared.errors import AppError
-from quant_data._internal.shared.providers.payload import parsed_bars_payload
-from quant_data.protocols import OHLCV, DataQuality
+from quant_data._internal.shared.providers.payload import raw_bars_payload
 
 DEFAULT_DATA_PATH = Path(__file__).parent.parent / "data" / "ohlcv_bars.json"
 
@@ -28,6 +27,8 @@ class MockIntraDayProvider:
         self.closed = True
 
     def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
+        # Pure fetch, matching the real providers post-split (croicu/quant-data#56) -- returns raw
+        # per-bar dicts, no OHLCV construction.
         normalized_ticker = ticker.upper()
 
         ticker_data = self._bars_by_ticker.get(normalized_ticker)
@@ -38,19 +39,17 @@ class MockIntraDayProvider:
         if day_data is None:
             raise AppError(f"No data available for '{normalized_ticker}' on {target_date.isoformat()}.")
 
-        bars: list[OHLCV] = []
+        raw_bars: list[dict] = []
         for bar_data in day_data:
-            timestamp_utc = datetime.fromisoformat(bar_data["timestamp"])
-            bar = OHLCV(
-                ticker=normalized_ticker,
-                timestamp=timestamp_utc,
-                open=float(bar_data["open"]),
-                high=float(bar_data["high"]),
-                low=float(bar_data["low"]),
-                close=float(bar_data["close"]),
-                volume=int(bar_data["volume"]),
-                data_quality=DataQuality(bar_data.get("data_quality", "accepted")),
+            raw_bars.append(
+                {
+                    "timestamp": bar_data["timestamp"],
+                    "open": bar_data["open"],
+                    "high": bar_data["high"],
+                    "low": bar_data["low"],
+                    "close": bar_data["close"],
+                    "volume": bar_data["volume"],
+                }
             )
-            bars.append(bar)
 
-        return ProviderFetchResult(bars=bars, payload=parsed_bars_payload(bars), payload_kind=PayloadKind.PARSED_BARS)
+        return ProviderFetchResult(payload=raw_bars_payload(raw_bars), payload_kind=PayloadKind.PARSED_BARS)

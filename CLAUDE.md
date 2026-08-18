@@ -444,6 +444,63 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
+- **Split `quant-ingest` into `ingest` (fetch + archive) and `stage` (archive → staging)** —
+  [issue #56](https://github.com/croicu/quant-data/issues/56), `status:implementation`, ad-hoc task
+  (opened directly, no `tasks/*.md`), picked up the same session it was proposed. #52 shipped
+  `provider_source_archive` but explicitly deferred this exact split as a follow-on; picking it up
+  meant resolving its three open questions first: **CLI shape** — `src/stage/` is a new top-level
+  package (console script `quant-stage`, no importable surface, same convention as `src/ingest/`),
+  not a flag on `quant-ingest`. **Parsing location** — moved entirely out of the provider classes
+  and into `stage`; `ProviderFetchResult` dropped its `bars` field (see the #52 entry above),
+  providers (`yfinance.py`/`ibkr.py`/`massive.py`) are now pure fetchers, and the actual
+  `OHLCV`/data-quality logic (yfinance's NaN-or-zero-volume -> `INCOMPLETE` heuristic in particular)
+  moved to new `stage/parsers/{yfinance,ibkr,massive}_parser.py` modules, dispatched by
+  `stage/parsers/__init__.py`'s `parse_payload(provider, payload, ticker)`. yfinance's raw payload
+  now preserves `NaN` as JSON `null` instead of coercing to `0.0` at fetch time — a small
+  information-loss fix that fell out of the split, not a separately-scoped goal. **Rollout** —
+  atomic: both processes landed in the same PR/branch (`split-ingest-stage`), since staging would
+  get zero new data if `ingest`-only shipped first. `quant-ingest` now writes to `quant_ingest`
+  only (no `quant_data` dependency at all — `_default_archive_writer_factory` raises if
+  `archiveDbname` isn't configured, since there's nothing else for it to do); `quant-stage` reads
+  `provider_source_archive` via a new `ProviderSourceArchiveReader` (picks the latest-`fetched_at`
+  row per `(ticker, provider, trading_date)`, since the table has no uniqueness constraint on that
+  key) and calls the same `write_staging_bars`/`record_ingestion_coverage` `quant-ingest` used to
+  call directly — `ingestion_coverage`'s write path (#31) moved to `stage` accordingly, since it now
+  describes `stage`'s own write, not `ingest`'s. A real behavior change: an archive-write failure
+  used to be a tolerated secondary problem (staging still got its normal chance); now archiving is
+  `ingest`'s entire job, so it's treated exactly like a fetch failure. **`--backfill` deliberately
+  dropped, not carried over** — its old bookkeeping (`dataset_inception`/earliest-covered-date)
+  spanned both databases in a way the split didn't resolve on its own (see `docs/ARCHITECTURE.md`'s
+  `ingest` section for the specific reasoning); flagged as a follow-up rather than silently designed
+  mid-split. `pyproject.toml` gained a `quant-stage = "stage.cli:main"` entry; `pip install -e
+  ".[dev]"` re-run to pick it up. `docs/ARCHITECTURE.md`/`docs/PROTOCOL.md` updated for the new
+  two-process shape. Live-verified end-to-end against CroicuWS2's local database (freshly
+  clean-slate reset the same session): `quant-ingest --ticker SPY --start-date 2026-08-14` archived
+  960 IBKR bars to `quant_ingest`, `quant-stage` with the same arguments then parsed and staged all
+  960 into `quant_data.staging_market_data_1min`, `data_quality` all `accepted`, spot-checked
+  against the raw values. `ruff`/`pytest` both green (287 tests, including the two live integration
+  probes against real yfinance/IB Gateway on this box). Not yet committed — sitting on branch
+  `split-ingest-stage`, awaiting the repo owner's diff review per this file's "Before committing"
+  rule.
+
+  **Follow-on fix, same session**: a real ingest of `SPY` `2026-08-02`–`2026-08-16` surfaced a
+  genuine IBKR quirk — `reqHistoricalData` doesn't fail for a weekend `target_date`, it silently
+  returns the *prior trading day's* full session instead (confirmed live: requesting
+  `2026-08-15`/`2026-08-16` both archived `2026-08-14`'s bars again under a different
+  `trading_date` key; requesting `2026-08-02`, the boundary Sunday, pulled in `2026-07-31`'s
+  session — a day outside the requested range entirely). Since `stage` writes staging rows keyed
+  by each bar's own real timestamp (not the requested date), this was harmless to data
+  correctness — just wasted archive rows and redundant staging round trips. Fixed per explicit
+  direction: **keep `ingest` fetching/archiving weekends as before** (no change there), but
+  **`stage` now skips weekend dates outright** (`_is_weekend`, plain `weekday() >= 5` check) before
+  ever consulting the archive — not counted toward its `succeeded`/`failed` totals either.
+  Deliberately a calendar check, not a session-time heuristic, so it doesn't reintroduce the kind
+  of US-equities-market-hours assumption `--catch-up`'s own design note already avoids baking into
+  a schema with no session concept. Live-reverified: re-running `quant-stage` over the same range
+  logged 5 weekend skips and left `staging_market_data_1min` unchanged (still 11 distinct days,
+  10,560 bars for `SPY`) — confirming the fix eliminates the redundant work without disturbing
+  already-correct data.
+
 - **Immutable provider-fetch archive in a new `quant_ingest` database** —
   [issue #52](https://github.com/croicu/quant-data/issues/52), `status:implementation`. A separate
   database (not a table/schema inside `quant_data`) holding the immutable, append-only record of
@@ -466,7 +523,9 @@ under `/local/` to the box:
   `archive_coverage` is the archive-side equivalent of `ingestion_coverage`/#31, keyed by
   `(ticker, provider, fetch_version)` instead of just `(ticker, provider)`, so a version bump
   doesn't silently extend an old range. `IntraDayProvider.fetch_bars` now returns
-  `ProviderFetchResult` (bars + payload + payload_kind) instead of a bare `list[OHLCV]`, and gained
+  `ProviderFetchResult` (bars + payload + payload_kind) instead of a bare `list[OHLCV]` —
+  **update, 2026-08-17: `bars` was dropped by #56** (see that entry below), so this is now
+  `payload` + `payload_kind` only — and gained
   a `FETCH_VERSION: str` class attribute each provider bumps by hand when its own request
   construction changes. `ProviderSourceArchiveWriter` (new, not a `PostgresDatabase` method — no
   star-schema dependency at all) writes both tables in one transaction, called from `_ingest_one`

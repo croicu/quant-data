@@ -11,22 +11,20 @@ from pathlib import Path
 from quant_data._internal.contracts import IntraDayProvider
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
-from quant_data._internal.shared.postgres import PostgresDatabase
 from quant_data._internal.shared.provider_source_archive import ProviderSourceArchiveWriter
 from quant_data._internal.shared.providers.ibkr import CATEGORY_IBKR, IBKRIntraDay
 from quant_data._internal.shared.providers.massive import CATEGORY_MASSIVE, MassiveIntraDay
 from quant_data._internal.shared.providers.yfinance import CATEGORY_YFINANCE, YahooFinanceIntraDay
 from quant_data._internal.shared.settings import PostgresSettings, RateLimitSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
-from quant_data.protocols import DataQuality
 
 from .rate_limiter import RateLimiter
 
 CATEGORY_INGEST = "ingest"
 
 # Per-provider fetch-failure log category, so a Yahoo vs. IBKR fetch problem stays filterable
-# apart from a Postgres write problem -- same reasoning _ingest_one's own comment gives for
-# keeping fetch/write failures logged separately in the first place.
+# apart from an archive-write problem -- same reasoning _ingest_one's own comment gives for
+# keeping fetch/archive failures logged separately in the first place.
 _FETCH_FAILURE_CATEGORY: dict[str, str] = {
     "yfinance": CATEGORY_YFINANCE,
     "ibkr": CATEGORY_IBKR,
@@ -40,23 +38,25 @@ class CliArguments:
     start_date: date_type | None = None
     end_date: date_type | None = None
     catch_up: bool = False
-    backfill: bool = False
     debug: bool = False
 
 
 def parse_args(argv: list[str]) -> CliArguments:
     parser = argparse.ArgumentParser(
         prog="quant-ingest",
-        usage="quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up | --backfill] [--ticker TICKER] [--debug]",
+        usage="quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]",
         description=(
             "Fetch 1-minute OHLCV bars for one ticker (with --ticker) or every ticker in "
             "settings.tickers (without --ticker), over an inclusive date range (--start-date alone "
             "means a single day; add --end-date for a range; omit both to use "
-            "settings.startDate/settings.endDate), and store them in quant-data's warehouse. "
-            "--catch-up re-fetches the trailing settings.catchUpLookbackDays days instead, to fill "
-            "in days a prior run only partially ingested. --backfill instead walks each ticker "
-            "backward from its current earliest covered date toward dataset_inception, one "
-            "settings.backfillChunkDays chunk per ticker per invocation."
+            "settings.startDate/settings.endDate), and archive them to quant_ingest's "
+            "provider_source_archive. --catch-up re-fetches the trailing "
+            "settings.catchUpLookbackDays days instead, to fill in days a prior run only partially "
+            "covered. This process only fetches and archives -- it does not write to quant_data's "
+            "staging_market_data_1min; run quant-stage afterward to turn archived fetches into "
+            "staging rows (croicu/quant-data#56). --backfill is not yet supported here post-split "
+            "-- its bookkeeping (dataset_inception, earliest-covered-date) spanned both databases "
+            "and needs its own design; see the issue."
         ),
     )
 
@@ -68,12 +68,6 @@ def parse_args(argv: list[str]) -> CliArguments:
         action="store_true",
         default=False,
         help="re-fetch the trailing settings.catchUpLookbackDays days (excluding today) instead of a date range",
-    )
-    parser.add_argument(
-        "--backfill",
-        action="store_true",
-        default=False,
-        help="walk each ticker backward from its current earliest covered date toward dataset_inception, one settings.backfillChunkDays chunk per invocation",
     )
     parser.add_argument(
         "--debug",
@@ -89,12 +83,6 @@ def parse_args(argv: list[str]) -> CliArguments:
 
     if args.catch_up and (args.start_date is not None or args.end_date is not None):
         parser.error("--catch-up cannot be combined with --start-date/--end-date.")
-
-    if args.backfill and (args.start_date is not None or args.end_date is not None):
-        parser.error("--backfill cannot be combined with --start-date/--end-date.")
-
-    if args.backfill and args.catch_up:
-        parser.error("--backfill cannot be combined with --catch-up.")
 
     start_date: date_type | None = None
     end_date: date_type | None = None
@@ -115,7 +103,7 @@ def parse_args(argv: list[str]) -> CliArguments:
         if end_date < start_date:
             parser.error(f"--end-date ({end_date.isoformat()}) must not be before --start-date ({start_date.isoformat()}).")
 
-    return CliArguments(ticker=args.ticker, start_date=start_date, end_date=end_date, catch_up=args.catch_up, backfill=args.backfill, debug=args.debug)
+    return CliArguments(ticker=args.ticker, start_date=start_date, end_date=end_date, catch_up=args.catch_up, debug=args.debug)
 
 
 def _date_range(start_date: date_type, end_date: date_type) -> list[date_type]:
@@ -127,24 +115,9 @@ def _date_range(start_date: date_type, end_date: date_type) -> list[date_type]:
     return dates
 
 
-def _default_database_factory(postgres_settings: PostgresSettings) -> PostgresDatabase:
-    transport = resolve_transport(
-        host=postgres_settings.host,
-        port=postgres_settings.port,
-        ssh_user=postgres_settings.ssh_user,
-        ssh_key_path=postgres_settings.ssh_key_path,
-    )
-    return PostgresDatabase(
-        transport=transport,
-        user=postgres_settings.user,
-        password=postgres_settings.password,
-        dbname=postgres_settings.dbname,
-    )
-
-
-def _default_archive_writer_factory(postgres_settings: PostgresSettings) -> ProviderSourceArchiveWriter | None:
+def _default_archive_writer_factory(postgres_settings: PostgresSettings) -> ProviderSourceArchiveWriter:
     if postgres_settings.archive_dbname is None:
-        return None
+        raise AppError("settings.postgres.archiveDbname is required to run quant-ingest -- there is nowhere to archive fetches to without it.")
     transport = resolve_transport(
         host=postgres_settings.host,
         port=postgres_settings.port,
@@ -203,27 +176,24 @@ def _default_rate_limiters(settings: Settings) -> dict[str, RateLimiter]:
 
 def _ingest_one(
     providers: dict[str, IntraDayProvider],
-    database: PostgresDatabase,
+    archive_writer: ProviderSourceArchiveWriter,
     rate_limiters: dict[str, RateLimiter],
     ticker: str,
     target_date: date_type,
-    archive_writer: ProviderSourceArchiveWriter | None = None,
 ) -> int | None:
-    # Fetch and write failures are logged separately (rather than one catch-all at the call
+    # Fetch and archive failures are logged separately (rather than one catch-all at the call
     # site) so the log category actually reflects where the failure came from -- both raise the
     # same AppError type, so a single shared catch couldn't tell a fetch problem (e.g. a weekend,
-    # or a bad ticker -- indistinguishable from each other today) apart from a Postgres write
-    # problem (e.g. a date outside the populated dim_date range). Each configured provider writes
-    # independently to staging_market_data_1min, blind to what other providers wrote for the same
-    # bar -- one provider failing (bad ticker on that source, gateway unreachable, ...) doesn't
-    # stop the others from still writing their own data for this (ticker, date).
+    # or a bad ticker -- indistinguishable from each other today) apart from an archive-write
+    # problem. Each configured provider is fetched and archived independently, blind to what other
+    # providers returned for the same day -- one provider failing (bad ticker on that source,
+    # gateway unreachable, ...) doesn't stop the others from still archiving their own data for
+    # this (ticker, date).
     Logger.diagnostic(
         f"quant-ingest: starting {ticker.upper()} on {target_date.isoformat()}.",
         category=CATEGORY_INGEST,
     )
 
-    total_written = 0
-    total_incomplete = 0
     any_provider_succeeded = False
 
     for provider_name, provider in providers.items():
@@ -240,77 +210,41 @@ def _ingest_one(
             )
             continue
 
-        bars = fetch_result.bars
-
-        # Archived immediately after a successful fetch, before the staging write -- so even a
-        # bug in this repo's own parsing/staging code can't lose what the provider already
-        # returned (croicu/quant-data#52). Failing to archive is recoverable (the fetch itself
-        # succeeded, and staging still gets its normal chance below) -- logged and skipped, not
-        # fatal to this (ticker, date, provider).
-        if archive_writer is not None:
-            try:
-                archive_writer.record_fetch(
-                    ticker=ticker,
-                    provider=provider_name,
-                    trading_date=target_date,
-                    fetch_version=provider.FETCH_VERSION,
-                    payload_kind=fetch_result.payload_kind,
-                    payload=fetch_result.payload,
-                )
-            except AppError as error:
-                Logger.warning(
-                    f"quant-ingest: failed to record provider source archive for '{ticker.upper()}' "
-                    f"on {target_date.isoformat()} via '{provider_name}': {error}",
-                    category=CATEGORY_INGEST,
-                )
-
         try:
-            written = database.write_staging_bars(provider_name, bars)
+            archive_writer.record_fetch(
+                ticker=ticker,
+                provider=provider_name,
+                trading_date=target_date,
+                fetch_version=provider.FETCH_VERSION,
+                payload_kind=fetch_result.payload_kind,
+                payload=fetch_result.payload,
+            )
         except AppError as error:
             Logger.warning(
-                f"quant-ingest: failed to write staging bars for '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
+                f"quant-ingest: failed to record provider source archive for '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
                 category=CATEGORY_INGEST,
             )
             continue
 
-        # Coverage is recorded only after both fetch and write succeeded -- a provider's fetch
-        # completing without raising (any bar count, including zero) is what "covered" means
-        # (croicu/quant-data#31), and the write must have actually landed too. Failing to record
-        # coverage is recoverable (the bars themselves are already safely in staging either way) --
-        # logged and skipped, not fatal to this (ticker, date) pair.
-        try:
-            database.record_ingestion_coverage(provider_name, ticker, target_date)
-        except AppError as error:
-            Logger.warning(
-                f"quant-ingest: failed to record ingestion coverage for '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
-                category=CATEGORY_INGEST,
-            )
-
         any_provider_succeeded = True
-        total_written += written
-        for bar in bars:
-            if bar.data_quality != DataQuality.ACCEPTED:
-                total_incomplete += 1
 
     if not any_provider_succeeded:
         return None
 
     Logger.info(
-        f"quant-ingest: wrote {total_written} staging bars for {ticker.upper()} on {target_date.isoformat()} "
-        f"across {len(providers)} provider(s) ({total_incomplete} incomplete).",
+        f"quant-ingest: archived {ticker.upper()} on {target_date.isoformat()} across {len(providers)} provider(s).",
         category=CATEGORY_INGEST,
     )
-    return total_written
+    return 0
 
 
 def main(
     argv: list[str] | None = None,
     settings_path: Path | None = None,
     providers: dict[str, IntraDayProvider] | None = None,
-    database_factory: Callable[[PostgresSettings], PostgresDatabase] | None = None,
-    today: Callable[[], date_type] | None = None,
     rate_limiters: dict[str, RateLimiter] | None = None,
-    archive_writer_factory: Callable[[PostgresSettings], ProviderSourceArchiveWriter | None] | None = None,
+    archive_writer_factory: Callable[[PostgresSettings], ProviderSourceArchiveWriter] | None = None,
+    today: Callable[[], date_type] | None = None,
 ) -> int:
     arguments = parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -344,7 +278,7 @@ def main(
         # Connect once per batch (see IntraDayProvider.connect()'s own docstring) rather than
         # per-call -- a provider that fails to connect (e.g. IBKR Gateway not running) is dropped
         # for the rest of this run instead of aborting it, matching the per-(ticker, date)
-        # fetch/write tolerance below.
+        # fetch/archive tolerance below.
         connected_providers: dict[str, IntraDayProvider] = {}
         for provider_name, provider_instance in active_providers.items():
             try:
@@ -360,96 +294,45 @@ def main(
         if not connected_providers:
             raise AppError("No configured provider could connect -- check settings.providers and each provider's connection settings.")
 
-        active_database_factory = database_factory if database_factory is not None else _default_database_factory
         active_rate_limiters = rate_limiters if rate_limiters is not None else _default_rate_limiters(settings)
         active_archive_writer_factory = archive_writer_factory if archive_writer_factory is not None else _default_archive_writer_factory
 
-        database = active_database_factory(settings.postgres)
-        # A missing archiveDbname setting or a failed connection both degrade the same way --
-        # ingest still writes to staging as before, just without archiving to quant_ingest this
-        # run, rather than aborting the whole run over a secondary, additive feature.
-        try:
-            archive_writer = active_archive_writer_factory(settings.postgres)
-        except AppError as error:
-            Logger.warning(
-                f"quant-ingest: failed to connect to quant_ingest -- provider fetches will not be archived: {error}",
-                category=CATEGORY_INGEST,
-            )
-            archive_writer = None
-        if archive_writer is None and settings.postgres.archive_dbname is None:
-            Logger.warning(
-                "quant-ingest: settings.postgres.archiveDbname is not configured -- "
-                "provider fetches will not be archived to quant_ingest (croicu/quant-data#52).",
-                category=CATEGORY_INGEST,
-            )
+        archive_writer = active_archive_writer_factory(settings.postgres)
+
         succeeded: list[tuple[str, date_type]] = []
         failed: list[tuple[str, date_type]] = []
         try:
-            if arguments.backfill:
+            if arguments.catch_up:
                 active_today = date_type.today() if today is None else today()
-                inception_date = database.fetch_dataset_inception_date()
-
-                for ticker in tickers:
-                    earliest_covered = database.fetch_earliest_covered_date(ticker)
-                    if earliest_covered is not None and earliest_covered <= inception_date:
-                        Logger.info(
-                            f"quant-ingest --backfill: '{ticker.upper()}' already covers back to inception_date ({inception_date.isoformat()}); nothing to do.",
-                            category=CATEGORY_INGEST,
-                        )
-                        continue
-
-                    # A ticker with no existing coverage at all bootstraps from today backward,
-                    # using the same "excludes today" convention as --catch-up above -- this is
-                    # the same formula as the normal case, just with today standing in for
-                    # earliest_covered when there's no prior coverage to walk back from.
-                    reference_date = earliest_covered if earliest_covered is not None else active_today
-                    chunk_end_date = reference_date - timedelta(days=1)
-                    chunk_start_date = max(inception_date, chunk_end_date - timedelta(days=settings.backfill_chunk_days - 1))
-
-                    Logger.info(
-                        f"quant-ingest --backfill: '{ticker.upper()}' fetching {chunk_start_date.isoformat()} to {chunk_end_date.isoformat()}.",
-                        category=CATEGORY_INGEST,
-                    )
-                    for target_date in _date_range(chunk_start_date, chunk_end_date):
-                        written = _ingest_one(connected_providers, database, active_rate_limiters, ticker, target_date, archive_writer)
-                        if written is None:
-                            failed.append((ticker, target_date))
-                        else:
-                            succeeded.append((ticker, target_date))
+                effective_end_date = active_today - timedelta(days=1)
+                effective_start_date = active_today - timedelta(days=settings.catch_up_lookback_days)
+                Logger.info(
+                    f"quant-ingest: catch-up mode, re-fetching {effective_start_date.isoformat()} to {effective_end_date.isoformat()}.",
+                    category=CATEGORY_INGEST,
+                )
+            elif arguments.start_date is not None and arguments.end_date is not None:
+                effective_start_date = arguments.start_date
+                effective_end_date = arguments.end_date
+            elif settings.start_date is not None and settings.end_date is not None:
+                effective_start_date = settings.start_date
+                effective_end_date = settings.end_date
             else:
-                if arguments.catch_up:
-                    active_today = date_type.today() if today is None else today()
-                    effective_end_date = active_today - timedelta(days=1)
-                    effective_start_date = active_today - timedelta(days=settings.catch_up_lookback_days)
-                    Logger.info(
-                        f"quant-ingest: catch-up mode, re-fetching {effective_start_date.isoformat()} to {effective_end_date.isoformat()}.",
-                        category=CATEGORY_INGEST,
-                    )
-                elif arguments.start_date is not None and arguments.end_date is not None:
-                    effective_start_date = arguments.start_date
-                    effective_end_date = arguments.end_date
-                elif settings.start_date is not None and settings.end_date is not None:
-                    effective_start_date = settings.start_date
-                    effective_end_date = settings.end_date
-                else:
-                    raise AppError(
-                        "No date range given and settings.startDate/settings.endDate not configured — "
-                        "pass --start-date/--end-date, --catch-up, --backfill, or configure both settings dates."
-                    )
+                raise AppError(
+                    "No date range given and settings.startDate/settings.endDate not configured — "
+                    "pass --start-date/--end-date, --catch-up, or configure both settings dates."
+                )
 
-                target_dates = _date_range(effective_start_date, effective_end_date)
+            target_dates = _date_range(effective_start_date, effective_end_date)
 
-                for target_date in target_dates:
-                    for ticker in tickers:
-                        written = _ingest_one(connected_providers, database, active_rate_limiters, ticker, target_date, archive_writer)
-                        if written is None:
-                            failed.append((ticker, target_date))
-                        else:
-                            succeeded.append((ticker, target_date))
+            for target_date in target_dates:
+                for ticker in tickers:
+                    result = _ingest_one(connected_providers, archive_writer, active_rate_limiters, ticker, target_date)
+                    if result is None:
+                        failed.append((ticker, target_date))
+                    else:
+                        succeeded.append((ticker, target_date))
         finally:
-            database.close()
-            if archive_writer is not None:
-                archive_writer.close()
+            archive_writer.close()
             for provider_instance in connected_providers.values():
                 provider_instance.close()
 

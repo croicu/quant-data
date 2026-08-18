@@ -8,7 +8,6 @@ import pytest
 
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.providers.ibkr import IBKRIntraDay
-from quant_data.protocols import DataQuality
 
 
 @dataclass
@@ -115,7 +114,9 @@ def test_fetch_bars_wraps_provider_exceptions(mock_ib_class):
 
 
 @patch("quant_data._internal.shared.providers.ibkr.IB")
-def test_fetch_bars_maps_bars_to_ohlcv(mock_ib_class):
+def test_fetch_bars_returns_raw_payload(mock_ib_class):
+    # Pure fetch (croicu/quant-data#56) -- no OHLCV parsing here anymore, that moved to stage's
+    # ibkr parser (see tests/unit/test_stage_parsers.py).
     provider = _connected_provider(mock_ib_class)
     mock_ib_class.return_value.reqHistoricalData.return_value = [
         _FakeBar(
@@ -136,17 +137,13 @@ def test_fetch_bars_maps_bars_to_ohlcv(mock_ib_class):
         ),
     ]
 
-    bars = provider.fetch_bars("aapl", date(2026, 7, 24)).bars
+    payload = provider.fetch_bars("aapl", date(2026, 7, 24)).payload
+    raw_bars = payload["bars"]
 
-    assert len(bars) == 2
-    assert bars[0].ticker == "AAPL"
-    assert bars[0].timestamp == datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc)
-    assert bars[0].volume == 1234
-    assert bars[0].data_quality == DataQuality.ACCEPTED
-    # A real zero-volume IBKR bar (no trades that minute) is not treated as incomplete, unlike
-    # Yahoo's synthetic-gap heuristic.
-    assert bars[1].volume == 0
-    assert bars[1].data_quality == DataQuality.ACCEPTED
+    assert len(raw_bars) == 2
+    assert raw_bars[0]["timestamp"] == "2026-07-24T13:30:00+00:00"
+    assert raw_bars[0]["volume"] == 1234
+    assert raw_bars[1]["volume"] == 0
 
 
 @patch("quant_data._internal.shared.providers.ibkr.IB")
@@ -163,7 +160,6 @@ def test_fetch_bars_normalizes_naive_timestamp_to_utc(mock_ib_class):
         ),
     ]
 
-    bars = provider.fetch_bars("AAPL", date(2026, 7, 24)).bars
+    payload = provider.fetch_bars("AAPL", date(2026, 7, 24)).payload
 
-    assert bars[0].timestamp.tzinfo is not None
-    assert bars[0].timestamp == datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc)
+    assert payload["bars"][0]["timestamp"] == "2026-07-24T13:30:00+00:00"

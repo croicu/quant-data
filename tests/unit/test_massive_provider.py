@@ -9,7 +9,6 @@ from requests.exceptions import HTTPError
 from quant_data._internal.contracts import PayloadKind
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.providers.massive import MassiveIntraDay
-from quant_data.protocols import DataQuality
 
 _TARGET_DATE = date(2026, 7, 31)
 
@@ -50,20 +49,6 @@ class _RecordingSleep:
 
     def __call__(self, seconds: float) -> None:
         self.calls.append(seconds)
-
-
-def test_fetch_bars_parses_and_sorts_chronologically():
-    provider = MassiveIntraDay(api_key="test-key", request_fn=_FixedPayloadRequest(_SAMPLE_PAYLOAD))
-
-    bars = provider.fetch_bars("spy", _TARGET_DATE).bars
-
-    assert len(bars) == 2
-    assert bars[0].timestamp < bars[1].timestamp
-    assert bars[0].ticker == "SPY"
-    assert bars[0].open == 745.06
-    assert bars[0].volume == 6319  # truncated from the fractional 6319.407237
-    assert bars[1].close == 745.4
-    assert bars[0].data_quality == DataQuality.ACCEPTED  # no synthetic/NaN placeholder rows, like IBKR
 
 
 def test_fetch_bars_result_carries_the_literal_raw_payload():
@@ -135,9 +120,9 @@ def test_fetch_bars_retries_on_rate_limit_then_succeeds():
     sleep = _RecordingSleep()
     provider = MassiveIntraDay(api_key="test-key", request_fn=fake_request, sleep_fn=sleep)
 
-    bars = provider.fetch_bars("spy", _TARGET_DATE).bars
+    payload = provider.fetch_bars("spy", _TARGET_DATE).payload
 
-    assert len(bars) == 2
+    assert len(payload["results"]) == 2
     assert sleep.calls == [15.0, 15.0]
 
 
