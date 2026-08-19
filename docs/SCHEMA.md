@@ -157,6 +157,8 @@ identity — see `market_data_archive` below.
 | `volume` | `BIGINT NOT NULL` | `>= 0` |
 | `timestamp` | `TIMESTAMP NOT NULL` | UTC, same as `fact_market_data_1min` |
 | `data_quality` | `TEXT NOT NULL CHECK (data_quality IN ('accepted', 'incomplete', 'rejected'))` | Same meaning as `fact_market_data_1min.data_quality` |
+| `wap`, `trade_count` | `NUMERIC`, `INT CHECK (trade_count IS NULL OR trade_count >= 0)` | Nullable. Added in `018_add_supplement_fields` — see `fact_market_data_1min`'s own row below for the full design; this table just holds each reporting provider's own raw value ahead of promotion. |
+| `avg_bid`, `avg_ask`, `midpoint_open`, `midpoint_high`, `midpoint_low`, `midpoint_close` | `NUMERIC` | Nullable. Added in `018_add_supplement_fields`, same as above. |
 
 Added in `003_add_dim_provider_and_staging`. Holds each provider's raw, as-ingested bars —
 identical bar columns to `fact_market_data_1min`, plus `provider_id` — so multiple providers
@@ -242,9 +244,17 @@ database with empty staging.
 | `volume` | `BIGINT NOT NULL` | `>= 0` |
 | `timestamp` | `TIMESTAMP NOT NULL` | UTC, enforced by `PostgresDatabase` pinning the connection's session `TimeZone` to UTC on connect (see [issue #9](https://github.com/croicu/quant-data/issues/9)) — previously just assumed, which let an unpinned session silently shift every stored value by its own local offset; kept for reference/audit, redundant with the three dimension keys |
 | `data_quality` | `TEXT NOT NULL CHECK (data_quality IN ('accepted', 'incomplete', 'rejected'))` | Added in `002_add_incomplete_flag` as a boolean `incomplete`; replaced by `009_replace_incomplete_with_data_quality` with this tri-state column. `accepted` is the normal case; `incomplete` means the provider couldn't supply full data for this bar (e.g. missing pre-market volume) or a plausibility check couldn't be run against it; `rejected` means a per-provider staging-quality check ran and found the value implausible (`tasks/yahoo_data_sanitization.md`). `rejected` is treated identically to `incomplete` by reconcile's Tier 1 completeness check — the distinction is for audit/debugging, not different promotion behavior. Not a data-quality gate on read — a signal to prioritize backfilling/review. |
+| `wap`, `trade_count` | `NUMERIC`, `INT CHECK (trade_count IS NULL OR trade_count >= 0)` | Nullable. Added in `018_add_supplement_fields` ([croicu/quant-data#61](https://github.com/croicu/quant-data/issues/61)) — volume-weighted average price / trade count for the bar. **Trade group**: computed from the same trade prints as `open`/`high`/`low`/`close`/`volume`, so it's winner-gated exactly like `volume` already is — `quant-reconcile` copies it from whichever provider won this bar's `ohlc` vote, leaving it `NULL` if that provider didn't report it, even if a losing candidate did ("no data over bad data", an explicit tradeoff). Populated from Massive's `vw`/`n` today; `NULL` on most bars, since `ibkr` (which doesn't report these) wins the large majority of votes. |
+| `avg_bid`, `avg_ask`, `midpoint_open`, `midpoint_high`, `midpoint_low`, `midpoint_close` | `NUMERIC` | Nullable. Added in `018_add_supplement_fields`, same issue. **Quote group**: a different feed (the NBBO quote book, not the trade tape) with no shared failure mode with the trade group above, so it is *not* winner-gated — `quant-reconcile` copies it from whichever staging row reports it, independent of who won `ohlc`. Populated from IBKR's `BID_ASK` (`avg_bid`/`avg_ask`) and `MIDPOINT` (`midpoint_*`, a genuine OHLC series of the bid/ask midpoint price) methods; no second quote source exists yet, so this is an uncontested "wins by default" placeholder, not a validated cross-provider comparison — correctly shaped to graduate to one later. |
 
 Primary key: `(ticker_id, date_id, time_id)` — enforces exactly one bar per ticker per minute per
 date.
+
+Both groups are written exclusively by `quant-reconcile` (`_promote_and_lazily_purge` in
+`reconcile/cli.py`), preserving the standing single-writer-to-fact invariant — `stage` only ever
+writes `staging_market_data_1min`, even for the quote group, which has no gating logic of its own
+that would otherwise justify `stage` writing it directly. See `docs/ARCHITECTURE.md`'s `stage` and
+`reconcile` sections for how each side is populated.
 
 ## `dim_field_group`
 

@@ -45,6 +45,7 @@ class FakeReconcileDatabase:
         self.fact_reconciliation: list[tuple[int, int, int, int, int, str]] = []
         self.fact_reconciliation_participant: list[tuple[int, int, int, int, int, bool]] = []
         self.fact_market_data: dict[tuple[int, int, int], tuple] = {}
+        self.fact_market_data_supplement: dict[tuple[int, int, int], tuple] = {}
         self.pending_manual_resolution: set[tuple[int, int, int, int]] = set()
         self.closed = False
 
@@ -180,8 +181,28 @@ class FakeReconcileDatabase:
         close: float,
         volume: int,
         data_quality: str,
+        wap: float | None = None,
+        trade_count: int | None = None,
+        avg_bid: float | None = None,
+        avg_ask: float | None = None,
+        midpoint_open: float | None = None,
+        midpoint_high: float | None = None,
+        midpoint_low: float | None = None,
+        midpoint_close: float | None = None,
     ) -> None:
         self.fact_market_data[(ticker_id, date_id, time_id)] = (timestamp, open, high, low, close, volume, data_quality)
+        # Kept separate from fact_market_data above so its existing 7-tuple shape (and every test
+        # that positionally unpacks it) stays untouched -- croicu/quant-data#61's supplement fields.
+        self.fact_market_data_supplement[(ticker_id, date_id, time_id)] = (
+            wap,
+            trade_count,
+            avg_bid,
+            avg_ask,
+            midpoint_open,
+            midpoint_high,
+            midpoint_low,
+            midpoint_close,
+        )
 
     def purge_staging_bar(self, ticker_id: int, date_id: int, time_id: int) -> None:
         whistleblower_provider_ids: set[int] = set()

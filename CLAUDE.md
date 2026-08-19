@@ -444,6 +444,49 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
+- **Consume IBKR BID_ASK/MIDPOINT and Massive vw/n into staging/fact_market_data_1min** —
+  [issue #61](https://github.com/croicu/quant-data/issues/61), `status:implementation` — branch
+  `staging-supplement-fields`. Converged design (posted to #61's body): 8 new nullable columns
+  split into two independently-promoted groups, not one uniform mechanism and not "provider loses
+  ohlc -> discard everything it reported" — see `docs/SCHEMA.md`'s `fact_market_data_1min` section
+  for the full rationale. **Trade group** (`wap`, `trade_count`, from Massive's `vw`/`n` today):
+  computed from the same trade prints as OHLC/volume, so winner-gated exactly like `volume` already
+  is — `quant-reconcile` copies it from whichever provider won that bar's `ohlc` vote, `NULL` if
+  the winner didn't report it even if a losing candidate did ("no data over bad data", explicit
+  tradeoff — `wap`/`trade_count` will be `NULL` on most bars today, since `ibkr` wins the large
+  majority of votes and doesn't report them). **Quote group** (`avg_bid`, `avg_ask`,
+  `midpoint_open/high/low/close`, from IBKR's `BID_ASK`/`MIDPOINT`): a different feed (NBBO quote
+  book, not the trade tape) with no shared failure mode with the trade group, so *not*
+  winner-gated — copied from whichever staging row reports it, uncontested today since no second
+  quote source exists (an honest placeholder, not a validated comparison; correctly shaped to
+  graduate to a real Tier 1-4 resolution once one does). No new tables — both groups landed as
+  columns directly on the existing `staging_market_data_1min`/`fact_market_data_1min`, preserving
+  the standing single-writer-to-fact invariant (`quant-reconcile` alone writes fact, even for the
+  ungated quote group). `OHLCV` gained the same 8 fields, additive (default `None`), not breaking;
+  announced to `quant-scratch` via
+  [croicu/quant-scratch#28](https://github.com/croicu/quant-scratch/issues/28) ahead of shipping,
+  same informational/opt-in treatment as #17/#19/#20. IBKR's `BID_ASK`-archived `high`/`low` and
+  IBKR's `average`/`barCount` (the trade group's IBKR-side `wap`/`trade_count` equivalent)
+  deliberately deferred, not silently dropped — see #61. Implemented and unit-tested (13 new
+  tests, 322 unit tests total green, `ruff` clean). Migration `018_add_supplement_fields` applied
+  directly by the repo owner on CroicuWS2 (as `alex`, a local superuser — CroicuWS2 never got the
+  full `quant_data`/`quant_writer`/`quant_reader` three-role split CroicuWS1 had; only `alex` and
+  `postgres` exist there today, a known, deliberately-deferred gap, not new). Live-verified
+  end-to-end against CroicuWS2's real database (SPY, 2026-08-05 through 2026-08-18, backed up via
+  `pg_dump` first): `quant-stage` merged every `TRADES`+`BID_ASK`+`MIDPOINT` triplet into one
+  staging row (all 9,600 `ibkr` rows got both `avg_bid`/`avg_ask` and `midpoint_*`; all 6,026
+  `massive` rows got `wap`/`trade_count`); `quant-reconcile` (SPY graduated at 2,734 matched bars,
+  6,718 groups resolved) confirmed the promotion split precisely — `wap` populated on exactly the
+  6 bars `massive` won `ohlc` on (0 on the 6,712 `ibkr`-won bars, even where `massive` also
+  reported a losing value), while `avg_bid`/`midpoint_*` were on all 6,718 promoted bars including
+  the 6 `massive` won, proving the quote group truly isn't winner-gated. One placement note from
+  review, deliberately left as-is per the repo owner's call: the trade/quote-group promotion split
+  (`_find_quote_group_row`, `_promote_and_lazily_purge`) landed in `reconcile/cli.py`, but per this
+  codebase's own cli-is-thin-orchestration/algorithm-holds-domain-logic split, it arguably belongs
+  in `reconcile/algorithm.py` instead — flagged for whenever this area is next touched, not fixed
+  now. Not yet committed — sitting on branch `staging-supplement-fields`, awaiting the repo owner's
+  diff review per this file's "Before committing" rule.
+
 - **Method-keyed `provider_source_archive`; fetch IBKR TRADES/BID_ASK/MIDPOINT by default** —
   [issue #60](https://github.com/croicu/quant-data/issues/60) (`cross-repo`, still
   `status:brainstorm` — this PR is prep work toward it, not a full close), tracked via

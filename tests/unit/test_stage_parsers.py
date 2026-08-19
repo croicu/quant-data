@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 import pytest
 
 from quant_data._internal.shared.errors import AppError
-from quant_data.protocols import DataQuality
-from stage.parsers import ibkr_parser, massive_parser, parse_payload, yfinance_parser
+from quant_data.protocols import OHLCV, DataQuality
+from stage.parsers import apply_supplementary_payload, ibkr_parser, massive_parser, parse_payload, yfinance_parser
 
 
 def test_yfinance_parser_flags_none_fields_as_incomplete():
@@ -81,9 +81,96 @@ def test_massive_parser_parses_and_sorts_chronologically():
     assert bars[0].data_quality == DataQuality.ACCEPTED  # no synthetic/NaN placeholder rows, like IBKR
 
 
+def test_massive_parser_extracts_wap_and_trade_count():
+    # croicu/quant-data#61 trade group -- free on the same aggregates response, no extra archive
+    # read needed.
+    bars = massive_parser.parse(_SAMPLE_MASSIVE_PAYLOAD, "spy")
+
+    assert bars[0].wap == 745.3721
+    assert bars[0].trade_count == 454
+    assert bars[1].wap == 745.14
+    assert bars[1].trade_count == 288
+
+
+def test_massive_parser_leaves_wap_and_trade_count_none_when_absent():
+    payload = {"results": [{"v": 100, "o": 1.0, "c": 1.0, "h": 1.0, "l": 1.0, "t": 1785484860000}]}
+
+    bars = massive_parser.parse(payload, "spy")
+
+    assert bars[0].wap is None
+    assert bars[0].trade_count is None
+
+
 def test_massive_parser_raises_when_no_results():
     with pytest.raises(AppError, match="no 'results'"):
         massive_parser.parse({"ticker": "SPY", "status": "OK"}, "spy")
+
+
+def test_ibkr_parser_parse_bid_ask():
+    payload = {
+        "bars": [
+            {"timestamp": "2026-07-24T13:30:00+00:00", "avg_bid": 100.0, "avg_ask": 100.1, "high": 100.2, "low": 99.9},
+        ]
+    }
+
+    result = ibkr_parser.parse_bid_ask(payload)
+
+    assert result == {datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc): (100.0, 100.1)}
+
+
+def test_ibkr_parser_parse_midpoint():
+    payload = {
+        "bars": [
+            {"timestamp": "2026-07-24T13:30:00+00:00", "open": 100.0, "high": 100.2, "low": 99.9, "close": 100.1},
+        ]
+    }
+
+    result = ibkr_parser.parse_midpoint(payload)
+
+    assert result == {datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc): (100.0, 100.2, 99.9, 100.1)}
+
+
+def test_apply_supplementary_payload_merges_bid_ask_into_matching_bar():
+    timestamp = datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc)
+    bar = OHLCV(ticker="AAPL", timestamp=timestamp, open=1.0, high=1.0, low=1.0, close=1.0, volume=1)
+    bars_by_timestamp = {timestamp: bar}
+    payload = {"bars": [{"timestamp": "2026-07-24T13:30:00+00:00", "avg_bid": 100.0, "avg_ask": 100.1, "high": 100.2, "low": 99.9}]}
+
+    apply_supplementary_payload("ibkr", "BID_ASK", payload, bars_by_timestamp)
+
+    assert bar.avg_bid == 100.0
+    assert bar.avg_ask == 100.1
+    assert bar.midpoint_open is None  # untouched -- BID_ASK doesn't populate the quote midpoint fields
+
+
+def test_apply_supplementary_payload_merges_midpoint_into_matching_bar():
+    timestamp = datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc)
+    bar = OHLCV(ticker="AAPL", timestamp=timestamp, open=1.0, high=1.0, low=1.0, close=1.0, volume=1)
+    bars_by_timestamp = {timestamp: bar}
+    payload = {"bars": [{"timestamp": "2026-07-24T13:30:00+00:00", "open": 100.0, "high": 100.2, "low": 99.9, "close": 100.1}]}
+
+    apply_supplementary_payload("ibkr", "MIDPOINT", payload, bars_by_timestamp)
+
+    assert (bar.midpoint_open, bar.midpoint_high, bar.midpoint_low, bar.midpoint_close) == (100.0, 100.2, 99.9, 100.1)
+
+
+def test_apply_supplementary_payload_skips_timestamp_with_no_matching_primary_bar():
+    bars_by_timestamp: dict = {}
+    payload = {"bars": [{"timestamp": "2026-07-24T13:30:00+00:00", "avg_bid": 100.0, "avg_ask": 100.1, "high": 100.2, "low": 99.9}]}
+
+    apply_supplementary_payload("ibkr", "BID_ASK", payload, bars_by_timestamp)  # no raise
+
+    assert bars_by_timestamp == {}
+
+
+def test_apply_supplementary_payload_is_a_no_op_for_unregistered_provider_method():
+    timestamp = datetime(2026, 7, 24, 13, 30, tzinfo=timezone.utc)
+    bar = OHLCV(ticker="AAPL", timestamp=timestamp, open=1.0, high=1.0, low=1.0, close=1.0, volume=1)
+    bars_by_timestamp = {timestamp: bar}
+
+    apply_supplementary_payload("massive", "aggregates", {}, bars_by_timestamp)  # no raise, no-op
+
+    assert bar.avg_bid is None
 
 
 def test_parse_payload_dispatches_by_provider_name():

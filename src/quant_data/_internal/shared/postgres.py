@@ -60,6 +60,70 @@ class StagingRow:
     close: float
     volume: int
     data_quality: str
+    # Supplement fields (croicu/quant-data#61) -- see quant_data.protocols.OHLCV's own comment for
+    # the trade-group (winner-gated) vs. quote-group (not winner-gated) split.
+    wap: float | None = None
+    trade_count: int | None = None
+    avg_bid: float | None = None
+    avg_ask: float | None = None
+    midpoint_open: float | None = None
+    midpoint_high: float | None = None
+    midpoint_low: float | None = None
+    midpoint_close: float | None = None
+
+
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _staging_row_from_tuple(row: tuple) -> StagingRow:
+    """Shared by fetch_staging_rows_for_reconciliation and
+    fetch_pending_manual_resolution_staging_rows -- both select the same 19 staging_market_data_1min
+    columns in the same order."""
+    (
+        ticker_id,
+        date_id,
+        time_id,
+        timestamp,
+        provider_id,
+        open_,
+        high,
+        low,
+        close,
+        volume,
+        data_quality,
+        wap,
+        trade_count,
+        avg_bid,
+        avg_ask,
+        midpoint_open,
+        midpoint_high,
+        midpoint_low,
+        midpoint_close,
+    ) = row
+    return StagingRow(
+        ticker_id=ticker_id,
+        date_id=date_id,
+        time_id=time_id,
+        timestamp=timestamp,
+        provider_id=provider_id,
+        open=float(open_),
+        high=float(high),
+        low=float(low),
+        close=float(close),
+        volume=int(volume),
+        data_quality=data_quality,
+        wap=_optional_float(wap),
+        trade_count=None if trade_count is None else int(trade_count),
+        avg_bid=_optional_float(avg_bid),
+        avg_ask=_optional_float(avg_ask),
+        midpoint_open=_optional_float(midpoint_open),
+        midpoint_high=_optional_float(midpoint_high),
+        midpoint_low=_optional_float(midpoint_low),
+        midpoint_close=_optional_float(midpoint_close),
+    )
 
 
 @dataclass
@@ -156,7 +220,9 @@ class PostgresDatabase:
         normalized_ticker = ticker.upper()
 
         query = """
-            SELECT t.ticker, f.timestamp, f.open, f.high, f.low, f.close, f.volume, f.data_quality
+            SELECT t.ticker, f.timestamp, f.open, f.high, f.low, f.close, f.volume, f.data_quality,
+                   f.wap, f.trade_count, f.avg_bid, f.avg_ask,
+                   f.midpoint_open, f.midpoint_high, f.midpoint_low, f.midpoint_close
             FROM fact_market_data_1min f
             JOIN dim_ticker t ON t.ticker_id = f.ticker_id
             JOIN dim_date d ON d.date_id = f.date_id
@@ -175,7 +241,24 @@ class PostgresDatabase:
 
         bars: list[OHLCV] = []
         for row in rows:
-            row_ticker, row_timestamp, row_open, row_high, row_low, row_close, row_volume, row_data_quality = row
+            (
+                row_ticker,
+                row_timestamp,
+                row_open,
+                row_high,
+                row_low,
+                row_close,
+                row_volume,
+                row_data_quality,
+                row_wap,
+                row_trade_count,
+                row_avg_bid,
+                row_avg_ask,
+                row_midpoint_open,
+                row_midpoint_high,
+                row_midpoint_low,
+                row_midpoint_close,
+            ) = row
             bar = OHLCV(
                 ticker=row_ticker,
                 timestamp=row_timestamp,
@@ -185,6 +268,14 @@ class PostgresDatabase:
                 close=float(row_close),
                 volume=int(row_volume),
                 data_quality=DataQuality(row_data_quality),
+                wap=_optional_float(row_wap),
+                trade_count=None if row_trade_count is None else int(row_trade_count),
+                avg_bid=_optional_float(row_avg_bid),
+                avg_ask=_optional_float(row_avg_ask),
+                midpoint_open=_optional_float(row_midpoint_open),
+                midpoint_high=_optional_float(row_midpoint_high),
+                midpoint_low=_optional_float(row_midpoint_low),
+                midpoint_close=_optional_float(row_midpoint_close),
             )
             bars.append(bar)
 
@@ -378,8 +469,9 @@ class PostgresDatabase:
                     cursor.execute(
                         """
                         INSERT INTO staging_market_data_1min
-                            (provider_id, ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            (provider_id, ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality,
+                             wap, trade_count, avg_bid, avg_ask, midpoint_open, midpoint_high, midpoint_low, midpoint_close)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (provider_id, ticker_id, date_id, time_id) DO UPDATE SET
                             open = EXCLUDED.open,
                             high = EXCLUDED.high,
@@ -387,7 +479,15 @@ class PostgresDatabase:
                             close = EXCLUDED.close,
                             volume = EXCLUDED.volume,
                             timestamp = EXCLUDED.timestamp,
-                            data_quality = EXCLUDED.data_quality
+                            data_quality = EXCLUDED.data_quality,
+                            wap = EXCLUDED.wap,
+                            trade_count = EXCLUDED.trade_count,
+                            avg_bid = EXCLUDED.avg_bid,
+                            avg_ask = EXCLUDED.avg_ask,
+                            midpoint_open = EXCLUDED.midpoint_open,
+                            midpoint_high = EXCLUDED.midpoint_high,
+                            midpoint_low = EXCLUDED.midpoint_low,
+                            midpoint_close = EXCLUDED.midpoint_close
                         """,
                         (
                             provider_id,
@@ -401,6 +501,14 @@ class PostgresDatabase:
                             bar.volume,
                             bar.timestamp,
                             bar.data_quality.value,
+                            bar.wap,
+                            bar.trade_count,
+                            bar.avg_bid,
+                            bar.avg_ask,
+                            bar.midpoint_open,
+                            bar.midpoint_high,
+                            bar.midpoint_low,
+                            bar.midpoint_close,
                         ),
                     )
                     written += 1
@@ -773,7 +881,9 @@ class PostgresDatabase:
                 cursor.execute(
                     """
                     SELECT s.ticker_id, s.date_id, s.time_id, s.timestamp, s.provider_id,
-                           s.open, s.high, s.low, s.close, s.volume, s.data_quality
+                           s.open, s.high, s.low, s.close, s.volume, s.data_quality,
+                           s.wap, s.trade_count, s.avg_bid, s.avg_ask,
+                           s.midpoint_open, s.midpoint_high, s.midpoint_low, s.midpoint_close
                     FROM staging_market_data_1min s
                     JOIN dim_provider p ON p.provider_id = s.provider_id
                     WHERE p.name = ANY(%(names)s)
@@ -800,22 +910,8 @@ class PostgresDatabase:
         self._logger.perf(f"fetch_staging_rows_for_reconciliation({len(rows)} rows)", time.perf_counter() - started)
 
         result: list[StagingRow] = []
-        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, data_quality in rows:
-            result.append(
-                StagingRow(
-                    ticker_id=ticker_id,
-                    date_id=date_id,
-                    time_id=time_id,
-                    timestamp=timestamp,
-                    provider_id=provider_id,
-                    open=float(open_),
-                    high=float(high),
-                    low=float(low),
-                    close=float(close),
-                    volume=int(volume),
-                    data_quality=data_quality,
-                )
-            )
+        for row in rows:
+            result.append(_staging_row_from_tuple(row))
         return result
 
     def fetch_pending_manual_resolution_staging_rows(self) -> list[StagingRow]:
@@ -828,7 +924,9 @@ class PostgresDatabase:
                 cursor.execute(
                     """
                     SELECT s.ticker_id, s.date_id, s.time_id, s.timestamp, s.provider_id,
-                           s.open, s.high, s.low, s.close, s.volume, s.data_quality
+                           s.open, s.high, s.low, s.close, s.volume, s.data_quality,
+                           s.wap, s.trade_count, s.avg_bid, s.avg_ask,
+                           s.midpoint_open, s.midpoint_high, s.midpoint_low, s.midpoint_close
                     FROM staging_market_data_1min s
                     WHERE EXISTS (
                         SELECT 1 FROM fact_pending_manual_resolution fpmr
@@ -842,22 +940,8 @@ class PostgresDatabase:
         self._logger.perf(f"fetch_pending_manual_resolution_staging_rows({len(rows)} rows)", time.perf_counter() - started)
 
         result: list[StagingRow] = []
-        for ticker_id, date_id, time_id, timestamp, provider_id, open_, high, low, close, volume, data_quality in rows:
-            result.append(
-                StagingRow(
-                    ticker_id=ticker_id,
-                    date_id=date_id,
-                    time_id=time_id,
-                    timestamp=timestamp,
-                    provider_id=provider_id,
-                    open=float(open_),
-                    high=float(high),
-                    low=float(low),
-                    close=float(close),
-                    volume=int(volume),
-                    data_quality=data_quality,
-                )
-            )
+        for row in rows:
+            result.append(_staging_row_from_tuple(row))
         return result
 
     def fetch_pending_manual_resolution_keys(self) -> set[tuple[int, int, int, int]]:
@@ -986,17 +1070,31 @@ class PostgresDatabase:
         close: float,
         volume: int,
         data_quality: str,
+        wap: float | None = None,
+        trade_count: int | None = None,
+        avg_bid: float | None = None,
+        avg_ask: float | None = None,
+        midpoint_open: float | None = None,
+        midpoint_high: float | None = None,
+        midpoint_low: float | None = None,
+        midpoint_close: float | None = None,
     ) -> None:
         """Upsert the fully-resolved bar into fact_market_data_1min -- called once every field
         group for this bar has resolved. Does NOT purge staging rows; that's the separate,
-        deliberately lazy purge_staging_bar (see its docstring for why)."""
+        deliberately lazy purge_staging_bar (see its docstring for why).
+
+        wap/trade_count (trade group) and avg_bid/avg_ask/midpoint_* (quote group) are the
+        croicu/quant-data#61 supplement fields -- the caller (reconcile/cli.py's
+        _promote_and_lazily_purge) is responsible for their differing promotion rules (winner-gated
+        vs. not); this method just writes whatever it's given."""
         try:
             with self._connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO fact_market_data_1min
-                        (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality,
+                         wap, trade_count, avg_bid, avg_ask, midpoint_open, midpoint_high, midpoint_low, midpoint_close)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (ticker_id, date_id, time_id) DO UPDATE SET
                         open = EXCLUDED.open,
                         high = EXCLUDED.high,
@@ -1004,9 +1102,36 @@ class PostgresDatabase:
                         close = EXCLUDED.close,
                         volume = EXCLUDED.volume,
                         timestamp = EXCLUDED.timestamp,
-                        data_quality = EXCLUDED.data_quality
+                        data_quality = EXCLUDED.data_quality,
+                        wap = EXCLUDED.wap,
+                        trade_count = EXCLUDED.trade_count,
+                        avg_bid = EXCLUDED.avg_bid,
+                        avg_ask = EXCLUDED.avg_ask,
+                        midpoint_open = EXCLUDED.midpoint_open,
+                        midpoint_high = EXCLUDED.midpoint_high,
+                        midpoint_low = EXCLUDED.midpoint_low,
+                        midpoint_close = EXCLUDED.midpoint_close
                     """,
-                    (ticker_id, date_id, time_id, open, high, low, close, volume, timestamp, data_quality),
+                    (
+                        ticker_id,
+                        date_id,
+                        time_id,
+                        open,
+                        high,
+                        low,
+                        close,
+                        volume,
+                        timestamp,
+                        data_quality,
+                        wap,
+                        trade_count,
+                        avg_bid,
+                        avg_ask,
+                        midpoint_open,
+                        midpoint_high,
+                        midpoint_low,
+                        midpoint_close,
+                    ),
                 )
             self._connection.commit()
         except psycopg.Error as error:

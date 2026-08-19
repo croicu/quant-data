@@ -21,6 +21,8 @@ def parse(payload: dict, ticker: str) -> list[OHLCV]:
     bars: list[OHLCV] = []
     for raw_bar in raw_bars:
         timestamp_utc = datetime.fromtimestamp(raw_bar["t"] / 1000, tz=timezone.utc)
+        raw_wap = raw_bar.get("vw")
+        raw_trade_count = raw_bar.get("n")
         bars.append(
             OHLCV(
                 ticker=normalized_ticker,
@@ -31,6 +33,10 @@ def parse(payload: dict, ticker: str) -> list[OHLCV]:
                 close=float(raw_bar["c"]),
                 volume=int(raw_bar["v"]),
                 data_quality=DataQuality.ACCEPTED,
+                # Trade group (croicu/quant-data#61) -- free on this same aggregates response, no
+                # extra archive read needed. None if a given bar's response happens to omit them.
+                wap=None if raw_wap is None else float(raw_wap),
+                trade_count=None if raw_trade_count is None else int(raw_trade_count),
             )
         )
     bars.sort(key=_bar_timestamp)

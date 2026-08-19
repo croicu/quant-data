@@ -432,7 +432,7 @@ def test_mark_staging_bars_rejected_empty_keys_is_a_noop(mock_psycopg):
 def test_fetch_staging_rows_for_reconciliation_scopes_by_provider_names(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
     mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, "accepted"),
+        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, "accepted", None, None, None, None, None, None, None, None),
     ]
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")
@@ -668,7 +668,7 @@ def test_fetch_earliest_covered_date_returns_none_for_a_never_ingested_ticker(mo
 def test_fetch_pending_manual_resolution_staging_rows_returns_rows(mock_psycopg):
     mock_connection = _connect(mock_psycopg, [])
     mock_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
-        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, "accepted"),
+        (1, 10, 20, datetime(2026, 7, 24, 13, 30), 2, 100.0, 101.0, 99.0, 100.5, 1000, "accepted", None, None, None, None, None, None, None, None),
     ]
 
     database = PostgresDatabase(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_data")

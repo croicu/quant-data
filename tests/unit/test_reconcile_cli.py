@@ -124,6 +124,66 @@ def test_agreement_promotes_bar_and_purges_staging():
         assert resolution_path == "agreement"
 
 
+def test_trade_group_rides_along_with_ohlc_winner_not_the_losing_reporter():
+    # croicu/quant-data#61: wap/trade_count are winner-gated, same precedent already set for
+    # volume -- promoted from whichever provider won this bar's OHLC vote, even when a losing
+    # candidate also reported them ("no data over bad data").
+    staging_rows = [
+        _staging_row(IBKR, data_quality="incomplete", wap=999.0, trade_count=1),
+        _staging_row(MASSIVE, data_quality="accepted", wap=500.25, trade_count=300),
+        _staging_row(YFINANCE, data_quality="incomplete"),
+    ]
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    database = FakeReconcileDatabase(PROVIDERS_WITH_MASSIVE, FIELD_GROUPS, staging_rows, fields=FIELDS, disagreement_stats=disagreement_stats)
+
+    resolved, stuck = run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"]), finalize=False)
+
+    assert resolved == 1
+    assert stuck == 0
+    for _, _, _, _, winning_provider_id, resolution_path in database.fact_reconciliation:
+        assert winning_provider_id == MASSIVE
+        assert resolution_path == "completeness"
+    wap, trade_count, avg_bid, avg_ask, midpoint_open, midpoint_high, midpoint_low, midpoint_close = database.fact_market_data_supplement[(1, 10, 20)]
+    # Massive's own report, since massive won ohlc -- not ibkr's 999.0/1, even though ibkr
+    # reported wap/trade_count too.
+    assert (wap, trade_count) == (500.25, 300)
+
+
+def test_quote_group_promotes_regardless_of_which_provider_won_ohlc():
+    # croicu/quant-data#61: avg_bid/avg_ask/midpoint_* are NOT winner-gated -- promoted from
+    # whichever staging row reports them, even when that provider lost the OHLC vote.
+    staging_rows = [
+        _staging_row(IBKR, data_quality="incomplete", avg_bid=100.0, avg_ask=100.1),
+        _staging_row(MASSIVE, data_quality="accepted"),
+        _staging_row(YFINANCE, data_quality="incomplete"),
+    ]
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    database = FakeReconcileDatabase(PROVIDERS_WITH_MASSIVE, FIELD_GROUPS, staging_rows, fields=FIELDS, disagreement_stats=disagreement_stats)
+
+    resolved, stuck = run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"]), finalize=False)
+
+    assert resolved == 1
+    assert stuck == 0
+    for _, _, _, _, winning_provider_id, _resolution_path in database.fact_reconciliation:
+        assert winning_provider_id == MASSIVE  # massive won ohlc...
+    wap, trade_count, avg_bid, avg_ask, midpoint_open, midpoint_high, midpoint_low, midpoint_close = database.fact_market_data_supplement[(1, 10, 20)]
+    assert (avg_bid, avg_ask) == (100.0, 100.1)  # ...but avg_bid/avg_ask still comes from ibkr, who lost
+
+
+def test_supplement_fields_are_none_when_nobody_reports_them():
+    staging_rows = [
+        _staging_row(IBKR, open=100.0, high=101.0, low=99.0, close=100.5, volume=1000),
+        _staging_row(YFINANCE, open=100.01, high=101.01, low=99.01, close=100.51, volume=1002),
+    ]
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    database = FakeReconcileDatabase(PROVIDERS, FIELD_GROUPS, staging_rows, fields=FIELDS, disagreement_stats=disagreement_stats)
+
+    resolved, stuck = run_reconciliation(database, _settings(), finalize=False)
+
+    assert resolved == 1
+    assert database.fact_market_data_supplement[(1, 10, 20)] == (None, None, None, None, None, None, None, None)
+
+
 def test_completeness_resolves_yahoo_premarket_gap():
     # The actual motivating case: Yahoo (whistleblower) reports incomplete (premarket zero
     # placeholder), IBKR (candidate) has real data -- both groups should resolve via

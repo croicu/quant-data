@@ -235,6 +235,19 @@ def _bar_still_needed_as_neighbor(
     return False
 
 
+def _find_quote_group_row(rows: list[StagingRow]) -> StagingRow | None:
+    """The first staging row reporting any quote-group field (croicu/quant-data#61: avg_bid/
+    avg_ask/midpoint_*) -- not gated by which provider won this bar's OHLC vote, unlike the trade
+    group (wap/trade_count), which rides along with the ohlc winner's own row directly. Only IBKR
+    reports these today, so "first" really means "the only provider that ever could" -- written
+    generically so a second quote source later needs its own real Tier 1-4 resolution upstream,
+    not a change here."""
+    for row in rows:
+        if row.avg_bid is not None or row.midpoint_open is not None:
+            return row
+    return None
+
+
 def _promote_and_lazily_purge(
     database: PostgresDatabase,
     bars: dict[tuple[int, int, int], list[StagingRow]],
@@ -260,6 +273,18 @@ def _promote_and_lazily_purge(
         if ohlc_row is None:
             continue
 
+        # Supplement fields (croicu/quant-data#61). Trade group (wap/trade_count) rides along with
+        # the OHLC winner's own row, same precedent as volume. Quote group (avg_bid/avg_ask/
+        # midpoint_*) is not winner-gated -- copied from whichever row reports it, independent of
+        # who won OHLC.
+        quote_row = _find_quote_group_row(rows)
+        avg_bid = None if quote_row is None else quote_row.avg_bid
+        avg_ask = None if quote_row is None else quote_row.avg_ask
+        midpoint_open = None if quote_row is None else quote_row.midpoint_open
+        midpoint_high = None if quote_row is None else quote_row.midpoint_high
+        midpoint_low = None if quote_row is None else quote_row.midpoint_low
+        midpoint_close = None if quote_row is None else quote_row.midpoint_close
+
         database.promote_bar_to_fact(
             ticker_id,
             date_id,
@@ -271,6 +296,14 @@ def _promote_and_lazily_purge(
             ohlc_row.close,
             ohlc_row.volume,
             ohlc_row.data_quality,
+            wap=ohlc_row.wap,
+            trade_count=ohlc_row.trade_count,
+            avg_bid=avg_bid,
+            avg_ask=avg_ask,
+            midpoint_open=midpoint_open,
+            midpoint_high=midpoint_high,
+            midpoint_low=midpoint_low,
+            midpoint_close=midpoint_close,
         )
 
         if _bar_still_needed_as_neighbor(ticker_id, ohlc_row.timestamp, bar_key_by_ticker_timestamp, resolved_by_bar, all_field_group_ids):
