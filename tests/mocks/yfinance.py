@@ -4,7 +4,7 @@ import json
 from datetime import date
 from pathlib import Path
 
-from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
+from quant_data._internal.contracts import DEFAULT_METHODS_BY_PROVIDER, PayloadKind, ProviderFetchResult
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.providers.payload import raw_bars_payload
 
@@ -13,6 +13,7 @@ DEFAULT_DATA_PATH = Path(__file__).parent.parent / "data" / "ohlcv_bars.json"
 
 class MockIntraDayProvider:
     FETCH_VERSION = "1"
+    DEFAULT_METHODS = DEFAULT_METHODS_BY_PROVIDER["yfinance"]
 
     def __init__(self, data_path: Path = DEFAULT_DATA_PATH) -> None:
         with data_path.open("r", encoding="utf-8") as f:
@@ -26,10 +27,11 @@ class MockIntraDayProvider:
     def close(self) -> None:
         self.closed = True
 
-    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
+    def fetch_bars(self, ticker: str, target_date: date, method: str | None = None) -> ProviderFetchResult:
         # Pure fetch, matching the real providers post-split (croicu/quant-data#56) -- returns raw
         # per-bar dicts, no OHLCV construction.
         normalized_ticker = ticker.upper()
+        effective_method = method if method is not None else self.DEFAULT_METHODS[0]
 
         ticker_data = self._bars_by_ticker.get(normalized_ticker)
         if ticker_data is None:
@@ -52,4 +54,4 @@ class MockIntraDayProvider:
                 }
             )
 
-        return ProviderFetchResult(payload=raw_bars_payload(raw_bars), payload_kind=PayloadKind.PARSED_BARS)
+        return ProviderFetchResult(payload=raw_bars_payload(raw_bars), payload_kind=PayloadKind.PARSED_BARS, method=effective_method)

@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 import pandas
 import yfinance
 
-from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
+from quant_data._internal.contracts import DEFAULT_METHODS_BY_PROVIDER, PayloadKind, ProviderFetchResult
 
 from ..diagnostics import Logger
 from ..errors import AppError
@@ -29,6 +29,7 @@ def _safe_volume_or_none(value: float) -> int | None:
 
 class YahooFinanceIntraDay:
     FETCH_VERSION = "1"
+    DEFAULT_METHODS = DEFAULT_METHODS_BY_PROVIDER["yfinance"]
 
     def connect(self) -> None:
         # Stateless per-call HTTP fetch -- no persistent connection to establish, unlike
@@ -39,12 +40,15 @@ class YahooFinanceIntraDay:
     def close(self) -> None:
         pass
 
-    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
+    def fetch_bars(self, ticker: str, target_date: date, method: str | None = None) -> ProviderFetchResult:
         # Pure fetch -- no OHLCV parsing here (croicu/quant-data#56). NaN values are preserved as
         # JSON null (not coerced to 0.0), so quant-stage's yfinance parser can make its own
         # incomplete/data-quality determination from the genuine raw signal, not a value this repo
         # already interpreted at fetch time.
         normalized_ticker = ticker.upper()
+        effective_method = method if method is not None else self.DEFAULT_METHODS[0]
+        if effective_method not in self.DEFAULT_METHODS:
+            raise AppError(f"YahooFinanceIntraDay does not recognize method '{effective_method}' -- expected one of: {self.DEFAULT_METHODS}.")
         start = datetime.combine(target_date, datetime.min.time())
         end = start + timedelta(days=1)
 
@@ -74,4 +78,4 @@ class YahooFinanceIntraDay:
             f"quant-ingest: fetched {len(raw_bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()}.",
             category=CATEGORY_YFINANCE,
         )
-        return ProviderFetchResult(payload=raw_bars_payload(raw_bars), payload_kind=PayloadKind.PARSED_BARS)
+        return ProviderFetchResult(payload=raw_bars_payload(raw_bars), payload_kind=PayloadKind.PARSED_BARS, method=effective_method)

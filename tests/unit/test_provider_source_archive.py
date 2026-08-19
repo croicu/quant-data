@@ -79,6 +79,7 @@ def test_record_fetch_inserts_archive_row_and_commits(mock_psycopg):
     writer.record_fetch(
         ticker="spy",
         provider="MASSIVE",
+        method="aggregates",
         trading_date=date(2026, 7, 23),
         fetch_version="1",
         payload_kind=PayloadKind.RAW_API_RESPONSE,
@@ -87,7 +88,7 @@ def test_record_fetch_inserts_archive_row_and_commits(mock_psycopg):
 
     insert_call = mock_cursor.execute.call_args_list[0]
     assert "INSERT INTO provider_source_archive" in insert_call.args[0]
-    assert insert_call.args[1] == ("SPY", "massive", date(2026, 7, 23), "1", "raw_api_response", '{"status": "OK"}')
+    assert insert_call.args[1] == ("SPY", "massive", "aggregates", date(2026, 7, 23), "1", "raw_api_response", '{"status": "OK"}')
     mock_connection.commit.assert_called_once()
 
 
@@ -98,11 +99,19 @@ def test_record_fetch_inserts_new_coverage_range_when_nothing_touches(mock_psyco
     mock_cursor.fetchall.return_value = []
 
     writer = ProviderSourceArchiveWriter(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_ingest")
-    writer.record_fetch(ticker="spy", provider="massive", trading_date=date(2026, 7, 23), fetch_version="1", payload_kind=PayloadKind.PARSED_BARS, payload={})
+    writer.record_fetch(
+        ticker="spy",
+        provider="massive",
+        method="aggregates",
+        trading_date=date(2026, 7, 23),
+        fetch_version="1",
+        payload_kind=PayloadKind.PARSED_BARS,
+        payload={},
+    )
 
     coverage_insert = mock_cursor.execute.call_args_list[-1]
     assert "INSERT INTO archive_coverage" in coverage_insert.args[0]
-    assert coverage_insert.args[1] == ("SPY", "massive", "1", date(2026, 7, 23), date(2026, 7, 23))
+    assert coverage_insert.args[1] == ("SPY", "massive", "aggregates", "1", date(2026, 7, 23), date(2026, 7, 23))
     mock_connection.commit.assert_called_once()
 
 
@@ -113,7 +122,15 @@ def test_record_fetch_extends_one_adjacent_coverage_range(mock_psycopg):
     mock_cursor.fetchall.return_value = [(99, date(2026, 7, 20), date(2026, 7, 22))]
 
     writer = ProviderSourceArchiveWriter(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_ingest")
-    writer.record_fetch(ticker="spy", provider="massive", trading_date=date(2026, 7, 23), fetch_version="1", payload_kind=PayloadKind.PARSED_BARS, payload={})
+    writer.record_fetch(
+        ticker="spy",
+        provider="massive",
+        method="aggregates",
+        trading_date=date(2026, 7, 23),
+        fetch_version="1",
+        payload_kind=PayloadKind.PARSED_BARS,
+        payload={},
+    )
 
     update_call = mock_cursor.execute.call_args_list[-1]
     assert "UPDATE archive_coverage" in update_call.args[0]
@@ -128,7 +145,15 @@ def test_record_fetch_is_a_no_op_for_coverage_when_date_already_covered(mock_psy
     mock_cursor.fetchall.return_value = [(99, date(2026, 7, 20), date(2026, 7, 25))]
 
     writer = ProviderSourceArchiveWriter(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_ingest")
-    writer.record_fetch(ticker="spy", provider="massive", trading_date=date(2026, 7, 23), fetch_version="1", payload_kind=PayloadKind.PARSED_BARS, payload={})
+    writer.record_fetch(
+        ticker="spy",
+        provider="massive",
+        method="aggregates",
+        trading_date=date(2026, 7, 23),
+        fetch_version="1",
+        payload_kind=PayloadKind.PARSED_BARS,
+        payload={},
+    )
 
     for call in mock_cursor.execute.call_args_list:
         sql = call.args[0]
@@ -145,7 +170,15 @@ def test_record_fetch_merges_two_bridged_coverage_ranges(mock_psycopg):
     mock_cursor.fetchall.return_value = [(97, date(2026, 7, 20), date(2026, 7, 22)), (98, date(2026, 7, 24), date(2026, 7, 26))]
 
     writer = ProviderSourceArchiveWriter(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_ingest")
-    writer.record_fetch(ticker="spy", provider="massive", trading_date=date(2026, 7, 23), fetch_version="1", payload_kind=PayloadKind.PARSED_BARS, payload={})
+    writer.record_fetch(
+        ticker="spy",
+        provider="massive",
+        method="aggregates",
+        trading_date=date(2026, 7, 23),
+        fetch_version="1",
+        payload_kind=PayloadKind.PARSED_BARS,
+        payload={},
+    )
 
     calls = mock_cursor.execute.call_args_list
     delete_calls = []
@@ -173,11 +206,19 @@ def test_record_fetch_keys_coverage_by_fetch_version_separately(mock_psycopg):
     mock_cursor.fetchall.return_value = []
 
     writer = ProviderSourceArchiveWriter(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_ingest")
-    writer.record_fetch(ticker="spy", provider="massive", trading_date=date(2026, 7, 23), fetch_version="2", payload_kind=PayloadKind.PARSED_BARS, payload={})
+    writer.record_fetch(
+        ticker="spy",
+        provider="massive",
+        method="aggregates",
+        trading_date=date(2026, 7, 23),
+        fetch_version="2",
+        payload_kind=PayloadKind.PARSED_BARS,
+        payload={},
+    )
 
     select_call = mock_cursor.execute.call_args_list[1]
     assert "fetch_version = %s" in select_call.args[0]
-    assert select_call.args[1] == ("SPY", "massive", "2", date(2026, 7, 23), date(2026, 7, 23))
+    assert select_call.args[1] == ("SPY", "massive", "aggregates", "2", date(2026, 7, 23), date(2026, 7, 23))
 
 
 @patch("quant_data._internal.shared.provider_source_archive.psycopg")
@@ -190,7 +231,62 @@ def test_record_fetch_rolls_back_and_wraps_error(mock_psycopg):
 
     with pytest.raises(AppError):
         writer.record_fetch(
-            ticker="spy", provider="massive", trading_date=date(2026, 7, 23), fetch_version="1", payload_kind=PayloadKind.PARSED_BARS, payload={}
+            ticker="spy",
+            provider="massive",
+            method="aggregates",
+            trading_date=date(2026, 7, 23),
+            fetch_version="1",
+            payload_kind=PayloadKind.PARSED_BARS,
+            payload={},
         )
+
+    mock_connection.rollback.assert_called_once()
+
+
+# --- mark_covered_without_data (croicu/quant-data#60, weekend consolidation) ---
+
+
+@patch("quant_data._internal.shared.provider_source_archive.psycopg")
+def test_mark_covered_without_data_extends_coverage_without_inserting_archive_row(mock_psycopg):
+    mock_connection = _connect(mock_psycopg)
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.fetchall.return_value = []  # no existing coverage range touches this date
+
+    writer = ProviderSourceArchiveWriter(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_ingest")
+    writer.mark_covered_without_data(ticker="spy", provider="yfinance", method="history", trading_date=date(2026, 8, 16), fetch_version="1")
+
+    for call in mock_cursor.execute.call_args_list:
+        assert "INSERT INTO provider_source_archive" not in call.args[0]
+    coverage_insert = mock_cursor.execute.call_args_list[-1]
+    assert "INSERT INTO archive_coverage" in coverage_insert.args[0]
+    assert coverage_insert.args[1] == ("SPY", "yfinance", "history", "1", date(2026, 8, 16), date(2026, 8, 16))
+    mock_connection.commit.assert_called_once()
+
+
+@patch("quant_data._internal.shared.provider_source_archive.psycopg")
+def test_mark_covered_without_data_extends_an_adjacent_range(mock_psycopg):
+    mock_connection = _connect(mock_psycopg)
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    mock_cursor.fetchall.return_value = [(41, date(2026, 8, 10), date(2026, 8, 14))]
+
+    writer = ProviderSourceArchiveWriter(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_ingest")
+    writer.mark_covered_without_data(ticker="spy", provider="yfinance", method="history", trading_date=date(2026, 8, 15), fetch_version="1")
+
+    update_call = mock_cursor.execute.call_args_list[-1]
+    assert "UPDATE archive_coverage" in update_call.args[0]
+    assert update_call.args[1] == (date(2026, 8, 10), date(2026, 8, 15), 41)
+    mock_connection.commit.assert_called_once()
+
+
+@patch("quant_data._internal.shared.provider_source_archive.psycopg")
+def test_mark_covered_without_data_rolls_back_and_wraps_error(mock_psycopg):
+    mock_connection = _connect(mock_psycopg)
+    mock_psycopg.Error = Exception
+    mock_connection.cursor.return_value.__enter__.return_value.execute.side_effect = mock_psycopg.Error("boom")
+
+    writer = ProviderSourceArchiveWriter(transport=_FakeTransport(), user="quant_writer", password="x", dbname="quant_ingest")
+
+    with pytest.raises(AppError):
+        writer.mark_covered_without_data(ticker="spy", provider="yfinance", method="history", trading_date=date(2026, 8, 16), fetch_version="1")
 
     mock_connection.rollback.assert_called_once()

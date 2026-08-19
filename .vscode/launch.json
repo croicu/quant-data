@@ -2,20 +2,29 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: Run (ingest)",
+      "name": "Python: Ingest",
       "type": "debugpy",
       "request": "launch",
       "module": "ingest.cli",
-      "args": [],
+      "args": [
+        "--ticker", "${input:ingestTicker}",
+        "--start-date", "${input:ingestStartDate}",
+        "--end-date", "${input:ingestEndDate}"
+      ],
       "console": "integratedTerminal",
       "justMyCode": true
     },
     {
-      "name": "Python: Run (catch-up)",
+      "name": "Python: Ingest (debug)",
       "type": "debugpy",
       "request": "launch",
       "module": "ingest.cli",
-      "args": ["--catch-up"],
+      "args": [
+        "--ticker", "${input:ingestTicker}",
+        "--start-date", "${input:ingestStartDate}",
+        "--end-date", "${input:ingestEndDate}",
+        "--debug"
+      ],
       "console": "integratedTerminal",
       "justMyCode": true
     },
@@ -33,10 +42,29 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/local/sync_local.py",
-      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "python": "${workspaceFolder}/.venv/bin/python",
       "console": "integratedTerminal",
       "justMyCode": true
     }
   ],
-  "inputs": []
+  "inputs": [
+    {
+      "id": "ingestTicker",
+      "type": "promptString",
+      "description": "Ticker for --ticker (this config always passes --ticker/--start-date/--end-date, so leaving this blank passes an empty ticker, not settings.tickers)",
+      "default": "SPY"
+    },
+    {
+      "id": "ingestStartDate",
+      "type": "promptString",
+      "description": "Date for --start-date, YYYY-MM-DD",
+      "default": "2026-08-14"
+    },
+    {
+      "id": "ingestEndDate",
+      "type": "promptString",
+      "description": "Date for --end-date, YYYY-MM-DD",
+      "default": "2026-08-14"
+    }
+  ]
 }

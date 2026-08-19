@@ -53,7 +53,7 @@ def _custom_settings(tmp_path: Path, **overrides) -> Path:
 
 def test_main_parses_archived_payload_and_writes_staging_bars():
     database = MockPostgresDatabase()
-    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
+    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", "history", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
 
     exit_code = cli.main(
         ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
@@ -72,7 +72,7 @@ def test_main_parses_archived_payload_and_writes_staging_bars():
 
 def test_main_records_ingestion_coverage_on_successful_stage():
     database = MockPostgresDatabase()
-    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
+    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", "history", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
 
     cli.main(
         ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
@@ -92,9 +92,9 @@ def test_main_skips_weekend_dates_without_touching_the_archive():
     database = MockPostgresDatabase()
     archive_reader = MockProviderSourceArchiveReader(
         {
-            ("AAPL", "yfinance", date(2026, 1, 2)): _YFINANCE_PAYLOAD,
-            ("AAPL", "yfinance", date(2026, 1, 3)): _YFINANCE_PAYLOAD,
-            ("AAPL", "yfinance", date(2026, 1, 4)): _YFINANCE_PAYLOAD,
+            ("AAPL", "yfinance", "history", date(2026, 1, 2)): _YFINANCE_PAYLOAD,
+            ("AAPL", "yfinance", "history", date(2026, 1, 3)): _YFINANCE_PAYLOAD,
+            ("AAPL", "yfinance", "history", date(2026, 1, 4)): _YFINANCE_PAYLOAD,
         }
     )
 
@@ -129,7 +129,7 @@ def test_main_returns_one_when_nothing_archived_for_the_date():
 def test_main_uses_settings_tickers_when_ticker_omitted(tmp_path):
     settings_path = _custom_settings(tmp_path, tickers=["aapl"])
     database = MockPostgresDatabase()
-    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
+    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", "history", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
 
     exit_code = cli.main(
         ["--start-date", "2026-01-02", "--end-date", "2026-01-02"],
@@ -145,7 +145,7 @@ def test_main_uses_settings_tickers_when_ticker_omitted(tmp_path):
 def test_main_iterates_multiple_configured_providers_independently(tmp_path):
     settings_path = _custom_settings(tmp_path, providers=["yfinance", "ibkr"])
     database = MockPostgresDatabase()
-    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
+    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", "history", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
 
     exit_code = cli.main(
         ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
@@ -165,7 +165,7 @@ def test_main_iterates_multiple_configured_providers_independently(tmp_path):
 def test_main_catch_up_uses_settings_lookback_window(tmp_path):
     settings_path = _custom_settings(tmp_path, tickers=["aapl"], catchUpLookbackDays=1)
     database = MockPostgresDatabase()
-    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
+    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", "history", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
 
     exit_code = cli.main(
         ["--catch-up"],

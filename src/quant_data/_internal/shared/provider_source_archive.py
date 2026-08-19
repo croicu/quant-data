@@ -69,16 +69,20 @@ class ProviderSourceArchiveWriter:
         self,
         ticker: str,
         provider: str,
+        method: str,
         trading_date: date,
         fetch_version: str,
         payload_kind: PayloadKind,
         payload: dict,
     ) -> None:
         """Appends one row to provider_source_archive and coalesces archive_coverage for
-        (ticker, provider, fetch_version) -- one transaction, so a fetch is never recorded without
-        its coverage range also reflecting it. Callers should invoke this immediately after a
-        provider's fetch_bars() succeeds, before the staging write, so a bug in this repo's own
-        parsing/staging code can't lose the fetch."""
+        (ticker, provider, method, fetch_version) -- one transaction, so a fetch is never recorded
+        without its coverage range also reflecting it. `method` identifies which provider
+        call/endpoint produced this payload (croicu/quant-data#60) -- e.g. IBKR's 'TRADES' vs
+        'BID_ASK' -- and is passed through as-is, not case-normalized like ticker/provider, since
+        IBKR's own whatToShow literals are meaningfully uppercase. Callers should invoke this
+        immediately after a provider's fetch_bars() succeeds, before the staging write, so a bug
+        in this repo's own parsing/staging code can't lose the fetch."""
         normalized_ticker = ticker.upper()
         normalized_provider = provider.lower()
         started = time.perf_counter()
@@ -88,33 +92,60 @@ class ProviderSourceArchiveWriter:
                 cursor.execute(
                     """
                     INSERT INTO provider_source_archive
-                        (ticker, provider, trading_date, fetch_version, payload_kind, payload)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (ticker, provider, method, trading_date, fetch_version, payload_kind, payload)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (normalized_ticker, normalized_provider, trading_date, fetch_version, payload_kind.value, json.dumps(payload)),
+                    (normalized_ticker, normalized_provider, method, trading_date, fetch_version, payload_kind.value, json.dumps(payload)),
                 )
-                self._record_coverage(cursor, normalized_ticker, normalized_provider, fetch_version, trading_date)
+                self._record_coverage(cursor, normalized_ticker, normalized_provider, method, fetch_version, trading_date)
             self._connection.commit()
         except psycopg.Error as error:
             self._connection.rollback()
-            raise AppError(f"Failed to record provider source archive fetch for '{normalized_ticker}' via '{normalized_provider}': {error}") from error
+            raise AppError(
+                f"Failed to record provider source archive fetch for '{normalized_ticker}' via '{normalized_provider}' ({method}): {error}"
+            ) from error
 
-        self._logger.perf(f"record_fetch({normalized_ticker}, {normalized_provider})", time.perf_counter() - started)
+        self._logger.perf(f"record_fetch({normalized_ticker}, {normalized_provider}, {method})", time.perf_counter() - started)
 
-    def _record_coverage(self, cursor: psycopg.Cursor, ticker: str, provider: str, fetch_version: str, trading_date: date) -> None:
+    def mark_covered_without_data(self, ticker: str, provider: str, method: str, trading_date: date, fetch_version: str) -> None:
+        """Extends archive_coverage for a (ticker, provider, method, fetch_version) date known in
+        advance to never have data (e.g. a weekend for a provider with no IBKR-style silent
+        fallback) -- without inserting a provider_source_archive row, since no provider actually
+        returned anything to archive. Lets `ingest` skip a wasted API call against a date that can
+        never have data while still letting archive_coverage consolidate around it, instead of
+        leaving a permanent gap a future run would just re-attempt forever (croicu/quant-data#60)."""
+        normalized_ticker = ticker.upper()
+        normalized_provider = provider.lower()
+        started = time.perf_counter()
+
+        try:
+            with self._connection.cursor() as cursor:
+                self._record_coverage(cursor, normalized_ticker, normalized_provider, method, fetch_version, trading_date)
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(
+                f"Failed to mark '{normalized_ticker}' via '{normalized_provider}' ({method}) covered without data for {trading_date.isoformat()}: {error}"
+            ) from error
+
+        self._logger.perf(f"mark_covered_without_data({normalized_ticker}, {normalized_provider}, {method})", time.perf_counter() - started)
+
+    def _record_coverage(self, cursor: psycopg.Cursor, ticker: str, provider: str, method: str, fetch_version: str, trading_date: date) -> None:
         # Same gaps-and-islands coalescing as PostgresDatabase.record_ingestion_coverage, on plain
         # DATE arithmetic (no surrogate date_id here, unlike quant_data's dim_date) -- keyed by
         # fetch_version too, so bumping a provider's version starts a fresh range rather than
-        # silently extending an old one.
+        # silently extending an old one. Also keyed by method: BID_ASK and TRADES can return
+        # different bar counts for the same window (confirmed live, croicu/quant-data#60), so
+        # coverage for one method says nothing reliable about coverage for another.
         cursor.execute(
             """
             SELECT coverage_id, start_date, end_date
             FROM archive_coverage
-            WHERE ticker = %s AND provider = %s AND fetch_version = %s
+            WHERE ticker = %s AND provider = %s AND method = %s AND fetch_version = %s
               AND start_date <= %s + 1 AND end_date >= %s - 1
             ORDER BY start_date
             """,
-            (ticker, provider, fetch_version, trading_date, trading_date),
+            (ticker, provider, method, fetch_version, trading_date, trading_date),
         )
         touching_rows = cursor.fetchall()
 
@@ -129,8 +160,8 @@ class ProviderSourceArchiveWriter:
 
         if len(touching_rows) == 0:
             cursor.execute(
-                "INSERT INTO archive_coverage (ticker, provider, fetch_version, start_date, end_date) VALUES (%s, %s, %s, %s, %s)",
-                (ticker, provider, fetch_version, trading_date, trading_date),
+                "INSERT INTO archive_coverage (ticker, provider, method, fetch_version, start_date, end_date) VALUES (%s, %s, %s, %s, %s, %s)",
+                (ticker, provider, method, fetch_version, trading_date, trading_date),
             )
             return
 
@@ -194,12 +225,15 @@ class ProviderSourceArchiveReader:
         self._connection.close()
         self._transport.close()
 
-    def fetch_latest_bars(self, ticker: str, provider: str, trading_date: date) -> tuple[PayloadKind, dict] | None:
-        """The most recently archived fetch for (ticker, provider, trading_date), or None if
-        nothing's been archived for that key. provider_source_archive has no uniqueness constraint
-        on that key (a re-fetch is a new row, never an upsert -- see migrations/quant_ingest/
-        001_init_provider_source_archive.sql), so this picks the row with the latest fetched_at as
-        the one worth staging."""
+    def fetch_latest_bars(self, ticker: str, provider: str, method: str, trading_date: date) -> tuple[PayloadKind, dict] | None:
+        """The most recently archived fetch for (ticker, provider, method, trading_date), or None
+        if nothing's been archived for that key. provider_source_archive has no uniqueness
+        constraint on that key (a re-fetch is a new row, never an upsert -- see migrations/
+        quant_ingest/001_init_provider_source_archive.sql), so this picks the row with the latest
+        fetched_at as the one worth staging. `method` must be given explicitly (croicu/quant-data#60)
+        rather than defaulting to "whatever's latest for this provider": once a provider archives
+        more than one method (e.g. IBKR's TRADES and BID_ASK), an unfiltered "latest fetched_at"
+        query could silently pick a non-OHLCV call's row."""
         normalized_ticker = ticker.upper()
         normalized_provider = provider.lower()
         started = time.perf_counter()
@@ -210,17 +244,17 @@ class ProviderSourceArchiveReader:
                     """
                     SELECT payload_kind, payload
                     FROM provider_source_archive
-                    WHERE ticker = %s AND provider = %s AND trading_date = %s
+                    WHERE ticker = %s AND provider = %s AND method = %s AND trading_date = %s
                     ORDER BY fetched_at DESC
                     LIMIT 1
                     """,
-                    (normalized_ticker, normalized_provider, trading_date),
+                    (normalized_ticker, normalized_provider, method, trading_date),
                 )
                 row = cursor.fetchone()
         except psycopg.Error as error:
-            raise AppError(f"Failed to read provider source archive for '{normalized_ticker}' via '{normalized_provider}': {error}") from error
+            raise AppError(f"Failed to read provider source archive for '{normalized_ticker}' via '{normalized_provider}' ({method}): {error}") from error
 
-        self._logger.perf(f"fetch_latest_bars({normalized_ticker}, {normalized_provider})", time.perf_counter() - started)
+        self._logger.perf(f"fetch_latest_bars({normalized_ticker}, {normalized_provider}, {method})", time.perf_counter() - started)
 
         if row is None:
             return None

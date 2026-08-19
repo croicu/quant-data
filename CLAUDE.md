@@ -444,6 +444,37 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
+- **Method-keyed `provider_source_archive`; fetch IBKR TRADES/BID_ASK/MIDPOINT by default** —
+  [issue #60](https://github.com/croicu/quant-data/issues/60) (`cross-repo`, still
+  `status:brainstorm` — this PR is prep work toward it, not a full close), tracked via
+  [tasks/ingestion_layer_spec.md](tasks/ingestion_layer_spec.md) (supersedes
+  [tasks/quote_bar_ingest.md](tasks/quote_bar_ingest.md), kept on disk since #60 still points at it
+  originally). `status:implementation` in effect — branch `ibkr-multi-method-archive`,
+  [PR #62](https://github.com/croicu/quant-data/pull/62) open. `provider_source_archive`/
+  `archive_coverage` gained `method` in their natural key (coalesced into the init migration, not
+  a separate `ALTER` — no production `quant_ingest` data existed yet worth an incremental path).
+  `IntraDayProvider.fetch_bars` gained an optional `method` param (one call = one method, so rate
+  limiting — which sits between `ingest`'s loop and the provider, never inside one — still counts
+  real API requests accurately); `ingest` now loops over each provider's
+  `DEFAULT_METHODS_BY_PROVIDER` entry by default (IBKR: `TRADES`/`BID_ASK`/`MIDPOINT`, added
+  incrementally this session on an explicit collect-now-decide-later basis — cheap to drop later
+  via `provider_source_archive`'s existing `DELETE` grant, expensive to not have collected at all;
+  `ADJUSTED_LAST` stayed excluded, no concrete reason raised), restrictable via new
+  `settings.ibkr.methods`. `BID_ASK`/`MIDPOINT` serialize under honest, non-OHLCV field names
+  (`avg_bid`/`avg_ask` for `BID_ASK`'s flat per-bar averages; real OHLC for `MIDPOINT`, which is a
+  genuine midpoint-price series, not reconstructable from `BID_ASK` alone). New
+  `ProviderSourceArchiveWriter.mark_covered_without_data` fixes a related gap: `yfinance`/`massive`
+  fetch failures on a genuine non-trading weekend used to leave `archive_coverage` permanently
+  split around the gap (a generic `AppError` can't distinguish "no data because closed" from a
+  transient failure after the fact) — `ingest` now checks the calendar before fetching, skipping
+  the wasted API call for non-IBKR providers on a weekend, and marks the date covered directly.
+  Live-verified end to end against CroicuWS2's real IB Gateway across SPY 2026-08-05 through
+  2026-08-18: default-vs-restricted method selection, `BID_ASK`/`MIDPOINT` payload field shape,
+  `--catch-up` against the new archive shape, and coverage consolidation via both a filled weekday
+  gap and the weekend-marking path. `ruff`/`pytest` green (311 passed). Follow-on issue
+  [#61](https://github.com/croicu/quant-data/issues/61) (`status:brainstorm`) tracks what this PR
+  deliberately doesn't do — `stage`/`fact_market_data_1min` still don't consume any of this yet.
+
 - **Split `quant-ingest` into `ingest` (fetch + archive) and `stage` (archive → staging)** —
   [issue #56](https://github.com/croicu/quant-data/issues/56), `status:implementation`, ad-hoc task
   (opened directly, no `tasks/*.md`), picked up the same session it was proposed. #52 shipped

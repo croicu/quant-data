@@ -7,7 +7,7 @@ from datetime import date
 import requests
 from requests.exceptions import HTTPError
 
-from quant_data._internal.contracts import PayloadKind, ProviderFetchResult
+from quant_data._internal.contracts import DEFAULT_METHODS_BY_PROVIDER, PayloadKind, ProviderFetchResult
 
 from ..diagnostics import Logger
 from ..errors import AppError
@@ -37,6 +37,7 @@ class MassiveIntraDay:
     """
 
     FETCH_VERSION = "1"
+    DEFAULT_METHODS = DEFAULT_METHODS_BY_PROVIDER["massive"]
 
     def __init__(
         self,
@@ -58,8 +59,11 @@ class MassiveIntraDay:
     def close(self) -> None:
         pass
 
-    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
+    def fetch_bars(self, ticker: str, target_date: date, method: str | None = None) -> ProviderFetchResult:
         normalized_ticker = ticker.upper()
+        effective_method = method if method is not None else self.DEFAULT_METHODS[0]
+        if effective_method not in self.DEFAULT_METHODS:
+            raise AppError(f"MassiveIntraDay does not recognize method '{effective_method}' -- expected one of: {self.DEFAULT_METHODS}.")
         date_str = target_date.isoformat()
         url = f"{BASE_URL}/v2/aggs/ticker/{normalized_ticker}/range/1/minute/{date_str}/{date_str}"
         params = {
@@ -111,7 +115,7 @@ class MassiveIntraDay:
             f"quant-ingest: fetched {len(raw_bars)} intraday bars for {normalized_ticker} on {target_date.isoformat()} via Massive.",
             category=CATEGORY_MASSIVE,
         )
-        return ProviderFetchResult(payload=payload, payload_kind=PayloadKind.RAW_API_RESPONSE)
+        return ProviderFetchResult(payload=payload, payload_kind=PayloadKind.RAW_API_RESPONSE, method=effective_method)
 
 
 def _request(url: str, params: dict) -> dict:

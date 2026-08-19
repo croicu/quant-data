@@ -8,6 +8,7 @@ from datetime import date as date_type
 from datetime import timedelta
 from pathlib import Path
 
+from quant_data._internal.contracts import PRIMARY_METHOD_BY_PROVIDER
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
@@ -158,8 +159,16 @@ def _stage_one(
     any_provider_staged = False
 
     for provider_name in providers:
+        method = PRIMARY_METHOD_BY_PROVIDER.get(provider_name)
+        if method is None:
+            Logger.warning(
+                f"quant-stage: no known archive method for provider '{provider_name}' -- skipping.",
+                category=CATEGORY_STAGE,
+            )
+            continue
+
         try:
-            archived = archive_reader.fetch_latest_bars(ticker, provider_name, target_date)
+            archived = archive_reader.fetch_latest_bars(ticker, provider_name, method, target_date)
         except AppError as error:
             Logger.warning(
                 f"quant-stage: failed to read archive for '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
