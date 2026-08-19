@@ -22,6 +22,7 @@ class _FailingProvider:
     provider's failure doesn't sink providers that succeed."""
 
     FETCH_VERSION = "1"
+    DEFAULT_METHODS = ["TEST"]
 
     def __init__(self, fail_on: str = "fetch_bars") -> None:
         self.fail_on = fail_on
@@ -33,7 +34,7 @@ class _FailingProvider:
         if self.fail_on == "connect":
             raise AppError("connect failed")
 
-    def fetch_bars(self, ticker: str, target_date: date) -> ProviderFetchResult:
+    def fetch_bars(self, ticker: str, target_date: date, method: str | None = None) -> ProviderFetchResult:
         raise AppError("fetch failed")
 
     def close(self) -> None:
@@ -55,7 +56,7 @@ class _FailingArchiveWriter:
     def __init__(self) -> None:
         self.closed = False
 
-    def record_fetch(self, ticker: str, provider: str, trading_date: date, fetch_version: str, payload_kind, payload: dict) -> None:
+    def record_fetch(self, ticker: str, provider: str, method: str, trading_date: date, fetch_version: str, payload_kind, payload: dict) -> None:
         raise AppError("archive write failed")
 
     def close(self) -> None:
@@ -347,9 +348,10 @@ def test_main_archives_fetch_tagged_with_provider_name():
     )
 
     assert len(archive_writer.recorded_fetches) == 1
-    ticker, provider, trading_date, fetch_version, payload_kind, payload = archive_writer.recorded_fetches[0]
+    ticker, provider, method, trading_date, fetch_version, payload_kind, payload = archive_writer.recorded_fetches[0]
     assert ticker == "AAPL"
     assert provider == "yfinance"
+    assert method == "history"
     assert trading_date == date(2026, 1, 2)
     assert fetch_version == "1"
     assert payload_kind == PayloadKind.PARSED_BARS
@@ -511,3 +513,224 @@ def test_rate_limit_for_massive_returns_none_when_not_configured():
     settings = Settings.load(path=SETTINGS_PATH)
 
     assert cli._rate_limit_for("massive", settings) is None
+
+
+# --- Multi-method fetching (croicu/quant-data#60) ---
+
+
+class _MultiMethodProvider:
+    """Fake IntraDayProvider with more than one DEFAULT_METHODS entry (mirroring IBKRIntraDay's
+    real TRADES + BID_ASK), for testing ingest/cli.py's per-method loop without a real IBKR
+    connection."""
+
+    FETCH_VERSION = "1"
+    DEFAULT_METHODS = ["TRADES", "BID_ASK"]
+
+    def __init__(self) -> None:
+        self.connected = False
+        self.closed = False
+        self.requested_methods: list[str] = []
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def fetch_bars(self, ticker: str, target_date: date, method: str | None = None) -> ProviderFetchResult:
+        effective_method = method if method is not None else self.DEFAULT_METHODS[0]
+        self.requested_methods.append(effective_method)
+        return ProviderFetchResult(payload={"bars": []}, payload_kind=PayloadKind.PARSED_BARS, method=effective_method)
+
+
+def test_main_fetches_all_default_methods_when_none_specified():
+    archive_writer = MockProviderSourceArchiveWriter()
+    provider = _MultiMethodProvider()
+
+    exit_code = cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"ibkr": provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert exit_code == 0
+    assert provider.requested_methods == ["TRADES", "BID_ASK"]
+    assert len(archive_writer.recorded_fetches) == 2
+    archived_methods = []
+    for fetch in archive_writer.recorded_fetches:
+        archived_methods.append(fetch[2])
+    assert archived_methods == ["TRADES", "BID_ASK"]
+
+
+def test_main_restricts_to_settings_ibkr_methods_override(tmp_path):
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], ibkr={"methods": ["BID_ASK"]})
+    archive_writer = MockProviderSourceArchiveWriter()
+    provider = _MultiMethodProvider()
+
+    exit_code = cli.main(
+        ["--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=settings_path,
+        providers={"ibkr": provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert exit_code == 0
+    assert provider.requested_methods == ["BID_ASK"]
+    assert len(archive_writer.recorded_fetches) == 1
+
+
+def test_main_calls_rate_limiter_once_per_method():
+    archive_writer = MockProviderSourceArchiveWriter()
+    provider = _MultiMethodProvider()
+    fake_limiter = _CountingRateLimiter()
+
+    cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"ibkr": provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+        rate_limiters={"ibkr": fake_limiter},
+    )
+
+    assert fake_limiter.acquire_calls == 2
+
+
+def test_main_archives_remaining_methods_when_one_method_fails():
+    # Per-method fault tolerance mirrors the existing per-provider tolerance: one method failing
+    # (e.g. a pacing violation on the second call) doesn't lose the methods that succeeded.
+    class _PartiallyFailingProvider(_MultiMethodProvider):
+        def fetch_bars(self, ticker: str, target_date: date, method: str | None = None) -> ProviderFetchResult:
+            if method == "BID_ASK":
+                raise AppError("pacing violation")
+            return super().fetch_bars(ticker, target_date, method)
+
+    archive_writer = MockProviderSourceArchiveWriter()
+    provider = _PartiallyFailingProvider()
+
+    exit_code = cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=SETTINGS_PATH,
+        providers={"ibkr": provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert exit_code == 0
+    assert len(archive_writer.recorded_fetches) == 1
+    assert archive_writer.recorded_fetches[0][2] == "TRADES"
+
+
+def test_methods_for_returns_provider_default_methods_when_no_settings_override():
+    settings = Settings.load(path=SETTINGS_PATH)
+    provider = _MultiMethodProvider()
+
+    assert cli._methods_for("ibkr", settings, provider) == ["TRADES", "BID_ASK"]
+
+
+def test_methods_for_returns_settings_override_for_ibkr(tmp_path):
+    settings_path = _custom_settings(tmp_path, ibkr={"methods": ["TRADES"]})
+    settings = Settings.load(path=settings_path)
+    provider = _MultiMethodProvider()
+
+    assert cli._methods_for("ibkr", settings, provider) == ["TRADES"]
+
+
+def test_methods_for_ignores_ibkr_settings_override_for_other_providers(tmp_path):
+    settings_path = _custom_settings(tmp_path, ibkr={"methods": ["TRADES"]})
+    settings = Settings.load(path=settings_path)
+
+    assert cli._methods_for("yfinance", settings, MockIntraDayProvider()) == ["history"]
+
+
+# --- Weekend consolidation (croicu/quant-data#60) ---
+
+
+class _TrackingProvider:
+    """Fake IntraDayProvider that records every fetch_bars() call it actually receives, for
+    proving a weekend-skipped (provider, date) pair never reaches fetch_bars at all."""
+
+    FETCH_VERSION = "1"
+    DEFAULT_METHODS = ["PRIMARY"]
+
+    def __init__(self) -> None:
+        self.fetch_calls: list[tuple[str, date]] = []
+
+    def connect(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def fetch_bars(self, ticker: str, target_date: date, method: str | None = None) -> ProviderFetchResult:
+        self.fetch_calls.append((ticker, target_date))
+        return ProviderFetchResult(payload={"bars": []}, payload_kind=PayloadKind.PARSED_BARS, method=self.DEFAULT_METHODS[0])
+
+
+def test_main_marks_weekend_covered_without_data_instead_of_fetching_for_non_ibkr():
+    archive_writer = MockProviderSourceArchiveWriter()
+    provider = _TrackingProvider()
+
+    exit_code = cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-03", "--end-date", "2026-01-04"],  # Sat/Sun
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert provider.fetch_calls == []
+    assert archive_writer.recorded_fetches == []
+    assert len(archive_writer.covered_without_data) == 2
+    for _ticker, provider_name, method, _trading_date, fetch_version in archive_writer.covered_without_data:
+        assert provider_name == "yfinance"
+        assert method == "PRIMARY"
+        assert fetch_version == "1"
+    # Weekend-skip never counts as an actual archived fetch -- same "failed" accounting as before
+    # this feature existed, since no real data was ever written either way.
+    assert exit_code == 1
+
+
+def test_main_does_not_skip_weekend_fetch_for_ibkr():
+    archive_writer = MockProviderSourceArchiveWriter()
+    provider = _TrackingProvider()
+
+    exit_code = cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-03", "--end-date", "2026-01-03"],  # Sat
+        settings_path=SETTINGS_PATH,
+        providers={"ibkr": provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert provider.fetch_calls == [("aapl", date(2026, 1, 3))]
+    assert archive_writer.covered_without_data == []
+    assert exit_code == 0
+
+
+def test_main_does_not_acquire_rate_limiter_for_weekend_skip():
+    archive_writer = MockProviderSourceArchiveWriter()
+    provider = _TrackingProvider()
+    fake_limiter = _CountingRateLimiter()
+
+    cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-03", "--end-date", "2026-01-03"],  # Sat
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+        rate_limiters={"yfinance": fake_limiter},
+    )
+
+    assert fake_limiter.acquire_calls == 0
+
+
+def test_main_does_not_skip_weekday_dates():
+    archive_writer = MockProviderSourceArchiveWriter()
+    provider = _TrackingProvider()
+
+    cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02"],  # Fri
+        settings_path=SETTINGS_PATH,
+        providers={"yfinance": provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert provider.fetch_calls == [("aapl", date(2026, 1, 2))]
+    assert archive_writer.covered_without_data == []

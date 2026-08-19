@@ -593,19 +593,31 @@ not surrogate-key references to `quant_data`'s `dim_ticker`/`dim_provider`.
 | `id` | `BIGSERIAL PRIMARY KEY` | |
 | `ticker` | `TEXT NOT NULL` | `CHECK (ticker = UPPER(ticker))`, mirroring `dim_ticker.ticker`'s own constraint |
 | `provider` | `TEXT NOT NULL` | e.g. `'yfinance'`, `'ibkr'`, `'massive'` — no FK, `quant_ingest` has no `dim_provider` |
+| `method` | `TEXT NOT NULL` | which provider call/endpoint produced this row, e.g. IBKR's `'TRADES'`/`'BID_ASK'`; single-valued for Massive (`'aggregates'`) and yfinance (`'history'`) — see below |
 | `trading_date` | `DATE NOT NULL` | |
 | `fetched_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | |
 | `fetch_version` | `TEXT NOT NULL` | the fetching provider's `IntraDayProvider.FETCH_VERSION` at fetch time |
 | `payload_kind` | `TEXT NOT NULL` | `CHECK (payload_kind IN ('raw_api_response', 'parsed_bars'))` |
 | `payload` | `JSONB NOT NULL` | see below |
 
-No unique constraint on `(ticker, provider, trading_date)` — append-only by design; a re-fetch of
-the same day (a catch-up re-run, a backfill retry) is a new row, never an upsert.
+No unique constraint on `(ticker, provider, method, trading_date)` — append-only by design; a
+re-fetch of the same day (a catch-up re-run, a backfill retry) is a new row, never an upsert.
 `ProviderSourceArchiveWriter.record_fetch` only ever `INSERT`s; nothing in the application code
 issues `UPDATE`/`DELETE` against this table. `quant_writer` originally had `INSERT` + sequence
 `USAGE` only (true DB-enforced immutability); `DELETE` was granted afterward for manual cleanup, at
 the repo owner's explicit, informed request (2026-08-17 — see `docs/DATABASE.md`). `UPDATE` remains
 ungranted — a row can be removed, never edited in place.
+
+`method` was added to the key by [croicu/quant-data#60](https://github.com/croicu/quant-data/issues/60)
+(2026-08-18, `tasks/ingestion_layer_spec.md`), coalesced directly into the init migration rather than
+a separate `ALTER` — no production archive data existed yet worth an incremental migration path.
+A provider's blob is not self-describing on replay without knowing which call produced it: IBKR's
+serialized `BarData` is ambiguous between `TRADES`/`BID_ASK`/`MIDPOINT` without this column. Plain
+`TEXT`, not a `CHECK`-constrained enum — IBKR's set of methods is expected to grow. Sourced from
+each `IntraDayProvider`'s own `METHOD` class attribute (mirrors `FETCH_VERSION`'s precedent),
+itself set from `quant_data._internal.contracts.PRIMARY_METHOD_BY_PROVIDER` — the single source of
+truth both `ingest` (via `provider.METHOD`) and `stage` (which has no provider objects, only
+provider name strings) draw from.
 
 `payload_kind` exists because "raw" isn't uniform across providers: `MassiveIntraDay`'s plain
 `requests.get(...).json()` call genuinely has a raw JSON response to archive
@@ -629,6 +641,7 @@ which archived ranges were fetched under an outdated query shape.
 | `coverage_id` | `SERIAL PRIMARY KEY` | |
 | `ticker` | `TEXT NOT NULL` | |
 | `provider` | `TEXT NOT NULL` | |
+| `method` | `TEXT NOT NULL` | see `provider_source_archive.method` above |
 | `fetch_version` | `TEXT NOT NULL` | |
 | `start_date` | `DATE NOT NULL` | |
 | `end_date` | `DATE NOT NULL` | |
@@ -636,15 +649,18 @@ which archived ranges were fetched under an outdated query shape.
 
 The archive-side equivalent of `quant_data.ingestion_coverage` (croicu/quant-data#31) — coalesced
 contiguous date ranges, updated incrementally on every successful fetch rather than recomputed from
-scratch — but keyed by `(ticker, provider, fetch_version)` instead of just `(ticker, provider)`.
+scratch — but keyed by `(ticker, provider, method, fetch_version)` instead of just
+`(ticker, provider)`. `method` joined this key alongside `provider_source_archive`'s own
+(croicu/quant-data#60): `BID_ASK` and `TRADES` can return different bar counts for the same window
+(confirmed live), so coverage for one method says nothing reliable about coverage for another.
 Unlike `provider_source_archive` (`INSERT`/`DELETE` only, no `UPDATE`), this table *is* fully
 mutated (`quant_writer` has `SELECT`/`INSERT`/`UPDATE`/`DELETE`, same as `ingestion_coverage`) — it's
 maintained summary state, not an archival record itself. A date not covered by *any*
-`fetch_version`'s range for a `(ticker,
-provider)` is a genuine gap ("no IBKR data two weeks ago"); a date covered only by a non-current
-`fetch_version` is stale and a candidate for re-fetching in smaller chunks, without disturbing the
-old version's own range. `ProviderSourceArchiveWriter.record_fetch` writes both tables in one
-transaction, so a fetch is never archived without its coverage range also reflecting it.
+`fetch_version`'s range for a `(ticker, provider, method)` is a genuine gap ("no IBKR TRADES data
+two weeks ago"); a date covered only by a non-current `fetch_version` is stale and a candidate for
+re-fetching in smaller chunks, without disturbing the old version's own range.
+`ProviderSourceArchiveWriter.record_fetch` writes both tables in one transaction, so a fetch is
+never archived without its coverage range also reflecting it.
 
 ## Indexes
 

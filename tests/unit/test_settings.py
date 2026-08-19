@@ -322,6 +322,38 @@ def test_load_raises_when_ibkr_rate_limit_is_missing_a_key(tmp_path):
         Settings.load(path=settings_path)
 
 
+def test_load_defaults_ibkr_methods_to_none(tmp_path):
+    # None means "ingest all methods" (IBKRIntraDay.DEFAULT_METHODS), not "no methods"
+    # (croicu/quant-data#60).
+    settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.ibkr.methods is None
+
+
+def test_load_parses_ibkr_methods_override(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": {"methods": ["TRADES"]}})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.ibkr.methods == ["TRADES"]
+
+
+def test_load_raises_when_ibkr_methods_is_not_a_list(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": {"methods": "TRADES"}})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_raises_when_ibkr_methods_is_empty(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"ibkr": {"methods": []}})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
 def test_load_defaults_yfinance_rate_limit_to_unlimited(tmp_path):
     settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
 

@@ -161,26 +161,50 @@ independent top-level packages.
   `role = 'whistleblower'` and `data_quality = 'rejected'` — no join against
   `fact_pending_manual_resolution`, since a rejected whistleblower value with an accepted candidate
   never becomes pending at all.
-- `IntraDayProvider(Protocol)`: `connect() -> None`, `fetch_bars(ticker, target_date) ->
-  ProviderFetchResult` for a single session day, and `close() -> None`, plus a `FETCH_VERSION: str`
-  class attribute. The ingest-side contract for external data sources — `ingest` depends on this
-  abstraction, not concretely on whichever provider(s) are plugged in. `connect()`/`close()` were
-  added alongside `IBKRIntraDay` (issue #21/#22): a no-op for a stateless per-call fetcher like
+- `IntraDayProvider(Protocol)`: `connect() -> None`, `fetch_bars(ticker, target_date, method:
+  str | None = None) -> ProviderFetchResult` for a single session day and a single method, and
+  `close() -> None`, plus `FETCH_VERSION: str` and `DEFAULT_METHODS: list[str]` class attributes.
+  The ingest-side contract for external data sources — `ingest` depends on this abstraction, not
+  concretely on whichever provider(s) are plugged in. `connect()`/`close()` were added alongside
+  `IBKRIntraDay` (issue #21/#22): a no-op for a stateless per-call fetcher like
   `YahooFinanceIntraDay`, but real lifecycle methods for a provider with an expensive connection
   handshake to amortize across a batch — `ingest` calls `connect()` once per provider at the start
   of a run and `close()` once at the end, uniformly across every configured provider.
   `ProviderFetchResult` (croicu/quant-data#52) is a small dataclass colocated with `IntraDayProvider`
   in this module (the one deliberate exception to this module's own "not data" framing, since it's
-  purely internal and tightly coupled to this one Protocol method) holding `payload: dict` and
-  `payload_kind: PayloadKind` (`RAW_API_RESPONSE` or `PARSED_BARS`) for archiving into the separate
-  `quant_ingest` database. As of croicu/quant-data#56, providers are pure fetchers — the dataclass
-  no longer carries a `bars: list[OHLCV]` field at all; every concrete provider's `fetch_bars`
-  returns only the archivable payload, with `OHLCV` parsing (and any data-quality determination,
-  e.g. NaN/zero-volume handling) moved entirely into `stage`'s per-provider parsers (see the
-  `stage` section below), which read the same payload back out of
+  purely internal and tightly coupled to this one Protocol method) holding `payload: dict`,
+  `payload_kind: PayloadKind` (`RAW_API_RESPONSE` or `PARSED_BARS`), and `method: str` for
+  archiving into the separate `quant_ingest` database. As of croicu/quant-data#56, providers are
+  pure fetchers — the dataclass no longer carries a `bars: list[OHLCV]` field at all; every
+  concrete provider's `fetch_bars` returns only the archivable payload, with `OHLCV` parsing (and
+  any data-quality determination, e.g. NaN/zero-volume handling) moved entirely into `stage`'s
+  per-provider parsers (see the `stage` section below), which read the same payload back out of
   `quant_ingest.provider_source_archive`. `FETCH_VERSION` is a plain string (not numeric) each
   concrete provider bumps by hand whenever its own request construction changes in a way that could
   change what comes back.
+
+  **Multi-method fetching (croicu/quant-data#60, 2026-08-19):** `fetch_bars`'s `method` parameter
+  and `ProviderFetchResult.method` support a provider archiving more than one method per (ticker,
+  date) -- e.g. IBKR's `TRADES` and `BID_ASK` -- as separate `provider_source_archive` rows,
+  without `fetch_bars` itself fetching more than one method per call. `method=None` means "this
+  provider's own primary method" (`DEFAULT_METHODS[0]`); a caller wanting a provider's full
+  default set (`ingest/cli.py`'s `_ingest_one`) loops over `DEFAULT_METHODS` itself and calls
+  `fetch_bars` once per method — deliberately not a single call returning multiple results, so
+  rate limiting (which sits between `_ingest_one`'s loop and the provider, never inside a
+  provider) is acquired once per real API request, not once per logical `fetch_bars` invocation.
+  `quant_data._internal.contracts.DEFAULT_METHODS_BY_PROVIDER` (`{"yfinance": ["history"], "ibkr":
+  ["TRADES", "BID_ASK", "MIDPOINT"], "massive": ["aggregates"]}`) is the single source of truth each provider's
+  `DEFAULT_METHODS` is set from; `PRIMARY_METHOD_BY_PROVIDER` (derived from it, first entry per
+  provider) is what `stage` still consumes for OHLCV staging — unaffected by a provider archiving
+  additional methods, since those extra rows just sit in `provider_source_archive` unconsumed
+  until a method-aware parser exists. `settings.ibkr.methods` (optional array, `IbkrSettings`)
+  overrides which methods `ingest` fetches for `ibkr` specifically — the only provider genuinely
+  multi-valued today; `None` (the default/unset case) means "ingest all of `DEFAULT_METHODS`," not
+  "ingest none." `IBKRIntraDay`'s own per-method serialization differs: `TRADES` bars use the
+  existing OHLCV field names, while `BID_ASK` bars use honest quote-bar field names (`avg_bid`,
+  `avg_ask`, `high`, `low` — `.volume`/`.average`/`.barCount` come back `-1` on a quote-type bar,
+  confirmed live, and are omitted rather than archived as meaningless placeholders) instead of
+  being forced into `TRADES`' OHLCV vocabulary.
 - `ConnectionTransport(Protocol)`: `open() -> tuple[str, int]` (establish whatever's needed to
   reach Postgres, returning the `(host, port)` to connect to) plus `close() -> None`. Introduced so
   `PostgresDatabase` never needs to know *how* Postgres is actually reached (direct TCP vs. an SSH
@@ -288,20 +312,30 @@ independent top-level packages.
   connection-setup shape as `PostgresDatabase` (`ConnectionTransport`, `TimeZone=UTC` pinning, the
   `"localhost"` -> `"127.0.0.1"` normalization, injectable `LoggingSink`), duplicated across both
   rather than shared, since their actual query logic has nothing in common beyond that setup.
-  `ProviderSourceArchiveWriter`'s one real method, `record_fetch(ticker, provider, trading_date,
-  fetch_version, payload_kind, payload)`, writes `provider_source_archive` and coalesces
-  `archive_coverage` in one transaction (same gaps-and-islands coalescing as
+  `ProviderSourceArchiveWriter`'s one real method, `record_fetch(ticker, provider, method,
+  trading_date, fetch_version, payload_kind, payload)`, writes `provider_source_archive` and
+  coalesces `archive_coverage` in one transaction (same gaps-and-islands coalescing as
   `PostgresDatabase.record_ingestion_coverage`, on plain `DATE` arithmetic instead of a surrogate
-  `date_id`, and keyed by `fetch_version` too). It only ever `INSERT`s into `provider_source_archive`
-  — `quant_writer`'s grants there originally excluded `UPDATE`/`DELETE` entirely (true DB-enforced
-  immutability); `DELETE` was granted afterward for manual cleanup, at the repo owner's explicit,
-  informed request (2026-08-17). `UPDATE` remains ungranted.
-  `ProviderSourceArchiveReader`'s one real method, `fetch_latest_bars(ticker, provider,
+  `date_id`, and keyed by `fetch_version`/`method` too — croicu/quant-data#60 added `method` to
+  both tables' natural keys, since a provider's blob isn't self-describing on replay without
+  knowing which call produced it, e.g. IBKR's `TRADES` vs `BID_ASK`). It only ever `INSERT`s into
+  `provider_source_archive` — `quant_writer`'s grants there originally excluded `UPDATE`/`DELETE`
+  entirely (true DB-enforced immutability); `DELETE` was granted afterward for manual cleanup, at
+  the repo owner's explicit, informed request (2026-08-17). `UPDATE` remains ungranted.
+  `method` is sourced from each `IntraDayProvider`'s own `METHOD` class attribute (mirroring
+  `FETCH_VERSION`'s existing precedent), itself set from `contracts.PRIMARY_METHOD_BY_PROVIDER` —
+  the single source of truth for which method each provider's core OHLCV fetch archives under,
+  consumed on the write side via `provider.METHOD` and directly by `stage` (which has no provider
+  objects, only provider name strings).
+  `ProviderSourceArchiveReader`'s one real method, `fetch_latest_bars(ticker, provider, method,
   trading_date) -> tuple[PayloadKind, dict] | None`, reads the most recently archived row for that
   key (`ORDER BY fetched_at DESC LIMIT 1` — the table has no uniqueness constraint on that key, a
   re-fetch is always a new row, never an upsert) and returns `None` if nothing's archived, which
-  `stage` treats as "not this process's job to go fetch," not an error. See `docs/SCHEMA.md`'s
-  `quant_ingest database` section for the full schema/grant history and rationale.
+  `stage` treats as "not this process's job to go fetch," not an error. `method` must be given
+  explicitly rather than defaulting to "whatever's latest for this provider": once a provider
+  archives more than one method, an unfiltered latest-`fetched_at` query could silently pick a
+  non-OHLCV call's row. See `docs/SCHEMA.md`'s `quant_ingest database` section for the full
+  schema/grant history and rationale.
 - `providers/payload.py` — `raw_bars_payload(bars: list[dict]) -> dict`, a thin wrapper
   (`{"bars": bars}`) each provider uses for `ProviderFetchResult.payload` when it has no genuine raw
   API response to archive (`providers/massive.py` doesn't use this — it archives the literal raw
@@ -339,7 +373,7 @@ independent top-level packages.
 - `providers/ibkr.py` — `IBKRIntraDay`, an `IntraDayProvider` implementation wrapping `ib_async`
   (the maintained fork of the archived `ib_insync`), ported from `quant-scratch`'s
   `shared/providers/ibkr.py` (see croicu/quant-scratch#11/#12). Connects to a local IB Gateway/TWS
-  (`127.0.0.1:4002` by default, IB Gateway's paper port) and fetches 1-minute `TRADES` bars
+  (`127.0.0.1:4002` by default, IB Gateway's paper port) and fetches 1-minute bars
   (`useRTH=False`, i.e. including pre-/after-market) via `reqHistoricalData`, ending each session
   day at 20:00 America/New_York. Unlike `YahooFinanceIntraDay`'s stateless per-call HTTP fetch,
   IBKR's connection handshake is expensive enough to amortize across a batch, so `connect()`/
@@ -353,7 +387,28 @@ independent top-level packages.
   parsed bar `ACCEPTED`, no zero-volume-as-incomplete heuristic (unlike yfinance's parser): IBKR
   only returns bars it actually has trade data for, so a zero-volume bar is a real "no trades that
   minute" fact, not a synthesized placeholder — this is exactly the gap `YahooFinanceIntraDay` has
-  that motivated adding this provider. Tested via `tests/unit/test_ibkr.py` plus a live
+  that motivated adding this provider (`stage` only ever consumes `TRADES`' `PRIMARY_METHOD`
+  output today — see below).
+
+  **`DEFAULT_METHODS = ["TRADES", "BID_ASK", "MIDPOINT"]`** (croicu/quant-data#60): `whatToShow` is
+  now `fetch_bars`'s `method` argument rather than a hardcoded literal, dispatched to one of three
+  module-level serializers (`_SERIALIZERS`) by method — `_serialize_trades_bar` (today's OHLCV
+  field names, unchanged), `_serialize_bid_ask_bar` (`avg_bid`/`avg_ask`/`high`/`low` — `.open`/
+  `.close` on a `BID_ASK` bar are the time-averaged bid/ask, not a real trade open/close, so they
+  keep their own honest field names rather than the `TRADES` vocabulary), or
+  `_serialize_midpoint_bar` (real OHLC field names, since `MIDPOINT`'s `.open`/`.high`/`.low`/
+  `.close` genuinely are an OHLC series of the bid/ask midpoint price — unlike `BID_ASK`'s flat
+  per-bar averages, not reconstructable from `BID_ASK` alone). `.volume`/`.average`/`.barCount`
+  come back `-1` on any quote-type bar (`BID_ASK`/`MIDPOINT`) and are omitted from both, not
+  archived as meaningless placeholders. `MIDPOINT` was added 2026-08-19 on an explicit
+  collect-now-decide-later basis (repo owner's call, weighing that `provider_source_archive`
+  already has a real `DELETE` grant for later cleanup against the cost of not having the data to
+  analyze at all) — `ADJUSTED_LAST` remains excluded, no concrete reason to ingest it yet. An
+  unrecognized method (anything not in `_SERIALIZERS`) raises `AppError`. With no
+  `settings.ibkr.methods` override, `ingest` now fetches **all three** methods for every (ticker,
+  date) by default — roughly tripling IBKR call volume per day versus before croicu/quant-data#60,
+  within the existing `settings.ibkr.rateLimit` ceiling (50 requests/600s).
+  Tested via `tests/unit/test_ibkr.py` plus a live
   `tests/integration/test_ibkr.py` probe against a real Gateway (requires one running and
   reachable at the configured host/port — that test fails, not skips, without one, same as any
   other integration test in this repo hitting a real external dependency). **Wired into `ingest`**

@@ -390,6 +390,41 @@ under `/local/` to the box:
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
+- **File**: [Ingestion layer spec](tasks/ingestion_layer_spec.md) (supersedes
+  [Quote-bar enrichment ingest](tasks/quote_bar_ingest.md) — that file's problem statement/evidence
+  still stand and are carried forward, but its open questions are answered here instead; kept on
+  disk, not deleted, since tracking issue #60 below still points at it originally)
+- **Status**: Landing-zone design converged and now real, live-verified code — not just schema.
+  `provider_source_archive`/`archive_coverage` carry `method` in their key (coalesced migration,
+  applied to CroicuWS2's `quant_ingest`). As of 2026-08-19, `ingest` itself fetches and archives
+  three IBKR methods (`TRADES` + `BID_ASK` + `MIDPOINT`) by default — `IntraDayProvider.fetch_bars`
+  gained an optional `method` param, `settings.ibkr.methods` (unset = all) restricts it, and both
+  paths were live-verified against CroicuWS2's real IB Gateway (SPY 2026-08-17 archived TRADES+
+  BID_ASK by default before MIDPOINT was added; SPY 2026-08-18 with `methods: ["TRADES"]` archived
+  only that one; SPY 2026-08-13 archived all three, MIDPOINT confirmed real OHLC shape).
+  `MIDPOINT` was added on an explicit collect-now-decide-later basis (repo owner's call — data is
+  cheap to drop later via the existing `DELETE` grant, expensive to not have collected at all);
+  `ADJUSTED_LAST` remains excluded, no concrete reason raised. `ruff`/`pytest` green (304 passed).
+  Not yet committed, and no `status:implementation` GitHub issue opened for this slice specifically
+  — tracking issue [croicu/quant-data#60](https://github.com/croicu/quant-data/issues/60)
+  (`cross-repo`) is still labeled `status:brainstorm`; relabeling/opening the implementation issue
+  and committing are both still the repo owner's call per this file's own workflow.
+  `stage`/`fact_market_data_1min` actually consuming `BID_ASK`/`MIDPOINT` remain open — see
+  `tasks/ingestion_layer_spec.md` §6/§7/§8 for full detail.
+- **Key Context**: follow-on to `quant-scratch`'s prototype (croicu/quant-scratch#26/#27) validating
+  that IBKR (`WAP`/trade-count from the existing `TRADES` call, plus a separate `BID_ASK` call) and
+  Massive (`vw`/`n` free on the existing OHLCV response, no bid/ask on any tier below Stocks
+  Advanced/Business) both expose usable per-minute enrichment fields beyond OHLCV. Follow-on to
+  [croicu/quant-data#44](https://github.com/croicu/quant-data/issues/44) (Massive as a second OHLCV
+  candidate), not a duplicate of it. A real, previously-unknown gap surfaced checking the spec's own
+  open item against code: current IBKR ingestion ([ibkr.py:109-118](src/quant_data/_internal/shared/providers/ibkr.py#L109-L118))
+  discards `ib_async`'s `BarData.average`/`.barCount` (WAP/trade-count) before archiving, so
+  `provider_source_archive`'s "lossless, replayable" property does not actually hold for IBKR
+  today — every historical IBKR row is affected, and reparsing WAP/trade-count for an already-
+  archived day would need a genuine, pacing-limited re-fetch. Massive is unaffected (archive already
+  stores the full raw JSON response). This fix is folded into #60's implementation rather than
+  tracked separately.
+
 - **File**: [Pipeline accuracy hardening](tasks/pipeline_accuracy_hardening.md) (supersedes
   [Per-ticker disagreement stats](tasks/per_ticker_disagreement.md) — that file's motivating
   evidence/ticker concentration data still stand and were carried forward, but its

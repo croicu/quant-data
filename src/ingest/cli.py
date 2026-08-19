@@ -115,6 +115,20 @@ def _date_range(start_date: date_type, end_date: date_type) -> list[date_type]:
     return dates
 
 
+def _is_weekend(target_date: date_type) -> bool:
+    return target_date.weekday() >= 5
+
+
+def _provider_never_has_weekend_data(provider_name: str) -> bool:
+    # IBKR is the one exception: reqHistoricalData doesn't fail for a weekend date, it silently
+    # returns the prior trading day's session instead (croicu/quant-data#56's split-work
+    # follow-on fix) -- so it already "covers" weekends fine on its own and needs no special
+    # handling here. yfinance/massive both genuinely have no data on a real non-trading day and
+    # raise AppError -- there is no chance that ever changes, so retrying it via a real API call
+    # every run just wastes rate-limited quota for a known-empty answer.
+    return provider_name != "ibkr"
+
+
 def _default_archive_writer_factory(postgres_settings: PostgresSettings) -> ProviderSourceArchiveWriter:
     if postgres_settings.archive_dbname is None:
         raise AppError("settings.postgres.archiveDbname is required to run quant-ingest -- there is nowhere to archive fetches to without it.")
@@ -174,10 +188,21 @@ def _default_rate_limiters(settings: Settings) -> dict[str, RateLimiter]:
     return rate_limiters
 
 
+def _methods_for(name: str, settings: Settings, provider: IntraDayProvider) -> list[str]:
+    # Only IBKR carries a settings override today (settings.ibkr.methods, croicu/quant-data#60) --
+    # it's the only provider genuinely multi-valued; every other provider always ingests its own
+    # DEFAULT_METHODS (trivially a single entry). None (unset) means "ingest all methods," i.e.
+    # the provider's own DEFAULT_METHODS, not just its primary one.
+    if name == "ibkr" and settings.ibkr.methods is not None:
+        return settings.ibkr.methods
+    return provider.DEFAULT_METHODS
+
+
 def _ingest_one(
     providers: dict[str, IntraDayProvider],
     archive_writer: ProviderSourceArchiveWriter,
     rate_limiters: dict[str, RateLimiter],
+    methods_by_provider: dict[str, list[str]],
     ticker: str,
     target_date: date_type,
 ) -> int | None:
@@ -188,51 +213,91 @@ def _ingest_one(
     # problem. Each configured provider is fetched and archived independently, blind to what other
     # providers returned for the same day -- one provider failing (bad ticker on that source,
     # gateway unreachable, ...) doesn't stop the others from still archiving their own data for
-    # this (ticker, date).
+    # this (ticker, date). Same tolerance applies one level deeper, per method (croicu/quant-data#60):
+    # a provider fetching multiple methods (e.g. IBKR's TRADES + BID_ASK) archives each
+    # independently, so one method failing doesn't lose the others.
     Logger.diagnostic(
         f"quant-ingest: starting {ticker.upper()} on {target_date.isoformat()}.",
         category=CATEGORY_INGEST,
     )
 
     any_provider_succeeded = False
+    archived_count = 0
 
     for provider_name, provider in providers.items():
-        rate_limiter = rate_limiters.get(provider_name)
-        if rate_limiter is not None:
-            rate_limiter.acquire()
+        methods = methods_by_provider.get(provider_name, provider.DEFAULT_METHODS)
 
-        try:
-            fetch_result = provider.fetch_bars(ticker, target_date)
-        except AppError as error:
-            Logger.warning(
-                f"quant-ingest: failed to fetch '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
-                category=_FETCH_FAILURE_CATEGORY.get(provider_name, CATEGORY_INGEST),
-            )
-            continue
+        for method in methods:
+            if _is_weekend(target_date) and _provider_never_has_weekend_data(provider_name):
+                # Known in advance, not learned by attempting and catching the failure: this date
+                # can never have data for this provider, so there's no point spending a real
+                # (rate-limited) API call to relearn that. Extends archive_coverage directly
+                # instead, so a genuine gap (e.g. IBKR down mid-batch) still shows up as a gap,
+                # while a weekend consolidates instead of staying open forever.
+                try:
+                    archive_writer.mark_covered_without_data(
+                        ticker=ticker,
+                        provider=provider_name,
+                        method=method,
+                        trading_date=target_date,
+                        fetch_version=provider.FETCH_VERSION,
+                    )
+                except AppError as error:
+                    Logger.warning(
+                        f"quant-ingest: failed to mark '{ticker.upper()}' on {target_date.isoformat()} covered without data "
+                        f"via '{provider_name}' (method={method}): {error}",
+                        category=CATEGORY_INGEST,
+                    )
+                    continue
+                Logger.diagnostic(
+                    f"quant-ingest: '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}' (method={method}) "
+                    f"is a weekend -- marked covered without data instead of fetching.",
+                    category=CATEGORY_INGEST,
+                )
+                continue
 
-        try:
-            archive_writer.record_fetch(
-                ticker=ticker,
-                provider=provider_name,
-                trading_date=target_date,
-                fetch_version=provider.FETCH_VERSION,
-                payload_kind=fetch_result.payload_kind,
-                payload=fetch_result.payload,
-            )
-        except AppError as error:
-            Logger.warning(
-                f"quant-ingest: failed to record provider source archive for '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}': {error}",
-                category=CATEGORY_INGEST,
-            )
-            continue
+            rate_limiter = rate_limiters.get(provider_name)
+            if rate_limiter is not None:
+                # Acquired once per real fetch_bars() call, i.e. once per method -- rate limiting
+                # sits between this orchestration loop and the provider (never inside a provider),
+                # so it must count actual API requests, not logical (provider, date) pairs.
+                rate_limiter.acquire()
 
-        any_provider_succeeded = True
+            try:
+                fetch_result = provider.fetch_bars(ticker, target_date, method=method)
+            except AppError as error:
+                Logger.warning(
+                    f"quant-ingest: failed to fetch '{ticker.upper()}' on {target_date.isoformat()} via '{provider_name}' (method={method}): {error}",
+                    category=_FETCH_FAILURE_CATEGORY.get(provider_name, CATEGORY_INGEST),
+                )
+                continue
+
+            try:
+                archive_writer.record_fetch(
+                    ticker=ticker,
+                    provider=provider_name,
+                    method=fetch_result.method,
+                    trading_date=target_date,
+                    fetch_version=provider.FETCH_VERSION,
+                    payload_kind=fetch_result.payload_kind,
+                    payload=fetch_result.payload,
+                )
+            except AppError as error:
+                Logger.warning(
+                    f"quant-ingest: failed to record provider source archive for '{ticker.upper()}' on {target_date.isoformat()} "
+                    f"via '{provider_name}' (method={method}): {error}",
+                    category=CATEGORY_INGEST,
+                )
+                continue
+
+            any_provider_succeeded = True
+            archived_count += 1
 
     if not any_provider_succeeded:
         return None
 
     Logger.info(
-        f"quant-ingest: archived {ticker.upper()} on {target_date.isoformat()} across {len(providers)} provider(s).",
+        f"quant-ingest: archived {ticker.upper()} on {target_date.isoformat()} across {archived_count} provider/method combination(s).",
         category=CATEGORY_INGEST,
     )
     return 0
@@ -294,6 +359,10 @@ def main(
         if not connected_providers:
             raise AppError("No configured provider could connect -- check settings.providers and each provider's connection settings.")
 
+        methods_by_provider: dict[str, list[str]] = {}
+        for provider_name, provider_instance in connected_providers.items():
+            methods_by_provider[provider_name] = _methods_for(provider_name, settings, provider_instance)
+
         active_rate_limiters = rate_limiters if rate_limiters is not None else _default_rate_limiters(settings)
         active_archive_writer_factory = archive_writer_factory if archive_writer_factory is not None else _default_archive_writer_factory
 
@@ -326,7 +395,7 @@ def main(
 
             for target_date in target_dates:
                 for ticker in tickers:
-                    result = _ingest_one(connected_providers, archive_writer, active_rate_limiters, ticker, target_date)
+                    result = _ingest_one(connected_providers, archive_writer, active_rate_limiters, methods_by_provider, ticker, target_date)
                     if result is None:
                         failed.append((ticker, target_date))
                     else:

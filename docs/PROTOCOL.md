@@ -41,7 +41,14 @@ CLI signature and file format schemas for `quant-data`.
   rollout, means a separate invocation against a separate settings file); unrecognized names fail
   fast at startup. `settings.ibkr` (`host`/`port`/`clientId`, all optional — default to
   `IBKRIntraDay`'s own defaults, IB Gateway's paper port `4002`) — only consulted when `"ibkr"` is
-  in `settings.providers`. `settings.massive` (`apiKey`, required if the object is present — no
+  in `settings.providers`. `settings.ibkr.methods` (optional array of strings, e.g. `["TRADES"]` —
+  croicu/quant-data#60) restricts which IBKR method(s) `quant-ingest` fetches per (ticker, date);
+  **omitted (the default) means all of `IBKRIntraDay.DEFAULT_METHODS`** (`TRADES`, `BID_ASK`, and
+  `MIDPOINT` today), archived as separate `provider_source_archive` rows under their own `method`
+  — not just the primary/OHLCV one. This roughly triples IBKR call volume per (ticker, date) versus
+  before croicu/quant-data#60, within `settings.ibkr.rateLimit`'s existing ceiling. No equivalent setting
+  exists for `yfinance`/`massive` — both are genuinely single-method, so there's nothing to
+  restrict. `settings.massive` (`apiKey`, required if the object is present — no
   usable local default, a free-tier account credential) — only consulted when `"massive"` is in
   `settings.providers`; `"massive"` in `settings.providers` without a configured `settings.massive`
   fails fast at startup. `settings.ibkr.rateLimit`/`settings.yfinance.rateLimit`/

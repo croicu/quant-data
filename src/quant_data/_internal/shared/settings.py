@@ -73,6 +73,11 @@ class IbkrSettings:
     port: int = IBKR_DEFAULT_PORT
     client_id: int = IBKR_DEFAULT_CLIENT_ID
     rate_limit: RateLimitSettings | None = field(default_factory=_default_ibkr_rate_limit)
+    # None (the default) means "ingest all methods" -- IBKRIntraDay.DEFAULT_METHODS
+    # (croicu/quant-data#60). A configured list restricts a run to just those methods; only IBKR
+    # carries this today since it's the only provider genuinely multi-valued -- see
+    # quant_data._internal.contracts.DEFAULT_METHODS_BY_PROVIDER.
+    methods: list[str] | None = None
 
 
 @dataclass
@@ -297,11 +302,20 @@ class Settings:
                 if not isinstance(ibkr_rate_limit_payload, dict):
                     raise TaskError("'settings.ibkr.rateLimit' must be a JSON object.")
                 ibkr_rate_limit = _parse_rate_limit_payload(ibkr_rate_limit_payload, "settings.ibkr")
+            ibkr_methods: list[str] | None = None
+            ibkr_methods_payload = ibkr_payload.get("methods")
+            if ibkr_methods_payload is not None:
+                if not isinstance(ibkr_methods_payload, list) or not ibkr_methods_payload:
+                    raise TaskError("'settings.ibkr.methods' must be a non-empty array of strings.")
+                ibkr_methods = []
+                for method_name in ibkr_methods_payload:
+                    ibkr_methods.append(str(method_name))
             ibkr_settings = IbkrSettings(
                 host=str(ibkr_payload.get("host", IBKR_DEFAULT_HOST)),
                 port=int(ibkr_payload.get("port", IBKR_DEFAULT_PORT)),
                 client_id=int(ibkr_payload.get("clientId", IBKR_DEFAULT_CLIENT_ID)),
                 rate_limit=ibkr_rate_limit,
+                methods=ibkr_methods,
             )
 
         yfinance_settings = YfinanceSettings()
