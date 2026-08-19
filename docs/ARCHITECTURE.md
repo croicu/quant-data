@@ -93,6 +93,15 @@ independent top-level packages.
   `docs/SCHEMA.md`'s `fact_market_data_1min.data_quality`). Re-exported at the `quant_data` top
   level. **Breaking change (`009_replace_incomplete_with_data_quality`)**: this field was
   `incomplete: bool` before; now `data_quality: DataQuality`.
+  **Additive (`018_add_supplement_fields`, croicu/quant-data#61)**: 8 new optional fields, all
+  defaulting to `None` — `wap`/`trade_count` (trade group: winner-gated, rides along with whichever
+  provider won that bar's `ohlc` reconciliation, same precedent as `volume`) and `avg_bid`/
+  `avg_ask`/`midpoint_open`/`midpoint_high`/`midpoint_low`/`midpoint_close` (quote group: not
+  winner-gated, populated from whichever provider reports them, independent of the `ohlc` vote —
+  see `docs/SCHEMA.md`'s `fact_market_data_1min` section for the full split rationale). Not a
+  breaking change to the constructor or existing attribute access; announced to `quant-scratch`
+  via [croicu/quant-scratch#28](https://github.com/croicu/quant-scratch/issues/28), same
+  informational/opt-in treatment as #17/#19/#20's own additive public-surface changes.
 - `ProviderRole(Enum)`: `CANDIDATE`/`WHISTLEBLOWER`/`ADVISOR` (`ADVISOR` added in
   `011_add_market_data_archive`, croicu/quant-data#35 — can suggest a value but has no autonomous
   authoring rights, unlike `CANDIDATE`), mirroring `dim_provider.role`'s `CHECK` constraint. A
@@ -572,6 +581,16 @@ here either.
 - A `(ticker, provider, date)` with nothing archived (`ProviderSourceArchiveReader.fetch_latest_bars`
   returns `None`) is skipped, not treated as an error — going and fetching it is `ingest`'s job, not
   `stage`'s; a bar only actually reaches `staging_market_data_1min` once both processes have run.
+- **Supplement fields** (croicu/quant-data#61) — after the primary parse, `_stage_one` looks up
+  `DEFAULT_METHODS_BY_PROVIDER[provider_name][1:]` (any method beyond the provider's primary one,
+  e.g. IBKR's `BID_ASK`/`MIDPOINT` alongside `TRADES`) and, for each one actually archived, calls
+  `stage.parsers.apply_supplementary_payload(provider, method, payload, bars_by_timestamp)` to
+  merge it into the matching primary bar by timestamp — mutating the already-parsed `OHLCV` objects
+  in place rather than writing a separate row/table. Massive's `wap`/`trade_count` need no merge
+  step at all: `massive_parser.parse` pulls `vw`/`n` straight out of the same `aggregates` payload
+  already being parsed for OHLCV. A supplementary method with nothing archived is silently skipped,
+  same tolerance as the primary payload lookup above (e.g. a day archived before MIDPOINT started
+  being fetched by default, or a `settings.ibkr.methods` restriction).
 - **Weekend dates are skipped outright** (`_is_weekend`, `target_date.weekday() >= 5`), before ever
   consulting the archive — not counted toward `succeeded`/`failed` either. `ingest` deliberately
   still fetches/archives them (no change there): IBKR's `reqHistoricalData` doesn't fail for a
@@ -902,6 +921,15 @@ the full design (field consistency groups, the candidate/whistleblower model, th
   Today that's just `'ohlc'` — `volume` is no longer its own field group (see
   `tasks/volume_reconciliation.md`); the promoted row's `volume` and `data_quality` come straight
   off the `'ohlc'` winner's own `StagingRow`, not a separately resolved value.
+- **Supplement fields** (croicu/quant-data#61) piggyback on this same promotion step, with two
+  different rules by data source (see `docs/SCHEMA.md`'s `fact_market_data_1min` section for the
+  full rationale). `_promote_and_lazily_purge` passes `wap`/`trade_count` straight off the `'ohlc'`
+  winner's own `StagingRow`, same treatment as `volume` above — no extra lookup needed, since it's
+  the same row already selected. `avg_bid`/`avg_ask`/`midpoint_*` are *not* tied to the `'ohlc'`
+  winner: `_find_quote_group_row` scans every candidate's `StagingRow` for the bar and returns the
+  first one reporting any quote field, independent of which provider won `'ohlc'` — only `ibkr`
+  ever populates these today, so in practice this always resolves to `ibkr`'s row (or `None`,
+  leaving every quote column `NULL`) regardless of who won the bar.
 - **Lazy purge.** `promote_bar_to_fact` (upsert into `fact_market_data_1min`) and
   `purge_staging_bar` (delete that bar's staging rows) are separate calls, not one atomic step.
   After promoting, a bar's staging rows are purged only if neither adjacent minute (`t-1`/`t+1`,

@@ -36,6 +36,24 @@ class OHLCV:
     close: float
     volume: int
     data_quality: DataQuality = DataQuality.ACCEPTED
+    # Supplement fields (croicu/quant-data#61) -- all optional, default None: not every provider
+    # reports them, and fact_market_data_1min's own promotion rule leaves them null even when a
+    # provider did report them but didn't win that bar's OHLC vote (trade group only -- see the
+    # module-level split below). Purely additive to this constructor, not a breaking change.
+    #
+    # Trade group -- computed from the same trade prints as OHLC/volume, so winner-gated exactly
+    # like volume already is (tasks/volume_reconciliation.md): populated from whichever provider
+    # won the bar's OHLC reconciliation, null if that provider didn't report it.
+    wap: float | None = None
+    trade_count: int | None = None
+    # Quote group -- a different feed (the NBBO quote book, not the trade tape), not winner-gated:
+    # populated from whichever provider reported it, independent of the OHLC vote.
+    avg_bid: float | None = None
+    avg_ask: float | None = None
+    midpoint_open: float | None = None
+    midpoint_high: float | None = None
+    midpoint_low: float | None = None
+    midpoint_close: float | None = None
 
 
 class ProviderRole(Enum):

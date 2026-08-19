@@ -8,7 +8,7 @@ from datetime import date as date_type
 from datetime import timedelta
 from pathlib import Path
 
-from quant_data._internal.contracts import PRIMARY_METHOD_BY_PROVIDER
+from quant_data._internal.contracts import DEFAULT_METHODS_BY_PROVIDER, PRIMARY_METHOD_BY_PROVIDER
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
 from quant_data._internal.shared.postgres import PostgresDatabase
@@ -17,7 +17,7 @@ from quant_data._internal.shared.settings import PostgresSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
 from quant_data.protocols import DataQuality
 
-from .parsers import parse_payload
+from .parsers import apply_supplementary_payload, parse_payload
 
 CATEGORY_STAGE = "stage"
 
@@ -191,6 +191,40 @@ def _stage_one(
                 category=CATEGORY_STAGE,
             )
             continue
+
+        # Supplement fields (croicu/quant-data#61) -- any method beyond this provider's primary
+        # (e.g. IBKR's BID_ASK/MIDPOINT alongside TRADES) is archived separately but merges into
+        # these same per-minute bars by timestamp, rather than becoming its own staging row.
+        # Massive's wap/trade_count need no merge -- parse_payload above already pulled them
+        # straight out of the primary aggregates payload.
+        bars_by_timestamp = {}
+        for bar in bars:
+            bars_by_timestamp[bar.timestamp] = bar
+
+        supplementary_methods = DEFAULT_METHODS_BY_PROVIDER.get(provider_name, [method])[1:]
+        for supplementary_method in supplementary_methods:
+            try:
+                supplementary_archived = archive_reader.fetch_latest_bars(ticker, provider_name, supplementary_method, target_date)
+            except AppError as error:
+                Logger.warning(
+                    f"quant-stage: failed to read '{supplementary_method}' archive for '{ticker.upper()}' on {target_date.isoformat()} "
+                    f"via '{provider_name}': {error}",
+                    category=CATEGORY_STAGE,
+                )
+                continue
+
+            if supplementary_archived is None:
+                continue
+
+            _supplementary_payload_kind, supplementary_payload = supplementary_archived
+            try:
+                apply_supplementary_payload(provider_name, supplementary_method, supplementary_payload, bars_by_timestamp)
+            except AppError as error:
+                Logger.warning(
+                    f"quant-stage: failed to parse '{supplementary_method}' archive for '{ticker.upper()}' on {target_date.isoformat()} "
+                    f"via '{provider_name}': {error}",
+                    category=CATEGORY_STAGE,
+                )
 
         try:
             written = database.write_staging_bars(provider_name, bars)
