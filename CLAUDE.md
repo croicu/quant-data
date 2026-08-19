@@ -390,41 +390,6 @@ under `/local/` to the box:
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
-- **File**: [Ingestion layer spec](tasks/ingestion_layer_spec.md) (supersedes
-  [Quote-bar enrichment ingest](tasks/quote_bar_ingest.md) — that file's problem statement/evidence
-  still stand and are carried forward, but its open questions are answered here instead; kept on
-  disk, not deleted, since tracking issue #60 below still points at it originally)
-- **Status**: Landing-zone design converged and now real, live-verified code — not just schema.
-  `provider_source_archive`/`archive_coverage` carry `method` in their key (coalesced migration,
-  applied to CroicuWS2's `quant_ingest`). As of 2026-08-19, `ingest` itself fetches and archives
-  three IBKR methods (`TRADES` + `BID_ASK` + `MIDPOINT`) by default — `IntraDayProvider.fetch_bars`
-  gained an optional `method` param, `settings.ibkr.methods` (unset = all) restricts it, and both
-  paths were live-verified against CroicuWS2's real IB Gateway (SPY 2026-08-17 archived TRADES+
-  BID_ASK by default before MIDPOINT was added; SPY 2026-08-18 with `methods: ["TRADES"]` archived
-  only that one; SPY 2026-08-13 archived all three, MIDPOINT confirmed real OHLC shape).
-  `MIDPOINT` was added on an explicit collect-now-decide-later basis (repo owner's call — data is
-  cheap to drop later via the existing `DELETE` grant, expensive to not have collected at all);
-  `ADJUSTED_LAST` remains excluded, no concrete reason raised. `ruff`/`pytest` green (304 passed).
-  Not yet committed, and no `status:implementation` GitHub issue opened for this slice specifically
-  — tracking issue [croicu/quant-data#60](https://github.com/croicu/quant-data/issues/60)
-  (`cross-repo`) is still labeled `status:brainstorm`; relabeling/opening the implementation issue
-  and committing are both still the repo owner's call per this file's own workflow.
-  `stage`/`fact_market_data_1min` actually consuming `BID_ASK`/`MIDPOINT` remain open — see
-  `tasks/ingestion_layer_spec.md` §6/§7/§8 for full detail.
-- **Key Context**: follow-on to `quant-scratch`'s prototype (croicu/quant-scratch#26/#27) validating
-  that IBKR (`WAP`/trade-count from the existing `TRADES` call, plus a separate `BID_ASK` call) and
-  Massive (`vw`/`n` free on the existing OHLCV response, no bid/ask on any tier below Stocks
-  Advanced/Business) both expose usable per-minute enrichment fields beyond OHLCV. Follow-on to
-  [croicu/quant-data#44](https://github.com/croicu/quant-data/issues/44) (Massive as a second OHLCV
-  candidate), not a duplicate of it. A real, previously-unknown gap surfaced checking the spec's own
-  open item against code: current IBKR ingestion ([ibkr.py:109-118](src/quant_data/_internal/shared/providers/ibkr.py#L109-L118))
-  discards `ib_async`'s `BarData.average`/`.barCount` (WAP/trade-count) before archiving, so
-  `provider_source_archive`'s "lossless, replayable" property does not actually hold for IBKR
-  today — every historical IBKR row is affected, and reparsing WAP/trade-count for an already-
-  archived day would need a genuine, pacing-limited re-fetch. Massive is unaffected (archive already
-  stores the full raw JSON response). This fix is folded into #60's implementation rather than
-  tracked separately.
-
 - **File**: [Pipeline accuracy hardening](tasks/pipeline_accuracy_hardening.md) (supersedes
   [Per-ticker disagreement stats](tasks/per_ticker_disagreement.md) — that file's motivating
   evidence/ticker concentration data still stand and were carried forward, but its
@@ -478,6 +443,37 @@ under `/local/` to the box:
   purpose in the GitHub issue, not assumed away.
 
 ## Pending Tasks
+
+- **Method-keyed `provider_source_archive`; fetch IBKR TRADES/BID_ASK/MIDPOINT by default** —
+  [issue #60](https://github.com/croicu/quant-data/issues/60) (`cross-repo`, still
+  `status:brainstorm` — this PR is prep work toward it, not a full close), tracked via
+  [tasks/ingestion_layer_spec.md](tasks/ingestion_layer_spec.md) (supersedes
+  [tasks/quote_bar_ingest.md](tasks/quote_bar_ingest.md), kept on disk since #60 still points at it
+  originally). `status:implementation` in effect — branch `ibkr-multi-method-archive`,
+  [PR #62](https://github.com/croicu/quant-data/pull/62) open. `provider_source_archive`/
+  `archive_coverage` gained `method` in their natural key (coalesced into the init migration, not
+  a separate `ALTER` — no production `quant_ingest` data existed yet worth an incremental path).
+  `IntraDayProvider.fetch_bars` gained an optional `method` param (one call = one method, so rate
+  limiting — which sits between `ingest`'s loop and the provider, never inside one — still counts
+  real API requests accurately); `ingest` now loops over each provider's
+  `DEFAULT_METHODS_BY_PROVIDER` entry by default (IBKR: `TRADES`/`BID_ASK`/`MIDPOINT`, added
+  incrementally this session on an explicit collect-now-decide-later basis — cheap to drop later
+  via `provider_source_archive`'s existing `DELETE` grant, expensive to not have collected at all;
+  `ADJUSTED_LAST` stayed excluded, no concrete reason raised), restrictable via new
+  `settings.ibkr.methods`. `BID_ASK`/`MIDPOINT` serialize under honest, non-OHLCV field names
+  (`avg_bid`/`avg_ask` for `BID_ASK`'s flat per-bar averages; real OHLC for `MIDPOINT`, which is a
+  genuine midpoint-price series, not reconstructable from `BID_ASK` alone). New
+  `ProviderSourceArchiveWriter.mark_covered_without_data` fixes a related gap: `yfinance`/`massive`
+  fetch failures on a genuine non-trading weekend used to leave `archive_coverage` permanently
+  split around the gap (a generic `AppError` can't distinguish "no data because closed" from a
+  transient failure after the fact) — `ingest` now checks the calendar before fetching, skipping
+  the wasted API call for non-IBKR providers on a weekend, and marks the date covered directly.
+  Live-verified end to end against CroicuWS2's real IB Gateway across SPY 2026-08-05 through
+  2026-08-18: default-vs-restricted method selection, `BID_ASK`/`MIDPOINT` payload field shape,
+  `--catch-up` against the new archive shape, and coverage consolidation via both a filled weekday
+  gap and the weekend-marking path. `ruff`/`pytest` green (311 passed). Follow-on issue
+  [#61](https://github.com/croicu/quant-data/issues/61) (`status:brainstorm`) tracks what this PR
+  deliberately doesn't do — `stage`/`fact_market_data_1min` still don't consume any of this yet.
 
 - **Split `quant-ingest` into `ingest` (fetch + archive) and `stage` (archive → staging)** —
   [issue #56](https://github.com/croicu/quant-data/issues/56), `status:implementation`, ad-hoc task
