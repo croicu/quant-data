@@ -976,6 +976,77 @@ the full design (field consistency groups, the candidate/whistleblower model, th
 - `settings.reconcile.preferredProvider` (default `"ibkr"`) and `settings.reconcile.k` (default
   `3.0`, must be positive) are the only two tunables — see `ReconcileSettings` above.
 
+### `dispatch`
+
+`cli.py` — `quant-dispatch [--debug]` (croicu/quant-data#66): a generic, table-driven job
+dispatcher reviving the postponed `tasks/scheduled_jobs.md` brainstorm (issue #3) now that there
+are three recurring processes (`ingest`/`stage`/`reconcile`) worth scheduling. One-shot, not a
+daemon — same convention as every other process in this repo — and console-script-only, no
+importable surface, same public/private-split reasoning as `ingest`/`stage`.
+
+- **Job definitions live in the new `jobs` table as data, not committed code** — the mechanism
+  that actually keeps host-specific detail (which box, what schedule, what exact `--catch-up`
+  invocation) out of this public repo. `cli.py` only ever reads/writes generic rows; nothing here
+  ever names a specific host.
+- `algorithm.py` — deliberately thin (this module's logic doesn't need much): `compute_next_run_at(now,
+  interval_seconds) -> now + interval_seconds`. Schedules from the moment a job actually ran, not
+  from its own prior `next_run_at`, so a dispatcher that was down or delayed for a while doesn't
+  pile up a burst of immediately-due catch-up runs the instant it resumes — a small but deliberate
+  choice, kept in its own pure, directly-unit-testable function per this repo's
+  algorithm/orchestration split (`CLAUDE.md`'s cli-thin-orchestration convention).
+- `cli.py`'s `main()`: fetches every enabled, `status = 'idle'` job whose `next_run_at` has
+  arrived (`PostgresDatabase.fetch_due_jobs`), and for each one — flips it to `'running'`
+  (`mark_job_running`), runs `command` via an injected `subprocess_runner` (defaulting to
+  `subprocess.run(command, capture_output=True, text=True)`, no `shell=True` — `command` is a
+  plain argv list, so there's no shell injection/quoting concern), and records the outcome
+  (`record_job_result`: exit code, truncated `stderr` on failure, and the next `next_run_at` from
+  `compute_next_run_at`) — flipping `status` back to `'idle'` regardless of success or failure, so
+  a failed job is still retried on schedule rather than stuck `'running'` forever. A launch
+  failure (e.g. the command's own executable isn't on `PATH`, an `OSError`) is recorded the same
+  way, with exit code `-1`, rather than aborting the whole dispatch run.
+- **Concurrency guard**: `fetch_due_jobs` only returns `status = 'idle'` rows, so a `quant-dispatch`
+  invocation that overlaps a still-running prior one (e.g. its own trigger firing more often than
+  a job's actual execution time) simply skips that job instead of double-dispatching it — the
+  concrete failure mode this guards against is two concurrent `quant-reconcile` runs writing to
+  the same database.
+- **Sequential, not concurrent, within one invocation** — the `for job in due_jobs` loop blocks on
+  each job's `subprocess.run` before starting the next, deliberately, not just as an artifact of
+  the simple loop shape: if the dispatcher's own cron/systemd trigger was down for a while and
+  several jobs are due at once on resume, they run one at a time rather than all launching
+  concurrently against the same database — avoiding a "job storm."
+- **Executable resolution**: `_resolve_executable` resolves a job's `command[0]` against
+  `sys.executable`'s own directory first (falling back to a bare-name `PATH` lookup only if
+  nothing by that name lives there) rather than trusting the inherited `PATH` outright —
+  `quant-ingest`/`quant-stage`/`quant-reconcile` are installed as siblings of `quant-dispatch`
+  itself in the same venv, but an unattended cron/systemd `PATH` is often a minimal system default
+  that was never told about that venv, which would otherwise fail the first time a job actually
+  ran unattended. `cwd` is left inherited (no explicit `cwd=` passed to `subprocess.run`) — already
+  required to be the repo root for `quant-dispatch`'s own `Settings.load()` to find `settings.json`
+  at all, so a due job's subprocess gets that same correct `cwd` for free.
+- **`jobs` lives in its own `quant_schedule` database**, not `quant_data` — a deliberate pivot from
+  the table's original design (jobs was initially added directly to `quant_data`/`PostgresDatabase`,
+  reasoning that it shared `quant_writer`'s role; revised before that shipped, once it was clear
+  `jobs` is meant to eventually schedule work across other databases this repo doesn't own too, e.g.
+  a future `quant_trades`/`quant_accounting` — tying it to `quant_data`'s own lifecycle, including
+  this repo's routine clean-slate `DROP DATABASE quant_data` testing, was the wrong coupling). New
+  `ScheduleDatabase` (`quant_data._internal.shared.schedule`) owns `JobRow` and the three methods
+  (`fetch_due_jobs`, `mark_job_running`, `record_job_result`) with its own connection — same
+  separate-class reasoning as `ProviderSourceArchiveWriter`/`Reader` for `quant_ingest`. Its own
+  two-role split, distinct from `quant_writer`/`quant_reader`: `quant_scheduler` (read/insert/
+  update, for hand-managing job definitions via `psql` — no code here ever authenticates as it) and
+  `quant_worker` (read/update only — what `ScheduleDatabase`/`quant-dispatch` itself connects as; it
+  never inserts a row). New `PostgresSettings.schedule: ScheduleSettings | None` (`dbname`/`user`/
+  `password`, parsed from `settings.postgres.schedule` — see `docs/DATABASE.md`) is required for
+  `quant-dispatch` to run at all (`_default_database_factory` raises a clear `AppError` if
+  unconfigured) — unlike `archive_dbname`, there's no degraded-but-working mode, since `jobs` is
+  `quant-dispatch`'s entire reason to exist.
+- No date-range/ticker flags, no scheduling logic beyond "is this job due" — deliberately no
+  `depends_on`/DAG modeling either; job *ordering* (e.g. `ingest` before `stage` before
+  `reconcile`) is left to each job's own `interval_seconds`/`next_run_at` offset (e.g. `ingest`
+  hourly at `:00`, `stage` hourly at `:15`, `reconcile` hourly at `:30`), not tracked by this code
+  at all — see croicu/quant-data#66 for the accepted-risk reasoning (mitigated by `ingest`/`stage`
+  both already being idempotent/safe to re-run).
+
 ### `quant_data.client`
 
 - `market_data.py` — `MarketData`: a thin, read-only wrapper around a `MarketDataProvider`.

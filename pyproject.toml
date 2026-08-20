@@ -21,6 +21,7 @@ dependencies = [
 quant-ingest = "ingest.cli:main"
 quant-stage = "stage.cli:main"
 quant-reconcile = "reconcile.cli:main"
+quant-dispatch = "dispatch.cli:main"
 
 [project.optional-dependencies]
 dev = [

@@ -81,8 +81,9 @@ attempting Tiers 2/3, falling through to `settings.reconcile.preferredProvider`'
 this distinct reason code (never comparing against a whistleblower value already known to be
 invalid) rather than either tier's silent no-op. See
 [croicu/quant-data#44](https://github.com/croicu/quant-data/issues/44) for the full design.
-`quant_ingest` (croicu/quant-data#52) is a **separate database**, not a `migrations/` entry against
-`quant_data` — see its own "`quant_ingest` database" section below.
+`quant_ingest` (croicu/quant-data#52) and `quant_schedule` (croicu/quant-data#66) are each a
+**separate database**, not a `migrations/` entry against `quant_data` — see their own "`quant_ingest`
+database"/"`quant_schedule` database" sections below.
 
 ## `dim_ticker`
 
@@ -671,6 +672,66 @@ two weeks ago"); a date covered only by a non-current `fetch_version` is stale a
 re-fetching in smaller chunks, without disturbing the old version's own range.
 `ProviderSourceArchiveWriter.record_fetch` writes both tables in one transaction, so a fetch is
 never archived without its coverage range also reflecting it.
+
+## `quant_schedule` database
+
+A **separate Postgres database**, not a schema or table inside `quant_data` — same server/instance,
+own connection (`settings.postgres.schedule`), own `schema_migrations`, own migration sequence
+(`migrations/quant_schedule/*.sql`, independently numbered from `migrations/*.sql`). Added by
+[croicu/quant-data#66](https://github.com/croicu/quant-data/issues/66) as the table-driven schedule
+`quant-dispatch` reads. Deliberately its own database, not just a table: `jobs` is meant to
+eventually schedule work against other databases this repo doesn't own too (a future
+`quant_trades`, `quant_accounting`, ...), so it shouldn't be tied to `quant_data`'s own lifecycle —
+this repo's routine clean-slate testing (`DROP DATABASE quant_data`) must never touch it. Reads/
+writes go through `ScheduleDatabase` (`quant_data._internal.shared.schedule`), a class deliberately
+separate from `PostgresDatabase`, same reasoning as `ProviderSourceArchiveWriter`/`Reader` for
+`quant_ingest` above.
+
+Its own two-role split, deliberately separate from `quant_writer`/`quant_reader`: `quant_scheduler`
+(read/insert/update — for hand-managing job definitions directly with `psql`; no code in this repo
+ever authenticates as it) and `quant_worker` (read/update only — what `quant-dispatch` itself
+connects as via `settings.postgres.schedule`; it never inserts a row). See `docs/DATABASE.md`'s
+"Setting up the `quant_schedule` database" section for the exact `CREATE ROLE`/`GRANT` statements.
+
+### `jobs`
+
+| Column | Type | Notes |
+|---|---|---|
+| `job_id` | `SERIAL PRIMARY KEY` | |
+| `name` | `TEXT NOT NULL UNIQUE` | |
+| `command` | `TEXT[] NOT NULL` | argv array, e.g. `{quant-ingest,--catch-up}` |
+| `interval_seconds` | `INT NOT NULL` | `CHECK (interval_seconds > 0)` |
+| `next_run_at` | `TIMESTAMP NOT NULL` | |
+| `enabled` | `BOOLEAN NOT NULL DEFAULT true` | |
+| `status` | `TEXT NOT NULL DEFAULT 'idle'` | `CHECK (status IN ('idle', 'running'))` |
+| `last_run_at` | `TIMESTAMP` | |
+| `last_exit_code` | `INT` | |
+| `last_error` | `TEXT` | |
+
+Added in `001_add_jobs_table` — a generic, table-driven schedule for the repo's recurring
+processes (`quant-ingest`/`quant-stage`/`quant-reconcile`), reviving the postponed brainstorm at
+`tasks/scheduled_jobs.md` (issue #3). Job definitions live here as data rather than committed code
+specifically so the public repo never has to name a specific host — only the table shape and
+generic dispatch code are checked in. **Ships empty** — real job rows (real intervals, real
+`command` values, anything host-specific) are inserted by hand afterward by the `quant_scheduler`
+role, same precedent as `quant_data.dataset_inception`.
+
+`command` is passed straight to `subprocess.run` without `shell=True`, so there is no shell
+injection/quoting concern from its contents. `status` guards against double-dispatch:
+`quant-dispatch`'s `fetch_due_jobs` only considers `status = 'idle'` rows, and `mark_job_running`
+flips a row to `'running'` immediately before its subprocess launches, so a `quant-dispatch`
+invocation overlapping a still-running prior one skips that job rather than launching a second
+concurrent instance (e.g. two `quant-reconcile` runs against the same database at once).
+`record_job_result` always flips `status` back to `'idle'` regardless of `last_exit_code` — a
+failed run is still a finished run, and `next_run_at` (computed by
+`dispatch.algorithm.compute_next_run_at`, always `now + interval_seconds`, not the job's own
+prior `next_run_at`, so a dispatcher that was down or delayed doesn't pile up a burst of
+immediately-due catch-up runs on resume) still advances so the job is retried on schedule rather
+than stuck.
+
+`quant-dispatch` itself is one-shot, not a daemon: it checks `jobs` once, dispatches whatever's
+due, and exits. The actual "run every minute" trigger (a cron entry or systemd timer) is a
+host-level concern outside this repo, consistent with the rest of this table's design goal.
 
 ## Indexes
 

@@ -444,6 +444,60 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
+- **Generic table-driven job dispatcher (`quant-dispatch`)** —
+  [issue #66](https://github.com/croicu/quant-data/issues/66), `status:implementation` — branch
+  `scheduled-jobs-dispatcher`. Revives the postponed `tasks/scheduled_jobs.md` brainstorm (issue
+  #3) now that there are three recurring processes (`quant-ingest`/`quant-stage`/
+  `quant-reconcile`) worth scheduling. Converged design (posted to #66's body): new `jobs` table,
+  in its own **`quant_schedule` database** (`migrations/quant_schedule/001_add_jobs_table.sql`,
+  ships empty — real schedules inserted by hand per host, same precedent as `dataset_inception`) —
+  a pivot from the original design, which had put `jobs` inside `quant_data` itself; revised before
+  shipping once it was clear `jobs` should eventually schedule work across other databases this
+  repo doesn't own too (a future `quant_trades`/`quant_accounting`), so tying it to `quant_data`'s
+  own lifecycle (including this repo's routine clean-slate `DROP DATABASE quant_data` testing) was
+  the wrong coupling. Holds `name`, `command` (argv array, run via `subprocess.run` without
+  `shell=True` — no shell-injection concern), `interval_seconds`/`next_run_at` (simple interval
+  scheduling, not cron expressions), `enabled`, and a `status` (`idle`/`running`) guard against
+  double-dispatch. New top-level package `src/dispatch/` (console script `quant-dispatch`, no
+  importable surface, same convention as `ingest`/`stage`) — `algorithm.py` holds the one pure
+  piece (`compute_next_run_at`: schedules from the moment a job actually ran, not its own prior
+  `next_run_at`, so a dispatcher that was down doesn't burst-catch-up on resume);
+  `cli.py` is thin orchestration around new `ScheduleDatabase`
+  (`quant_data._internal.shared.schedule`) — a separate class with its own connection, same
+  reasoning as `provider_source_archive`'s `ProviderSourceArchiveWriter`/`Reader`, holding
+  `fetch_due_jobs`/`mark_job_running`/`record_job_result`. `quant_schedule` gets its own two-role
+  split, distinct from `quant_writer`/`quant_reader`: `quant_scheduler` (read/insert/update, for
+  hand-managing job definitions via `psql` — no code here ever authenticates as it) and
+  `quant_worker` (read/update only — what `quant-dispatch` itself connects as via the new
+  `settings.postgres.schedule`, required for `quant-dispatch` to run at all). Dispatch method is
+  subprocess (isolation, matches the existing
+  precedent that `ingest`/`stage`/`reconcile` are already separate processes); dispatcher itself
+  is one-shot, not a daemon — the actual "run every minute" trigger (cron/systemd) stays a
+  host-level concern outside this repo, which is the actual mechanism keeping box-specific detail
+  out of the public repo (job *definitions* are DB data, not committed code). Job *ordering*
+  (e.g. `ingest` before `stage` before `reconcile`) is left to each job's own interval/offset
+  schedule, not a `depends_on`/DAG column — accepted risk, mitigated by `ingest`/`stage` both
+  already being idempotent. Execution within one invocation is deliberately sequential, not
+  concurrent (the `for job in due_jobs` loop blocks on each subprocess before the next) —
+  confirmed with the repo owner specifically to avoid a "job storm" if the cron/systemd trigger
+  was down for a while (e.g. back from vacation) and several jobs are due at once on resume; don't
+  parallelize this loop later without re-confirming that's still wanted. `_resolve_executable`
+  resolves a job's `command[0]` against `sys.executable`'s own directory first, falling back to a
+  bare-name `PATH` lookup — a real gap caught in review: `quant-ingest`/`quant-stage`/
+  `quant-reconcile` are siblings of `quant-dispatch` in the same venv, but an unattended
+  cron/systemd `PATH` is often a minimal system default that was never told about that venv,
+  which would otherwise fail the first time a job actually ran unattended. `cwd` is left
+  inherited, not explicitly set — already required to be the repo root for `quant-dispatch`'s own
+  `Settings.load()` to find `settings.json`, so a due job's subprocess gets that same correct
+  `cwd` for free. Explicitly still open, deferred: the public/private repo split for the actual
+  systemd timer/cron entry, and whether `pg_cron` ever makes sense for a future pure-SQL
+  maintenance job. Implemented and unit-tested (362 unit tests total green, `ruff` clean — grew
+  from 355 to 362 pivoting `jobs` out of `quant_data` into its own `quant_schedule` database and
+  its own `ScheduleDatabase`/`ScheduleSettings`). Migration `quant_schedule/001_add_jobs_table.sql`
+  not yet applied to any real database — needs `quant_schedule` created, the migration applied, and
+  the `quant_scheduler`/`quant_worker` roles + grants set up by hand first (see `docs/DATABASE.md`'s
+  "Setting up the `quant_schedule` database" section for the exact commands).
+
 - **Consume IBKR BID_ASK/MIDPOINT and Massive vw/n into staging/fact_market_data_1min** —
   [issue #61](https://github.com/croicu/quant-data/issues/61), `status:implementation` — branch
   `staging-supplement-fields`. Converged design (posted to #61's body): 8 new nullable columns
@@ -673,13 +727,6 @@ under `/local/` to the box:
   CroicuWS1 with a custom logger object (not quant-data's own `Logger`), confirming every internal
   log call landed there instead.
 
-
-- **File**: [Scheduled jobs](tasks/scheduled_jobs.md)
-- **Status**: Brainstorm, postponed (see issue #3) — deprioritized, not actively worked
-- **Key Context**: How recurring background/maintenance work (DB maintenance now, ingest scheduling
-  later) gets tracked without baking `CroicuWS1`-specific detail into this public repo — leaning
-  toward a `jobs` table living in the database itself (data, not committed code), still in
-  investigation.
 
 - **File**: [Ingest error classification](tasks/ingest_error_classification.md)
 - **Status**: Brainstorm, postponed (see issue #13) — deprioritized, not actively worked

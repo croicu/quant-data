@@ -207,10 +207,52 @@ rather than picking a provider on the caller's behalf.
   exists) as part of the same manual edit — nothing else does this automatically for a hand
   correction the way `--finalize` does for its own resolutions.
 
-There is no generic `quant-data` command — `quant-ingest`/`quant-stage`/`quant-reconcile` (write
-side, packages `ingest`/`stage`/`reconcile`, outside the `quant_data` namespace — no importable
-surface, console script only) and `quant_data.MarketData` (read side — a library, not a CLI) are the
-consumer-facing entry points. `MarketData`, `OHLCV`, `DataQuality`, `LoggingSink`, `PendingResolutionBar`, `ProviderRole`,
+### `quant-dispatch`
+
+- Usage: `quant-dispatch [--debug]`
+- One-shot job dispatcher (croicu/quant-data#66): checks the `jobs` table once for every enabled,
+  currently-idle row whose `next_run_at` has arrived, runs each due job's `command` as a
+  subprocess (e.g. `quant-ingest --catch-up`), records the exit code/error/next schedule, and
+  exits. Not a daemon — something host-specific (a cron entry or systemd timer, set up outside
+  this repo) is responsible for invoking `quant-dispatch` repeatedly; job *definitions* live in
+  `jobs` as data instead, so the public repo never has to name a specific host.
+- Each due job's `status` is flipped to `'running'` immediately before its subprocess launches and
+  back to `'idle'` once it finishes (success or failure alike), so a `quant-dispatch` invocation
+  overlapping a still-running prior one skips that job rather than double-dispatching it (e.g. two
+  concurrent `quant-reconcile` runs against the same database).
+- `next_run_at` is always rescheduled to the moment this dispatch actually ran a job, plus that
+  job's own `interval_seconds` — not the job's prior `next_run_at` — so a dispatcher that was down
+  or delayed doesn't pile up a burst of immediately-due catch-up runs the moment it resumes.
+- `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
+  instead of printing a one-line error.
+- `settings.postgres` is required, same as every other command in this repo, **and
+  `settings.postgres.schedule` is required specifically for `quant-dispatch`** — `jobs` lives in its
+  own `quant_schedule` database, not `quant_data` (croicu/quant-data#66's design pivoted away from
+  the original `quant_data`-embedded plan before it shipped, once it was clear `jobs` should
+  eventually schedule work against other databases this repo doesn't own too). `quant-dispatch`
+  connects to `quant_schedule` as `quant_worker` (read/update only); a separate `quant_scheduler`
+  role (read/insert/update) exists for hand-managing job definitions via `psql`, never used by any
+  code in this repo. Omitting `settings.postgres.schedule` raises a clear `AppError` at startup.
+- Exit codes: `0` no jobs were due, or every due job's subprocess exited `0`; `1` settings load
+  failure, `settings.postgres`/`settings.postgres.schedule` not configured, or one or more due jobs
+  exited non-zero/failed to launch; `2` argument parsing error.
+- `jobs` ships empty by `migrations/quant_schedule/001_add_jobs_table.sql` — real schedules (real
+  intervals, real `command` values) are inserted by hand per host by the `quant_scheduler` role; see
+  `docs/DATABASE.md`/`docs/SCHEMA.md`'s `quant_schedule`/`jobs` sections.
+- **Deployment assumptions** (relevant to whatever cron entry/systemd timer invokes
+  `quant-dispatch`): a job's `command[0]` is resolved against `sys.executable`'s own directory
+  first (falling back to a plain `PATH` lookup if not found there) — not the inherited `PATH` —
+  since `quant-ingest`/`quant-stage`/`quant-reconcile` are installed as siblings of
+  `quant-dispatch` in the same venv, and an unattended cron/systemd `PATH` is often a minimal
+  system default that was never told about that venv. `cwd` is left to whatever `quant-dispatch`
+  itself was invoked with — already required to be the repo root for `quant-dispatch`'s own
+  `Settings.load()` to find `settings.json` in the first place, so a due job's subprocess inherits
+  that same correct `cwd` for free.
+
+There is no generic `quant-data` command — `quant-ingest`/`quant-stage`/`quant-reconcile`/
+`quant-dispatch` (write side, packages `ingest`/`stage`/`reconcile`/`dispatch`, outside the
+`quant_data` namespace — no importable surface, console script only) and `quant_data.MarketData`
+(read side — a library, not a CLI) are the consumer-facing entry points. `MarketData`, `OHLCV`, `DataQuality`, `LoggingSink`, `PendingResolutionBar`, `ProviderRole`,
 `RejectedWhistleblowerBar`, and `create_postgres_provider` are re-exported at the `quant_data` top
 level (`from quant_data import MarketData, OHLCV, create_postgres_provider, ...`);
 `quant_data._internal.*` is private (nested, not a separate package) and should not be imported
