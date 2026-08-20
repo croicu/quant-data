@@ -318,6 +318,71 @@ Omitting `archiveDbname` disables archiving entirely (the default, backward-comp
 `settings.json` predating this feature) — `quant-ingest` still writes to `staging_market_data_1min`
 exactly as before.
 
+## Setting up the `quant_schedule` database
+
+`quant_schedule` (croicu/quant-data#66) is a separate database on the same Postgres instance as
+`quant_data`/`quant_ingest` — the table-driven schedule `quant-dispatch` reads. Deliberately its
+own database, not a table inside `quant_data`: `jobs` is meant to eventually schedule work against
+other databases this repo doesn't own too (a future `quant_trades`, `quant_accounting`, ...), so it
+shouldn't share `quant_data`'s lifecycle (this repo's own routine clean-slate `DROP DATABASE
+quant_data` testing must never touch it). Create and migrate it the same way as `quant_ingest`,
+connected as the schema-owner role:
+
+```bash
+psql -h localhost -p 5433 -U quant_data -d postgres -c "CREATE DATABASE quant_schedule OWNER quant_data;"
+psql -h localhost -p 5433 -U quant_data -d quant_schedule -f migrations/quant_schedule/001_add_jobs_table.sql
+```
+
+`quant_schedule` gets its own two-role split, deliberately separate from `quant_writer`/
+`quant_reader` — `quant_scheduler` (read/insert/update, for hand-managing job definitions by
+connecting directly with `psql`) and `quant_worker` (read/update only, what `quant-dispatch` itself
+authenticates as — it never inserts a row, matching the "ships empty, real rows inserted by hand"
+precedent already set for `dataset_inception`):
+
+```sql
+CREATE ROLE quant_scheduler LOGIN PASSWORD '...';
+CREATE ROLE quant_worker LOGIN PASSWORD '...';
+
+GRANT CONNECT ON DATABASE quant_schedule TO quant_scheduler, quant_worker;
+
+GRANT SELECT, INSERT, UPDATE ON jobs TO quant_scheduler;
+GRANT USAGE ON SEQUENCE jobs_job_id_seq TO quant_scheduler;
+
+GRANT SELECT, UPDATE ON jobs TO quant_worker;
+```
+
+No `INSERT`/sequence grant for `quant_worker` — nothing in `ScheduleDatabase` ever inserts a row.
+No `quant_reader` grant on either role — `jobs` is purely operational, never read via `MarketData`.
+
+Then point `quant-dispatch` at it via `settings.postgres.schedule` (`settings.local.json`, same
+`host`/`port`/`sshUser`/`sshKeyPath` as the rest of `settings.postgres` — but its own `dbname`/
+`user`/`password`, unlike `archiveDbname` above, since `quant_worker` is a distinct role from
+whatever `settings.postgres.user` holds):
+
+```json
+{
+  "settings": {
+    "postgres": {
+      "host": "localhost",
+      "port": 5433,
+      "user": "quant_writer",
+      "password": "...",
+      "dbname": "quant_data",
+      "archiveDbname": "quant_ingest",
+      "schedule": {
+        "dbname": "quant_schedule",
+        "user": "quant_worker",
+        "password": "..."
+      }
+    }
+  }
+}
+```
+
+`settings.postgres.schedule` is required to run `quant-dispatch` — unlike `archiveDbname`, there's
+no degraded-but-working mode, since `jobs` is `quant-dispatch`'s entire reason to exist; omitting it
+makes `quant-dispatch` raise a clear `AppError` at startup rather than failing on the first query.
+
 ## Populating real data
 
 `quant-ingest` fetches bars from Yahoo Finance over an inclusive date range and writes them into

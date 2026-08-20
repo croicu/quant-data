@@ -41,6 +41,21 @@ def _parse_rate_limit_payload(rate_limit_payload: dict, settings_key: str) -> Ra
 
 
 @dataclass
+class ScheduleSettings:
+    # quant_schedule (croicu/quant-data#66) -- a separate database, same server as the primary
+    # connection above but its own dbname/user/password: unlike archive_dbname (which reuses the
+    # primary user/password since quant_writer already spans quant_data + quant_ingest),
+    # quant_schedule deliberately has its own two-role split -- quant_scheduler (read/insert/update,
+    # for hand-managing job definitions via psql) and quant_worker (read/update only, what
+    # quant-dispatch itself connects as -- it never inserts a row). Only quant_worker's credentials
+    # are configured here; quant_scheduler is a manual-administration role never used by any code in
+    # this repo, same "ships empty, inserted by hand" precedent as dataset_inception/jobs itself.
+    dbname: str
+    user: str
+    password: str
+
+
+@dataclass
 class PostgresSettings:
     host: str
     port: int
@@ -54,6 +69,10 @@ class PostgresSettings:
     # different dbname. None means archiving to quant_ingest is disabled (e.g. an existing
     # settings.json predating this feature) -- quant-ingest still writes to staging as before.
     archive_dbname: str | None = None
+    # quant_schedule (croicu/quant-data#66) -- see ScheduleSettings above. None means
+    # quant-dispatch cannot run (it raises at startup) -- unlike archive_dbname, there's no
+    # degraded-but-working mode, since jobs is quant-dispatch's entire reason to exist.
+    schedule: ScheduleSettings | None = None
 
 
 @dataclass
@@ -235,6 +254,24 @@ class Settings:
 
             archive_dbname_payload = postgres_payload.get("archiveDbname")
 
+            schedule_settings: ScheduleSettings | None = None
+            schedule_payload = postgres_payload.get("schedule")
+            if schedule_payload is not None:
+                if not isinstance(schedule_payload, dict):
+                    raise TaskError("'settings.postgres.schedule' must be a JSON object.")
+                schedule_required_keys = ["dbname", "user", "password"]
+                schedule_missing_keys = []
+                for key in schedule_required_keys:
+                    if key not in schedule_payload:
+                        schedule_missing_keys.append(key)
+                if schedule_missing_keys:
+                    raise TaskError(f"'settings.postgres.schedule' is missing required key(s): {', '.join(schedule_missing_keys)}")
+                schedule_settings = ScheduleSettings(
+                    dbname=str(schedule_payload["dbname"]),
+                    user=str(schedule_payload["user"]),
+                    password=str(schedule_payload["password"]),
+                )
+
             postgres_settings = PostgresSettings(
                 host=str(postgres_payload["host"]),
                 port=int(postgres_payload["port"]),
@@ -244,6 +281,7 @@ class Settings:
                 ssh_user=str(ssh_user_payload) if ssh_user_payload is not None else None,
                 ssh_key_path=str(ssh_key_path_payload) if ssh_key_path_payload is not None else None,
                 archive_dbname=str(archive_dbname_payload) if archive_dbname_payload is not None else None,
+                schedule=schedule_settings,
             )
 
         tickers_payload = settings_payload.get("tickers", [])

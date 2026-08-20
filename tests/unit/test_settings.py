@@ -235,6 +235,37 @@ def test_load_postgres_settings_parses_archive_dbname_when_given(tmp_path):
     assert settings.postgres.archive_dbname == "quant_ingest"
 
 
+def test_load_postgres_settings_defaults_schedule_to_none(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload()})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.postgres.schedule is None
+
+
+def test_load_postgres_settings_parses_schedule_when_given(tmp_path):
+    settings_path = _write_settings(
+        tmp_path / "settings.json",
+        {"postgres": _postgres_payload(schedule={"dbname": "quant_schedule", "user": "quant_worker", "password": "x"})},
+    )
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.postgres.schedule.dbname == "quant_schedule"
+    assert settings.postgres.schedule.user == "quant_worker"
+    assert settings.postgres.schedule.password == "x"
+
+
+def test_load_postgres_settings_raises_when_schedule_missing_a_required_key(tmp_path):
+    settings_path = _write_settings(
+        tmp_path / "settings.json",
+        {"postgres": _postgres_payload(schedule={"dbname": "quant_schedule", "user": "quant_worker"})},
+    )
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
 def test_load_defaults_providers_to_empty_when_unconfigured(tmp_path):
     # No implicit provider (croicu/quant-data#64 follow-up) -- silently defaulting to a single
     # provider was confusing; ingest/cli.py and stage/cli.py both fail fast with a clear error
