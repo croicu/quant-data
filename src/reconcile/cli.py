@@ -52,6 +52,7 @@ def parse_args(argv: list[str]) -> CliArguments:
     parser = argparse.ArgumentParser(
         prog="quant-reconcile",
         usage="quant-reconcile [--finalize] [--debug]",
+        fromfile_prefix_chars="@",
         description=(
             "Reads staging_market_data_1min, resolves bars where every configured provider "
             "agrees (or can be automatically explained), and promotes them into "
@@ -909,6 +910,13 @@ def main(
 
         if settings.postgres is None:
             raise AppError("settings.postgres is required to run quant-reconcile.")
+
+        if not settings.providers:
+            # No --providers CLI override here, unlike quant-ingest/quant-stage -- reconcile's
+            # provider set is load-bearing for Tier 1-4 correctness (matched-bar counting,
+            # candidate/whistleblower set), not just a fetch-source convenience, so it's
+            # settings.json/settings.local.json only.
+            raise AppError("No provider configured — configure settings.providers in settings.json or settings.local.json.")
 
         active_database_factory = database_factory if database_factory is not None else _default_database_factory
         database = active_database_factory(settings.postgres)

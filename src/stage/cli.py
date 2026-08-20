@@ -29,12 +29,14 @@ class CliArguments:
     end_date: date_type | None = None
     catch_up: bool = False
     debug: bool = False
+    providers: list[str] | None = None
 
 
 def parse_args(argv: list[str]) -> CliArguments:
     parser = argparse.ArgumentParser(
         prog="quant-stage",
-        usage="quant-stage [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]",
+        usage="quant-stage [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--providers NAME,...] [--debug]",
+        fromfile_prefix_chars="@",
         description=(
             "Read the most recently archived provider_source_archive fetch for one ticker (with "
             "--ticker) or every ticker in settings.tickers (without --ticker), over an inclusive "
@@ -44,7 +46,8 @@ def parse_args(argv: list[str]) -> CliArguments:
             "single process (croicu/quant-data#56), reading what `quant-ingest` already archived "
             "to quant_ingest rather than fetching from providers itself. --catch-up re-processes "
             "the trailing settings.catchUpLookbackDays days instead, mirroring quant-ingest's own "
-            "--catch-up."
+            "--catch-up. Arguments can also be read from a response file: `quant-stage "
+            "@some-file.args`, one argument per line."
         ),
     )
 
@@ -56,6 +59,11 @@ def parse_args(argv: list[str]) -> CliArguments:
         action="store_true",
         default=False,
         help="re-process the trailing settings.catchUpLookbackDays days (excluding today) instead of a date range",
+    )
+    parser.add_argument(
+        "--providers",
+        default=None,
+        help="comma-separated provider names to use instead of settings.providers, e.g. yfinance,massive",
     )
     parser.add_argument(
         "--debug",
@@ -91,7 +99,16 @@ def parse_args(argv: list[str]) -> CliArguments:
         if end_date < start_date:
             parser.error(f"--end-date ({end_date.isoformat()}) must not be before --start-date ({start_date.isoformat()}).")
 
-    return CliArguments(ticker=args.ticker, start_date=start_date, end_date=end_date, catch_up=args.catch_up, debug=args.debug)
+    providers: list[str] | None = None
+    if args.providers is not None:
+        providers = []
+        for name in args.providers.split(","):
+            normalized = name.strip().lower()
+            if not normalized:
+                parser.error("--providers must be a comma-separated list of non-empty provider names.")
+            providers.append(normalized)
+
+    return CliArguments(ticker=args.ticker, start_date=start_date, end_date=end_date, catch_up=args.catch_up, debug=args.debug, providers=providers)
 
 
 def _date_range(start_date: date_type, end_date: date_type) -> list[date_type]:
@@ -289,6 +306,12 @@ def main(
 
         if settings.postgres is None:
             raise AppError("settings.postgres is required to run quant-stage.")
+
+        if arguments.providers is not None:
+            settings.providers = arguments.providers
+
+        if not settings.providers:
+            raise AppError("No provider configured — pass --providers, a response file (e.g. @configs/all-providers.args), or configure settings.providers.")
 
         tickers = [arguments.ticker] if arguments.ticker is not None else settings.tickers
         if not tickers:

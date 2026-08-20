@@ -10,6 +10,7 @@
       "user": "test",
       "password": "test",
       "dbname": "test"
-    }
+    },
+    "providers": ["yfinance"]
   }
 }

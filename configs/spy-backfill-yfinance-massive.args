@@ -1,0 +1,8 @@
+--ticker
+SPY
+--providers
+yfinance,massive
+--start-date
+2026-08-05
+--end-date
+2026-08-18

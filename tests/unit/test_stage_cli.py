@@ -45,6 +45,7 @@ def _custom_settings(tmp_path: Path, **overrides) -> Path:
         "debug": False,
         "logLevel": "error",
         "postgres": {"host": "localhost", "port": 5433, "user": "test", "password": "test", "dbname": "test"},
+        "providers": ["yfinance"],
     }
     payload.update(overrides)
     settings_path.write_text(json.dumps({"settings": payload}), encoding="utf-8")
@@ -109,6 +110,19 @@ def test_main_skips_weekend_dates_without_touching_the_archive():
     # Only Friday 01-02's 2 bars land -- the weekend dates are skipped entirely, not staged and
     # not counted as failures either.
     assert len(database.written_staging_bars) == 2
+
+
+def test_main_fails_fast_when_no_providers_configured(tmp_path):
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], providers=[])
+
+    exit_code = cli.main(
+        ["--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=settings_path,
+        database_factory=_use_database(MockPostgresDatabase()),
+        archive_reader_factory=_use_archive_reader(MockProviderSourceArchiveReader({})),
+    )
+
+    assert exit_code == 1
 
 
 def test_main_returns_one_when_nothing_archived_for_the_date():
@@ -260,6 +274,43 @@ def test_main_stages_ibkr_bar_when_only_trades_is_archived(tmp_path):
     _provider_name, bar = database.written_staging_bars[0]
     assert bar.avg_bid is None
     assert bar.midpoint_open is None
+
+
+def test_parse_args_providers_splits_comma_separated_names():
+    arguments = cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02", "--providers", "yfinance,massive"])
+
+    assert arguments.providers == ["yfinance", "massive"]
+
+
+def test_parse_args_reads_response_file(tmp_path):
+    response_file = tmp_path / "no-ibkr.args"
+    response_file.write_text("--providers\nyfinance,massive\n", encoding="utf-8")
+
+    arguments = cli.parse_args([f"@{response_file}", "--ticker", "SPY", "--start-date", "2026-01-02"])
+
+    assert arguments.providers == ["yfinance", "massive"]
+    assert arguments.ticker == "SPY"
+
+
+def test_main_providers_flag_overrides_settings_providers(tmp_path):
+    # settings.providers defaults to ["ibkr"] here (nothing archived for ibkr in this test's
+    # archive_reader), but --providers yfinance should override it entirely -- proving the flag
+    # actually reaches _stage_one's provider loop, not just parsed and discarded.
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], providers=["ibkr"])
+    database = MockPostgresDatabase()
+    archive_reader = MockProviderSourceArchiveReader({("AAPL", "yfinance", "history", date(2026, 1, 2)): _YFINANCE_PAYLOAD})
+
+    exit_code = cli.main(
+        ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-02", "--providers", "yfinance"],
+        settings_path=settings_path,
+        database_factory=_use_database(database),
+        archive_reader_factory=_use_archive_reader(archive_reader),
+    )
+
+    assert exit_code == 0
+    assert len(database.written_staging_bars) == 2
+    for provider_name, _ in database.written_staging_bars:
+        assert provider_name == "yfinance"
 
 
 def test_default_archive_reader_factory_raises_when_not_configured():

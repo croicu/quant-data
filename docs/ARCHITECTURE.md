@@ -242,7 +242,8 @@ independent top-level packages.
   so loading a test fixture's `settings.json` never accidentally picks up the real repo-root
   `settings.local.json`. `Settings.catch_up_lookback_days` (`catchUpLookbackDays`, default `7`)
   sizes `quant-ingest --catch-up`'s trailing re-fetch window. `Settings.providers` (`providers`,
-  default `["yfinance"]`, lowercased) is the global list `quant-ingest` runs each invocation;
+  default `[]` — no implicit provider, croicu/quant-data#64 — lowercased) is the global list
+  `quant-ingest` runs each invocation;
   `Settings.ibkr` (`IbkrSettings`: `host`/`port`/`client_id`, parsed from `ibkr`) only matters
   when `"ibkr"` is configured, and `Settings.massive` (`MassiveSettings`: `api_key`/`rate_limit`,
   parsed from `massive`, `None` by default — no usable local default for a credential) only
@@ -355,9 +356,11 @@ independent top-level packages.
   `yfinance`. Ported from `quant-scratch`'s `shared/providers/yahoo_finance.py`. A pure fetcher
   (croicu/quant-data#56): returns raw per-bar `open`/`high`/`low`/`close`/`volume`/`timestamp`
   values, with `NaN` preserved as JSON `null` (not coerced to `0`/`0.0`) so `stage`'s yfinance
-  parser sees the genuine raw signal rather than a value this layer already interpreted. This is
-  `ingest`'s default provider (`settings.providers` defaults to `["yfinance"]`), not the only one
-  anymore — see `providers/ibkr.py` below, added to close the pre-/after-market zero-volume gap
+  parser sees the genuine raw signal rather than a value this layer already interpreted. This was
+  historically `ingest`'s implicit default provider (`settings.providers` used to default to
+  `["yfinance"]`; no longer does, croicu/quant-data#64 — must be configured or passed via
+  `--providers` explicitly now), not the only one — see `providers/ibkr.py` below, added to close
+  the pre-/after-market zero-volume gap
   yfinance has (the actual incomplete-detection logic — `NaN` or literal-zero-volume both signal a
   gap — now lives in `stage/parsers/yfinance_parser.py`, see the `stage` section) and wired in as an
   additional configured provider (issue #22); `ingest` depends on `IntraDayProvider`, not on
@@ -451,9 +454,11 @@ independent top-level packages.
 
 ### `ingest`
 
-`cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER]`:
+`cli.py` — `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--providers NAME,...] [--ibkr-methods METHOD,...]`:
 fetches bars over an inclusive date range from every provider named in `settings.providers`
-(default `["yfinance"]`; `IntraDayProvider` instances built by `_build_provider`/
+(default `[]` — no implicit provider, croicu/quant-data#64; `--providers`/a response file can
+override it per invocation, and `quant-ingest` fails fast if it's still empty at startup;
+`IntraDayProvider` instances built by `_build_provider`/
 `_default_providers`, or injected directly via `main`'s `providers: dict[str, IntraDayProvider]`
 parameter) and archives each successful fetch to `quant_ingest`'s `provider_source_archive` via an
 injected `ProviderSourceArchiveWriter` factory (defaults to constructing one from
@@ -518,12 +523,15 @@ patching `ingest`'s own internals.
   filterable by which provider it came from, apart from an archive-write problem — all still count
   the same toward the exit code today (see `tasks/ingest_error_classification.md` for the postponed
   work on making that distinction affect the exit code itself).
-- `settings.providers` (`list[str]`, lowercased, default `["yfinance"]`) is a flat global list —
-  the same providers run for every ticker in a given invocation; there's no per-ticker provider
-  override (see `tasks/ibkr-provider-reconciliation.md`'s now-resolved "currently configured
-  providers" question, and croicu/quant-data#44's explicit decision not to add a `--providers` CLI
-  override either — scoping a provider to a subset of tickers, e.g. a pilot rollout, means a
-  separate invocation against a separate settings file, not new code). `_build_provider` raises
+- `settings.providers` (`list[str]`, lowercased, default `[]` — no implicit provider,
+  croicu/quant-data#64) is a flat global list — the same providers run for every ticker in a given
+  invocation; there's still no per-ticker provider override (see
+  `tasks/ibkr-provider-reconciliation.md`'s now-resolved "currently configured providers" question)
+  — scoping a provider to a subset of tickers, e.g. a pilot rollout, means a separate invocation.
+  croicu/quant-data#44 originally declined a `--providers` CLI override on exactly that
+  per-ticker-scoping reasoning; #64 added one anyway for a different reason (avoiding hand-edits to
+  `settings.local.json` for a one-off run) — the two aren't in tension, since #64's `--providers`
+  still applies uniformly to the whole invocation, not per-ticker. `_build_provider` raises
   `AppError` for any name that isn't `"yfinance"`, `"ibkr"`, or `"massive"`, and also for
   `"massive"` itself if `settings.massive` isn't configured. `settings.ibkr` (`IbkrSettings`:
   `host`/`port`/`client_id`, all defaulting to `IBKRIntraDay`'s own module-level defaults) is only

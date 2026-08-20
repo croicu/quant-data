@@ -235,12 +235,15 @@ def test_load_postgres_settings_parses_archive_dbname_when_given(tmp_path):
     assert settings.postgres.archive_dbname == "quant_ingest"
 
 
-def test_load_defaults_providers_to_yfinance_only(tmp_path):
+def test_load_defaults_providers_to_empty_when_unconfigured(tmp_path):
+    # No implicit provider (croicu/quant-data#64 follow-up) -- silently defaulting to a single
+    # provider was confusing; ingest/cli.py and stage/cli.py both fail fast with a clear error
+    # when this ends up empty rather than picking one for the caller.
     settings_path = _write_settings(tmp_path / "settings.json", {"debug": False})
 
     settings = Settings.load(path=settings_path)
 
-    assert settings.providers == ["yfinance"]
+    assert settings.providers == []
 
 
 def test_load_parses_providers_and_lowercases_them(tmp_path):

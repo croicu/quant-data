@@ -69,6 +69,7 @@ def _custom_settings(tmp_path: Path, **overrides) -> Path:
         "debug": False,
         "logLevel": "error",
         "postgres": {"host": "localhost", "port": 5433, "user": "test", "password": "test", "dbname": "test"},
+        "providers": ["yfinance"],
     }
     payload.update(overrides)
     settings_path.write_text(json.dumps({"settings": payload}), encoding="utf-8")
@@ -337,6 +338,106 @@ def test_main_catch_up_excludes_today_and_tolerates_gaps(tmp_path):
     assert len(archive_writer.recorded_fetches) == 2  # 01-02 and 01-05
 
 
+def test_parse_args_providers_splits_comma_separated_names():
+    arguments = cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02", "--providers", "yfinance,massive"])
+
+    assert arguments.providers == ["yfinance", "massive"]
+
+
+def test_parse_args_providers_lowercases_and_trims():
+    arguments = cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02", "--providers", " Yfinance , MASSIVE "])
+
+    assert arguments.providers == ["yfinance", "massive"]
+
+
+def test_parse_args_providers_defaults_to_none_when_omitted():
+    arguments = cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02"])
+
+    assert arguments.providers is None
+
+
+def test_parse_args_providers_rejects_empty_name():
+    with pytest.raises(SystemExit) as exc_info:
+        cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02", "--providers", "yfinance,,massive"])
+
+    assert exc_info.value.code == 2
+
+
+def test_parse_args_reads_response_file(tmp_path):
+    response_file = tmp_path / "no-ibkr.args"
+    response_file.write_text("--providers\nyfinance,massive\n", encoding="utf-8")
+
+    arguments = cli.parse_args([f"@{response_file}", "--ticker", "SPY", "--start-date", "2026-01-02"])
+
+    assert arguments.providers == ["yfinance", "massive"]
+    assert arguments.ticker == "SPY"
+
+
+def test_parse_args_ibkr_methods_splits_comma_separated_names():
+    arguments = cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02", "--ibkr-methods", "TRADES,BID_ASK"])
+
+    assert arguments.ibkr_methods == ["TRADES", "BID_ASK"]
+
+
+def test_parse_args_ibkr_methods_strips_but_does_not_lowercase():
+    arguments = cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02", "--ibkr-methods", " TRADES , BID_ASK "])
+
+    assert arguments.ibkr_methods == ["TRADES", "BID_ASK"]
+
+
+def test_parse_args_ibkr_methods_defaults_to_none_when_omitted():
+    arguments = cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02"])
+
+    assert arguments.ibkr_methods is None
+
+
+def test_parse_args_ibkr_methods_rejects_empty_name():
+    with pytest.raises(SystemExit) as exc_info:
+        cli.parse_args(["--ticker", "AAPL", "--start-date", "2026-01-02", "--ibkr-methods", "TRADES,,MIDPOINT"])
+
+    assert exc_info.value.code == 2
+
+
+def test_main_ibkr_methods_flag_overrides_settings_ibkr_methods():
+    # No providers= kwarg injected -- exercises the real settings.ibkr.methods -> _methods_for
+    # path. IBKRIntraDay itself is passed in as a mock (avoids a real Gateway connection) so we can
+    # inspect what _methods_for actually resolved to via the archived fetch's recorded method.
+    from tests.mocks.yfinance import MockIntraDayProvider
+
+    ibkr_provider = MockIntraDayProvider()
+    ibkr_provider.DEFAULT_METHODS = ["TRADES", "BID_ASK", "MIDPOINT"]
+    archive_writer = MockProviderSourceArchiveWriter()
+
+    exit_code = cli.main(
+        ["--ticker", "AAPL", "--start-date", "2026-01-02", "--end-date", "2026-01-02", "--ibkr-methods", "TRADES"],
+        settings_path=SETTINGS_PATH,
+        providers={"ibkr": ibkr_provider},
+        archive_writer_factory=_use_archive_writer(archive_writer),
+    )
+
+    assert exit_code == 0
+    # Only TRADES fetched/archived -- BID_ASK/MIDPOINT (the provider's own full default set) were
+    # not, proving --ibkr-methods actually restricted settings.ibkr.methods for this run.
+    recorded_methods = [call[2] for call in archive_writer.recorded_fetches]
+    assert recorded_methods == ["TRADES"]
+
+
+def test_main_providers_flag_overrides_settings_providers_without_explicit_injection(tmp_path):
+    # No providers= kwarg passed to main() -- this exercises the real settings.providers ->
+    # _default_providers path, not the test-only override every other test in this file uses.
+    # Default settings.json has no "providers" key (defaults to ["yfinance"]); --providers massive
+    # should still route to _build_provider("massive", ...), which fails fast since
+    # settings.massive isn't configured in this fixture -- proving the CLI flag actually replaced
+    # settings.providers rather than being ignored.
+    exit_code = cli.main(
+        ["--ticker", "AAPL", "--start-date", "2026-01-02", "--providers", "massive"],
+        settings_path=SETTINGS_PATH,
+        archive_writer_factory=_use_archive_writer(MockProviderSourceArchiveWriter()),
+    )
+
+    assert exit_code == 1
+
+
 def test_main_archives_fetch_tagged_with_provider_name():
     archive_writer = MockProviderSourceArchiveWriter()
 
@@ -459,6 +560,18 @@ def test_main_drops_a_provider_that_fails_to_connect_and_continues_with_the_rest
     assert len(archive_writer.recorded_fetches) == 1
     # A provider that fails to connect is never asked to fetch or close.
     assert broken_provider.closed is False
+
+
+def test_main_fails_fast_when_no_providers_configured(tmp_path):
+    settings_path = _custom_settings(tmp_path, tickers=["aapl"], providers=[])
+
+    exit_code = cli.main(
+        ["--start-date", "2026-01-02", "--end-date", "2026-01-02"],
+        settings_path=settings_path,
+        archive_writer_factory=_use_archive_writer(MockProviderSourceArchiveWriter()),
+    )
+
+    assert exit_code == 1
 
 
 def test_main_fails_when_every_provider_fails_to_connect():
