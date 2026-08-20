@@ -15,7 +15,11 @@ from .providers.ibkr import DEFAULT_PORT as IBKR_DEFAULT_PORT
 _SETTINGS_PATH = Path("./settings.json")
 _LOCAL_PATH_NAME = "settings.local.json"
 
-DEFAULT_PROVIDERS = ["yfinance"]
+# Deliberately empty -- no implicit provider (previously ["yfinance"], removed croicu/quant-data#64
+# follow-up: silently defaulting to a single provider when nothing's configured is confusing,
+# especially now that --providers/a response file makes an explicit choice cheap. ingest/cli.py and
+# stage/cli.py both fail fast with a clear error when settings.providers ends up empty.
+DEFAULT_PROVIDERS: list[str] = []
 DEFAULT_PREFERRED_PROVIDER = "ibkr"
 DEFAULT_RECONCILE_K = 3.0
 

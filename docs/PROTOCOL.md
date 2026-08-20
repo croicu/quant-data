@@ -6,11 +6,28 @@ CLI signature and file format schemas for `quant-data`.
 
 <!-- Command name, arguments, flags, exit codes. -->
 
+Every command below also accepts a response file via argparse's native `fromfile_prefix_chars="@"`
+support: `quant-ingest @some-file.args` reads additional arguments from `some-file.args`, one per
+line, expanded in place before parsing — standard `@file` convention (same as GCC/MSVC). Useful for
+saving a recurring override (e.g. `--providers yfinance,massive` to skip IBKR for a backfill run)
+instead of hand-editing `settings.local.json` for a one-off invocation and remembering to revert it
+afterward. A response file can bundle any combination of flags, not just `--providers` — e.g.
+`configs/spy-backfill-yfinance-massive.args` combines `--ticker`/`--providers`/`--start-date`/
+`--end-date` into one reusable preset; `configs/ibkr-trades-only.args` combines `--providers ibkr`
+with `--ibkr-methods TRADES` to restrict a run to just the primary trade method;
+`configs/all-providers.args` (`yfinance,massive,ibkr`) is the explicit full-set preset now that
+`settings.local.json` no longer carries a baked-in `providers` default — `Settings.providers`
+itself has **no implicit fallback** (empty by default, not `["yfinance"]` as before — a silent
+single-provider default was judged confusing). `quant-ingest`/`quant-stage`/`quant-reconcile` all
+fail fast with a clear error if `settings.providers` ends up empty after CLI overrides are applied,
+rather than picking a provider on the caller's behalf.
+
 ### `quant-ingest`
 
-- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]`
-- Fetches 1-minute bars from every provider in `settings.providers` (default: just `yfinance`; add
-  `ibkr`/`massive` to also run those) and archives each provider's fetch into the separate
+- Usage: `quant-ingest [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--providers NAME,...] [--ibkr-methods METHOD,...] [--debug]`
+- Fetches 1-minute bars from every provider in `settings.providers` (no default — must be
+  configured, or passed via `--providers`/a response file, e.g. `@configs/all-providers.args`) and
+  archives each provider's fetch into the separate
   `quant_ingest` database's `provider_source_archive` (`settings.postgres.archiveDbname`, required
   — croicu/quant-data#52). **As of croicu/quant-data#56, this is `quant-ingest`'s entire job — it
   writes to `quant_ingest` only and no longer touches `quant_data` at all**, not even
@@ -35,11 +52,22 @@ CLI signature and file format schemas for `quant-data`.
 - `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
   instead of printing a one-line error, for upfront failures (settings load, no ticker/date
   configured at all, every configured provider failing to connect, `archiveDbname` unconfigured).
-- `settings.providers` (array of strings, default `["yfinance"]`) — which providers to run each
-  invocation, applied uniformly across every ticker in `settings.tickers` (no per-ticker override —
-  there is no `--providers` CLI flag; scoping a provider to a subset of tickers, e.g. a pilot
-  rollout, means a separate invocation against a separate settings file); unrecognized names fail
-  fast at startup. `settings.ibkr` (`host`/`port`/`clientId`, all optional — default to
+- `--providers` — comma-separated provider names (e.g. `yfinance,massive`) overriding
+  `settings.providers` entirely for this invocation; omit to use `settings.providers` as-is. Still
+  no per-ticker override — scoping a provider to a subset of tickers (e.g. a pilot rollout) means a
+  separate invocation. Added by croicu/quant-data#64, replacing the old workaround of hand-editing
+  `settings.local.json`'s `providers` array and reverting it afterward.
+- `--ibkr-methods` — comma-separated IBKR method names (e.g. `TRADES,BID_ASK`) overriding
+  `settings.ibkr.methods` entirely for this invocation; omit to use `settings.ibkr.methods` as-is
+  (or `IBKRIntraDay.DEFAULT_METHODS` if that's also unset). Case is passed through as-is, **not**
+  lowercased like `--providers` — IBKR's own `whatToShow` literals (`TRADES`, `BID_ASK`,
+  `MIDPOINT`) are meaningfully uppercase. Also added by croicu/quant-data#64.
+- `settings.providers` (array of strings, default `[]` — **no implicit provider**, changed by
+  croicu/quant-data#64: an unconfigured `settings.providers` used to silently default to
+  `["yfinance"]`, judged confusing) — which providers to run each invocation, applied uniformly
+  across every ticker in `settings.tickers`; unrecognized names fail fast at startup, and so does an
+  empty list (after CLI overrides are applied) — `quant-ingest --debug` shows this as an `AppError`
+  same as any other upfront misconfiguration. `settings.ibkr` (`host`/`port`/`clientId`, all optional — default to
   `IBKRIntraDay`'s own defaults, IB Gateway's paper port `4002`) — only consulted when `"ibkr"` is
   in `settings.providers`. `settings.ibkr.methods` (optional array of strings, e.g. `["TRADES"]` —
   croicu/quant-data#60) restricts which IBKR method(s) `quant-ingest` fetches per (ticker, date);
@@ -75,7 +103,7 @@ CLI signature and file format schemas for `quant-data`.
 
 ### `quant-stage`
 
-- Usage: `quant-stage [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--debug]`
+- Usage: `quant-stage [--start-date YYYY-MM-DD [--end-date YYYY-MM-DD] | --catch-up] [--ticker TICKER] [--providers NAME,...] [--debug]`
 - The second half of what used to be a single `quant-ingest` process (croicu/quant-data#56). For
   every provider in `settings.providers`, reads the most recently archived fetch for each (ticker,
   date) from `quant_ingest`'s `provider_source_archive`, parses it into `OHLCV` bars
@@ -92,9 +120,9 @@ CLI signature and file format schemas for `quant-data`.
   re-upsert of a day already staged correctly under its own date. Does **not** write
   `fact_market_data_1min` directly — promoting agreeing staging rows there is `quant-reconcile`'s
   job (see below).
-- `--ticker`/`--start-date`/`--end-date`/`--catch-up`/`--debug` — identical semantics to
-  `quant-ingest`'s own flags above, just applied to the archive-read/staging-write step instead of
-  the provider-fetch step. `--backfill` is not supported here either, for the same reason as
+- `--ticker`/`--start-date`/`--end-date`/`--catch-up`/`--providers`/`--debug` — identical semantics
+  to `quant-ingest`'s own flags above, just applied to the archive-read/staging-write step instead
+  of the provider-fetch step. `--backfill` is not supported here either, for the same reason as
   `quant-ingest`.
 - `settings.providers`/`settings.postgres.archiveDbname` are read the same way as `quant-ingest`
   (which providers to process; where to read archived fetches from — **required** here too, same
