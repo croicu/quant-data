@@ -295,9 +295,11 @@ maintained summary state (same as `quant_data`'s own `ingestion_coverage`), so i
 full read/write grant. No `quant_reader` grant on either table — this is an internal audit log, not
 part of `MarketData`'s public read surface; add one later if a read need actually shows up.
 
-Then point `quant-ingest` at it via `settings.postgres.archiveDbname` (`settings.local.json`, same
+Then point `quant-ingest` at it via `settings.postgres.archiver.dbname` (`settings.local.json`, same
 `host`/`port`/`user`/`password`/`sshUser`/`sshKeyPath` as the rest of `settings.postgres` — just a
-different `dbname`):
+different `dbname`; `archiver` carries no `user`/`password` of its own, unlike `worker`/`scheduler`
+below, since it deliberately reuses `settings.postgres.user`/`.password` — `quant_writer` already
+spans `quant_data` + `quant_ingest`, so there's no separate role to configure):
 
 ```json
 {
@@ -308,13 +310,15 @@ different `dbname`):
       "user": "quant_writer",
       "password": "...",
       "dbname": "quant_data",
-      "archiveDbname": "quant_ingest"
+      "archiver": {
+        "dbname": "quant_ingest"
+      }
     }
   }
 }
 ```
 
-Omitting `archiveDbname` disables archiving entirely (the default, backward-compatible with any
+Omitting `archiver` disables archiving entirely (the default, backward-compatible with any
 `settings.json` predating this feature) — `quant-ingest` still writes to `staging_market_data_1min`
 exactly as before.
 
@@ -331,13 +335,23 @@ connected as the schema-owner role:
 ```bash
 psql -h localhost -p 5433 -U quant_data -d postgres -c "CREATE DATABASE quant_schedule OWNER quant_data;"
 psql -h localhost -p 5433 -U quant_data -d quant_schedule -f migrations/quant_schedule/001_add_jobs_table.sql
+psql -h localhost -p 5433 -U quant_data -d quant_schedule -f migrations/quant_schedule/002_add_dependencies_and_run_once.sql
 ```
 
-`quant_schedule` gets its own two-role split, deliberately separate from `quant_writer`/
-`quant_reader` — `quant_scheduler` (read/insert/update, for hand-managing job definitions by
-connecting directly with `psql`) and `quant_worker` (read/update only, what `quant-dispatch` itself
-authenticates as — it never inserts a row, matching the "ships empty, real rows inserted by hand"
-precedent already set for `dataset_inception`):
+`002_add_dependencies_and_run_once.sql` (croicu/quant-data#68) adds `jobs.run_once` (a job that
+succeeds is disabled instead of rescheduled) and the `job_dependencies` table (a job is only
+dispatched once every job it depends on has succeeded) — what `quant-schedule` needs to decompose a
+bulk backfill into an ordered job graph. Apply it right after `001` — the role grants below cover
+`job_dependencies`, so it needs to exist first.
+
+`quant_schedule` gets its own role split, deliberately separate from `quant_writer`/`quant_reader`
+— `quant_scheduler` (full CRUD on `jobs`/`job_dependencies` — `SELECT`, `INSERT`, `UPDATE`,
+`DELETE` — what `quant-schedule` (croicu/quant-data#68) authenticates as to create and manage a
+work item's job graph) and `quant_worker` (read/update on `jobs`, read-only on `job_dependencies` —
+what `quant-dispatch` itself authenticates as; `fetch_due_jobs`'s dependency-gating query joins
+against `job_dependencies`, so `quant_worker` needs `SELECT` there too even though it never writes
+to it, matching the "ships empty, real rows inserted by hand" precedent already set for
+`dataset_inception`):
 
 ```sql
 CREATE ROLE quant_scheduler LOGIN PASSWORD '...';
@@ -345,19 +359,23 @@ CREATE ROLE quant_worker LOGIN PASSWORD '...';
 
 GRANT CONNECT ON DATABASE quant_schedule TO quant_scheduler, quant_worker;
 
-GRANT SELECT, INSERT, UPDATE ON jobs TO quant_scheduler;
+GRANT SELECT, INSERT, UPDATE, DELETE ON jobs, job_dependencies TO quant_scheduler;
 GRANT USAGE ON SEQUENCE jobs_job_id_seq TO quant_scheduler;
 
 GRANT SELECT, UPDATE ON jobs TO quant_worker;
+GRANT SELECT ON job_dependencies TO quant_worker;
 ```
 
 No `INSERT`/sequence grant for `quant_worker` — nothing in `ScheduleDatabase` ever inserts a row.
-No `quant_reader` grant on either role — `jobs` is purely operational, never read via `MarketData`.
+No `quant_reader` grant on either role — `jobs`/`job_dependencies` are purely operational, never
+read via `MarketData`.
 
-Then point `quant-dispatch` at it via `settings.postgres.schedule` (`settings.local.json`, same
+Then point `quant-dispatch` at it via `settings.postgres.worker` (`settings.local.json`, same
 `host`/`port`/`sshUser`/`sshKeyPath` as the rest of `settings.postgres` — but its own `dbname`/
-`user`/`password`, unlike `archiveDbname` above, since `quant_worker` is a distinct role from
-whatever `settings.postgres.user` holds):
+`user`/`password`, unlike `archiver` above, since `quant_worker` is a distinct role from
+whatever `settings.postgres.user` holds). `settings.postgres.worker`/`.scheduler` are named for the
+role each one holds credentials for (`quant_worker`/`quant_scheduler`), not for the CLI that uses
+them:
 
 ```json
 {
@@ -368,10 +386,17 @@ whatever `settings.postgres.user` holds):
       "user": "quant_writer",
       "password": "...",
       "dbname": "quant_data",
-      "archiveDbname": "quant_ingest",
-      "schedule": {
+      "archiver": {
+        "dbname": "quant_ingest"
+      },
+      "worker": {
         "dbname": "quant_schedule",
         "user": "quant_worker",
+        "password": "..."
+      },
+      "scheduler": {
+        "dbname": "quant_schedule",
+        "user": "quant_scheduler",
         "password": "..."
       }
     }
@@ -379,9 +404,11 @@ whatever `settings.postgres.user` holds):
 }
 ```
 
-`settings.postgres.schedule` is required to run `quant-dispatch` — unlike `archiveDbname`, there's
+`settings.postgres.worker` is required to run `quant-dispatch` — unlike `archiver`, there's
 no degraded-but-working mode, since `jobs` is `quant-dispatch`'s entire reason to exist; omitting it
 makes `quant-dispatch` raise a clear `AppError` at startup rather than failing on the first query.
+`settings.postgres.scheduler` is required to run `quant-schedule` (croicu/quant-data#68), same
+treatment — omitting it raises a clear `AppError` at startup.
 
 ## Populating real data
 

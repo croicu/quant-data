@@ -141,7 +141,7 @@ def _default_database_factory(postgres_settings: PostgresSettings) -> PostgresDa
 
 def _default_archive_reader_factory(postgres_settings: PostgresSettings) -> ProviderSourceArchiveReader:
     if postgres_settings.archive_dbname is None:
-        raise AppError("settings.postgres.archiveDbname is required to run quant-stage -- there is nothing to read from without it.")
+        raise AppError("settings.postgres.archiver.dbname is required to run quant-stage -- there is nothing to read from without it.")
     transport = resolve_transport(
         host=postgres_settings.host,
         port=postgres_settings.port,

@@ -444,6 +444,46 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
+- **Work-item scheduler (`quant-schedule`)** —
+  [issue #68](https://github.com/croicu/quant-data/issues/68), `status:implementation` — branch
+  `quant-schedule-cli`. Ad-hoc task: takes a bulk backfill request (one ticker, an inclusive date
+  range) and decomposes it into a job graph in `quant_schedule.jobs`/`job_dependencies` for the
+  already-shipped `quant-dispatch` (issue #66) to actually execute — one ingest job per (trading
+  day, provider), or per (day, method) for `ibkr` specifically since it's the only multi-method
+  provider, followed by one staging job depending on every ingest job, followed by one reconcile
+  job depending only on the staging job. Revisits two design decisions #66 recorded as deliberate
+  and accepted at the time, confirmed with the repo owner as no longer sufficient for a one-shot
+  backfill (which doesn't get the self-healing retries that made those choices safe for recurring
+  jobs): `jobs` gained `run_once` (a job that succeeds is disabled instead of rescheduled;
+  `record_job_result`'s new `disable` parameter) and a new `job_dependencies` table (a job is only
+  dispatched once every job it depends on has `last_exit_code = 0`) — migration
+  `002_add_dependencies_and_run_once`. Repurposes `quant_scheduler` — a role name #66's own docs
+  had reserved for a human/`psql`-only role, but which was never actually created on any real box —
+  as `quant-schedule`'s own role instead, with full CRUD (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) on
+  `jobs`/`job_dependencies`; distinct from `quant_worker` (the dispatcher, read/update only). New
+  `WorkItemScheduleWriter` (`quant_data._internal.shared.schedule_writer`) creates a whole work
+  item's job graph in one transaction — kept separate from `ScheduleDatabase`, whose own docstring
+  records that it never issues an `INSERT`. New package `src/schedule/` (console script
+  `quant-schedule`, no importable surface): pure `algorithm.py`'s `build_job_plan` plus thin
+  `cli.py` orchestration, including a `--dry-run` mode that prints the planned jobs without
+  touching the database — the safety valve for reviewing a plan before committing it. CLI named
+  `schedule` (a verb, matching `ingest`/`stage`/`reconcile`/`dispatch`), not the original
+  `workitem` — but `WorkItemScheduleWriter`/`NewJob` deliberately kept "work item" as the domain
+  term where the CLI's own name doesn't apply. `settings.postgres.scheduler` (holding `quant_scheduler`
+  credentials) is named for the role, not the CLI — an initial worry that this would sit too close
+  to the pre-existing `settings.postgres.schedule` (a one-character-different, easily-typo'd pair)
+  was resolved by renaming that field to `settings.postgres.worker` instead (matching `quant_worker`,
+  which it actually holds credentials for), not by avoiding `scheduler`. See the `quant-dispatch`
+  entry below for that rename. No cross-repo issue: every touched path is internal (`quant_schedule`
+  migrations,
+  `quant_data._internal.shared`, `src/dispatch/`, new `src/schedule/`), nothing under
+  `src/quant_data/`'s public surface changed. Implemented and unit-tested (`ruff`/`pytest` both
+  green). **Not yet applied to any real database** — the `002` migration and the `quant_scheduler`
+  role/grants are, per this repo's usual convention, manual by-hand steps for the repo owner (see
+  `docs/DATABASE.md`); not yet committed — sitting on branch `quant-schedule-cli`, awaiting the
+  repo owner's diff review per this file's "Before committing"
+  rule.
+
 - **Generic table-driven job dispatcher (`quant-dispatch`)** —
   [issue #66](https://github.com/croicu/quant-data/issues/66), `status:implementation` — branch
   `scheduled-jobs-dispatcher`. Revives the postponed `tasks/scheduled_jobs.md` brainstorm (issue
@@ -466,10 +506,17 @@ under `/local/` to the box:
   (`quant_data._internal.shared.schedule`) — a separate class with its own connection, same
   reasoning as `provider_source_archive`'s `ProviderSourceArchiveWriter`/`Reader`, holding
   `fetch_due_jobs`/`mark_job_running`/`record_job_result`. `quant_schedule` gets its own two-role
-  split, distinct from `quant_writer`/`quant_reader`: `quant_scheduler` (read/insert/update, for
-  hand-managing job definitions via `psql` — no code here ever authenticates as it) and
-  `quant_worker` (read/update only — what `quant-dispatch` itself connects as via the new
-  `settings.postgres.schedule`, required for `quant-dispatch` to run at all). Dispatch method is
+  split, distinct from `quant_writer`/`quant_reader`: `quant_scheduler` (originally documented here
+  as read/insert/update, for hand-managing job definitions via `psql`, with no code ever
+  authenticating as it — **superseded, see the `quant-schedule` entry above**: `quant_scheduler`
+  was never actually created on any real box, so #68 later repurposed the name as `quant-schedule`'s
+  own role instead, with full CRUD) and `quant_worker` (read/update on `jobs`, plus read-only on
+  `job_dependencies` — a grant missed when `fetch_due_jobs` grew its dependency-gating join in #68,
+  caught live as a real `permission denied for table job_dependencies` error and fixed in
+  `docs/DATABASE.md` — what `quant-dispatch` itself connects as via the new
+  `settings.postgres.schedule` [**renamed to `.worker`, see the `quant-schedule`/#68 entry above** —
+  `.schedule` read as ambiguous once `.scheduler` existed alongside it], required for
+  `quant-dispatch` to run at all). Dispatch method is
   subprocess (isolation, matches the existing
   precedent that `ingest`/`stage`/`reconcile` are already separate processes); dispatcher itself
   is one-shot, not a daemon — the actual "run every minute" trigger (cron/systemd) stays a
@@ -589,7 +636,7 @@ under `/local/` to the box:
   atomic: both processes landed in the same PR/branch (`split-ingest-stage`), since staging would
   get zero new data if `ingest`-only shipped first. `quant-ingest` now writes to `quant_ingest`
   only (no `quant_data` dependency at all — `_default_archive_writer_factory` raises if
-  `archiveDbname` isn't configured, since there's nothing else for it to do); `quant-stage` reads
+  `archiver.dbname` isn't configured, since there's nothing else for it to do); `quant-stage` reads
   `provider_source_archive` via a new `ProviderSourceArchiveReader` (picks the latest-`fetched_at`
   row per `(ticker, provider, trading_date)`, since the table has no uniqueness constraint on that
   key) and calls the same `write_staging_bars`/`record_ingestion_coverage` `quant-ingest` used to
@@ -659,7 +706,7 @@ under `/local/` to the box:
   star-schema dependency at all) writes both tables in one transaction, called from `_ingest_one`
   immediately after a fetch succeeds and before the staging write, so even a bug in this repo's own
   parsing/staging code can't lose what a provider already returned. Purely additive: an unconfigured
-  `settings.postgres.archiveDbname` (the default) disables archiving entirely, `quant-ingest` still
+  `settings.postgres.archiver` (the default) disables archiving entirely, `quant-ingest` still
   writes to staging exactly as before. Deliberately excludes splitting `quant-ingest` into two
   decoupled "ingest"/"stage" processes (discussed, explicitly deferred to its own future issue) —
   this issue only ships the `quant_ingest` database and archiving as an additive step alongside

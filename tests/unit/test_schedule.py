@@ -71,13 +71,24 @@ def test_close_closes_connection_and_transport(mock_psycopg):
 
 @patch("quant_data._internal.shared.schedule.psycopg")
 def test_fetch_due_jobs_returns_rows(mock_psycopg):
-    _connect(mock_psycopg, [(1, "ingest", ["quant-ingest", "--catch-up"], 3600)])
+    _connect(mock_psycopg, [(1, "ingest", ["quant-ingest", "--catch-up"], 3600, False)])
 
     database = ScheduleDatabase(transport=_FakeTransport(), user="quant_worker", password="x", dbname="quant_schedule")
 
     due_jobs = database.fetch_due_jobs(datetime(2026, 7, 24, 13, 0))
 
-    assert due_jobs == [JobRow(job_id=1, name="ingest", command=["quant-ingest", "--catch-up"], interval_seconds=3600)]
+    assert due_jobs == [JobRow(job_id=1, name="ingest", command=["quant-ingest", "--catch-up"], interval_seconds=3600, run_once=False)]
+
+
+@patch("quant_data._internal.shared.schedule.psycopg")
+def test_fetch_due_jobs_returns_run_once_flag(mock_psycopg):
+    _connect(mock_psycopg, [(2, "workitem-ingest", ["quant-ingest"], 300, True)])
+
+    database = ScheduleDatabase(transport=_FakeTransport(), user="quant_worker", password="x", dbname="quant_schedule")
+
+    due_jobs = database.fetch_due_jobs(datetime(2026, 7, 24, 13, 0))
+
+    assert due_jobs == [JobRow(job_id=2, name="workitem-ingest", command=["quant-ingest"], interval_seconds=300, run_once=True)]
 
 
 @patch("quant_data._internal.shared.schedule.psycopg")
@@ -130,9 +141,22 @@ def test_record_job_result_commits_with_expected_values(mock_psycopg):
     database.record_job_result(7, 1, "boom", next_run_at)
 
     mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
-    assert mock_cursor.execute.call_args.args[1] == (1, "boom", next_run_at, 7)
+    assert mock_cursor.execute.call_args.args[1] == (1, "boom", next_run_at, False, 7)
     mock_connection.commit.assert_called_once()
     mock_connection.rollback.assert_not_called()
+
+
+@patch("quant_data._internal.shared.schedule.psycopg")
+def test_record_job_result_disable_true_passed_through(mock_psycopg):
+    mock_connection = _connect(mock_psycopg, [])
+
+    database = ScheduleDatabase(transport=_FakeTransport(), user="quant_worker", password="x", dbname="quant_schedule")
+    next_run_at = datetime(2026, 7, 24, 14, 0)
+
+    database.record_job_result(9, 0, None, next_run_at, disable=True)
+
+    mock_cursor = mock_connection.cursor.return_value.__enter__.return_value
+    assert mock_cursor.execute.call_args.args[1] == (0, None, next_run_at, True, 9)
 
 
 @patch("quant_data._internal.shared.schedule.psycopg")

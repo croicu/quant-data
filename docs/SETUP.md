@@ -139,7 +139,9 @@ pip install -e ".[dev]"
       "user": "<role>",
       "password": "...",
       "dbname": "quant_data",
-      "archiveDbname": "quant_ingest"
+      "archiver": {
+        "dbname": "quant_ingest"
+      }
     },
     "providers": ["ibkr"]
   }

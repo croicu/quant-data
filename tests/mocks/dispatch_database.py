@@ -11,7 +11,7 @@ class FakeDispatchDatabase:
     def __init__(self, jobs: list[JobRow] | None = None) -> None:
         self.jobs = jobs if jobs is not None else []
         self.running_job_ids: list[int] = []
-        self.recorded_results: list[tuple[int, int, str | None, datetime]] = []
+        self.recorded_results: list[tuple[int, int, str | None, datetime, bool]] = []
         self.closed = False
 
     def fetch_due_jobs(self, now: datetime) -> list[JobRow]:
@@ -20,8 +20,8 @@ class FakeDispatchDatabase:
     def mark_job_running(self, job_id: int) -> None:
         self.running_job_ids.append(job_id)
 
-    def record_job_result(self, job_id: int, exit_code: int, error_message: str | None, next_run_at: datetime) -> None:
-        self.recorded_results.append((job_id, exit_code, error_message, next_run_at))
+    def record_job_result(self, job_id: int, exit_code: int, error_message: str | None, next_run_at: datetime, disable: bool = False) -> None:
+        self.recorded_results.append((job_id, exit_code, error_message, next_run_at, disable))
 
     def close(self) -> None:
         self.closed = True

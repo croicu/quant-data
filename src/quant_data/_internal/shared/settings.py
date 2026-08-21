@@ -28,6 +28,23 @@ def _default_providers() -> list[str]:
     return list(DEFAULT_PROVIDERS)
 
 
+def _parse_schedule_settings_payload(payload: dict, settings_key: str) -> ScheduleSettings:
+    if not isinstance(payload, dict):
+        raise TaskError(f"'{settings_key}' must be a JSON object.")
+    required_keys = ["dbname", "user", "password"]
+    missing_keys = []
+    for key in required_keys:
+        if key not in payload:
+            missing_keys.append(key)
+    if missing_keys:
+        raise TaskError(f"'{settings_key}' is missing required key(s): {', '.join(missing_keys)}")
+    return ScheduleSettings(
+        dbname=str(payload["dbname"]),
+        user=str(payload["user"]),
+        password=str(payload["password"]),
+    )
+
+
 def _parse_rate_limit_payload(rate_limit_payload: dict, settings_key: str) -> RateLimitSettings:
     if "requestsPerWindow" not in rate_limit_payload or "windowSeconds" not in rate_limit_payload:
         raise TaskError(f"'{settings_key}.rateLimit' must set both 'requestsPerWindow' and 'windowSeconds'.")
@@ -45,11 +62,14 @@ class ScheduleSettings:
     # quant_schedule (croicu/quant-data#66) -- a separate database, same server as the primary
     # connection above but its own dbname/user/password: unlike archive_dbname (which reuses the
     # primary user/password since quant_writer already spans quant_data + quant_ingest),
-    # quant_schedule deliberately has its own two-role split -- quant_scheduler (read/insert/update,
-    # for hand-managing job definitions via psql) and quant_worker (read/update only, what
-    # quant-dispatch itself connects as -- it never inserts a row). Only quant_worker's credentials
-    # are configured here; quant_scheduler is a manual-administration role never used by any code in
-    # this repo, same "ships empty, inserted by hand" precedent as dataset_inception/jobs itself.
+    # quant_schedule has its own role split -- quant_scheduler (full CRUD: SELECT/INSERT/UPDATE/
+    # DELETE on jobs/job_dependencies, croicu/quant-data#68 -- what quant-schedule connects as to
+    # create and manage a work item's job graph; a name this repo's docs had previously reserved
+    # for a human/psql-only role that was never actually created on any real box, so repurposing it
+    # here doesn't collide with anything real) and quant_worker (read/update only, what
+    # quant-dispatch itself connects as -- it never inserts a row). This same dataclass shape is
+    # reused for both PostgresSettings.worker (quant_worker credentials) and
+    # PostgresSettings.scheduler (quant_scheduler credentials) -- same database, different role.
     dbname: str
     user: str
     password: str
@@ -66,13 +86,20 @@ class PostgresSettings:
     ssh_key_path: str | None = None
     # quant_ingest (croicu/quant-data#52) -- a separate database on the same server, same
     # host/port/user/password/ssh_user/ssh_key_path as the primary connection above, just a
-    # different dbname. None means archiving to quant_ingest is disabled (e.g. an existing
-    # settings.json predating this feature) -- quant-ingest still writes to staging as before.
+    # different dbname. Parsed from the nested settings.postgres.archiver.dbname (unlike
+    # worker/scheduler, "archiver" carries no user/password of its own -- it deliberately reuses
+    # this same PostgresSettings.user/password, since quant_writer already spans quant_data +
+    # quant_ingest; no separate role). None means archiving to quant_ingest is disabled (e.g. an
+    # existing settings.json predating this feature) -- quant-ingest still writes to staging as
+    # before.
     archive_dbname: str | None = None
     # quant_schedule (croicu/quant-data#66) -- see ScheduleSettings above. None means
     # quant-dispatch cannot run (it raises at startup) -- unlike archive_dbname, there's no
     # degraded-but-working mode, since jobs is quant-dispatch's entire reason to exist.
-    schedule: ScheduleSettings | None = None
+    worker: ScheduleSettings | None = None
+    # quant_scheduler credentials (croicu/quant-data#68) -- see ScheduleSettings above. None means
+    # quant-schedule cannot run (it raises at startup), same treatment as schedule above.
+    scheduler: ScheduleSettings | None = None
 
 
 @dataclass
@@ -252,25 +279,24 @@ class Settings:
             if (ssh_user_payload is None) != (ssh_key_path_payload is None):
                 raise TaskError("'settings.postgres.sshUser' and 'settings.postgres.sshKeyPath' must be set together (or both omitted).")
 
-            archive_dbname_payload = postgres_payload.get("archiveDbname")
+            archive_dbname: str | None = None
+            archiver_payload = postgres_payload.get("archiver")
+            if archiver_payload is not None:
+                if not isinstance(archiver_payload, dict):
+                    raise TaskError("'settings.postgres.archiver' must be a JSON object.")
+                if "dbname" not in archiver_payload:
+                    raise TaskError("'settings.postgres.archiver' is missing required key(s): dbname")
+                archive_dbname = str(archiver_payload["dbname"])
 
-            schedule_settings: ScheduleSettings | None = None
-            schedule_payload = postgres_payload.get("schedule")
-            if schedule_payload is not None:
-                if not isinstance(schedule_payload, dict):
-                    raise TaskError("'settings.postgres.schedule' must be a JSON object.")
-                schedule_required_keys = ["dbname", "user", "password"]
-                schedule_missing_keys = []
-                for key in schedule_required_keys:
-                    if key not in schedule_payload:
-                        schedule_missing_keys.append(key)
-                if schedule_missing_keys:
-                    raise TaskError(f"'settings.postgres.schedule' is missing required key(s): {', '.join(schedule_missing_keys)}")
-                schedule_settings = ScheduleSettings(
-                    dbname=str(schedule_payload["dbname"]),
-                    user=str(schedule_payload["user"]),
-                    password=str(schedule_payload["password"]),
-                )
+            worker_settings: ScheduleSettings | None = None
+            worker_payload = postgres_payload.get("worker")
+            if worker_payload is not None:
+                worker_settings = _parse_schedule_settings_payload(worker_payload, "settings.postgres.worker")
+
+            scheduler_settings: ScheduleSettings | None = None
+            scheduler_payload = postgres_payload.get("scheduler")
+            if scheduler_payload is not None:
+                scheduler_settings = _parse_schedule_settings_payload(scheduler_payload, "settings.postgres.scheduler")
 
             postgres_settings = PostgresSettings(
                 host=str(postgres_payload["host"]),
@@ -280,8 +306,9 @@ class Settings:
                 dbname=str(postgres_payload["dbname"]),
                 ssh_user=str(ssh_user_payload) if ssh_user_payload is not None else None,
                 ssh_key_path=str(ssh_key_path_payload) if ssh_key_path_payload is not None else None,
-                archive_dbname=str(archive_dbname_payload) if archive_dbname_payload is not None else None,
-                schedule=schedule_settings,
+                archive_dbname=archive_dbname,
+                worker=worker_settings,
+                scheduler=scheduler_settings,
             )
 
         tickers_payload = settings_payload.get("tickers", [])

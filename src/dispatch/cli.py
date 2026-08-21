@@ -47,8 +47,8 @@ def parse_args(argv: list[str]) -> CliArguments:
 
 
 def _default_database_factory(postgres_settings: PostgresSettings) -> ScheduleDatabase:
-    if postgres_settings.schedule is None:
-        raise AppError("settings.postgres.schedule is required to run quant-dispatch -- there is nowhere to read jobs from without it.")
+    if postgres_settings.worker is None:
+        raise AppError("settings.postgres.worker is required to run quant-dispatch -- there is nowhere to read jobs from without it.")
     transport = resolve_transport(
         host=postgres_settings.host,
         port=postgres_settings.port,
@@ -57,9 +57,9 @@ def _default_database_factory(postgres_settings: PostgresSettings) -> ScheduleDa
     )
     return ScheduleDatabase(
         transport=transport,
-        user=postgres_settings.schedule.user,
-        password=postgres_settings.schedule.password,
-        dbname=postgres_settings.schedule.dbname,
+        user=postgres_settings.worker.user,
+        password=postgres_settings.worker.password,
+        dbname=postgres_settings.worker.dbname,
     )
 
 
@@ -110,11 +110,18 @@ def _run_job(
         error_message = str(error)
 
     next_run_at = compute_next_run_at(now, job.interval_seconds)
-    database.record_job_result(job.job_id, exit_code, error_message, next_run_at)
 
     if exit_code == 0:
-        Logger.info(f"quant-dispatch: job '{job.name}' succeeded, next run at {next_run_at.isoformat()}.", category=CATEGORY_DISPATCH)
+        # A run_once job (croicu/quant-data#68) is disabled instead of rescheduled once it
+        # actually succeeds -- a failure still reschedules/retries normally either way.
+        database.record_job_result(job.job_id, exit_code, error_message, next_run_at, disable=job.run_once)
+        if job.run_once:
+            Logger.info(f"quant-dispatch: job '{job.name}' succeeded (run_once), disabled.", category=CATEGORY_DISPATCH)
+        else:
+            Logger.info(f"quant-dispatch: job '{job.name}' succeeded, next run at {next_run_at.isoformat()}.", category=CATEGORY_DISPATCH)
         return True
+
+    database.record_job_result(job.job_id, exit_code, error_message, next_run_at)
 
     Logger.warning(
         f"quant-dispatch: job '{job.name}' failed (exit code {exit_code}): {error_message}",

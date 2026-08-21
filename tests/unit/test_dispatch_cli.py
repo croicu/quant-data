@@ -48,8 +48,42 @@ def test_main_runs_a_due_job_and_records_success():
     assert exit_code == 0
     assert runs == [["quant-ingest", "--catch-up"]]
     assert database.running_job_ids == [1]
-    assert database.recorded_results == [(1, 0, None, datetime(2026, 1, 2, 13, 0, 0, tzinfo=timezone.utc))]
+    assert database.recorded_results == [(1, 0, None, datetime(2026, 1, 2, 13, 0, 0, tzinfo=timezone.utc), False)]
     assert database.closed is True
+
+
+def test_main_disables_a_run_once_job_on_success_instead_of_rescheduling():
+    job = JobRow(job_id=4, name="workitem-ingest", command=["quant-ingest"], interval_seconds=300, run_once=True)
+    database = FakeDispatchDatabase(jobs=[job])
+
+    exit_code = cli.main(
+        [],
+        settings_path=SETTINGS_PATH,
+        database_factory=_use_database(database),
+        subprocess_runner=lambda command: _completed(0),
+        now=lambda: _NOW,
+    )
+
+    assert exit_code == 0
+    job_id, exit_code_recorded, error_message, _next_run_at, disable = database.recorded_results[0]
+    assert (job_id, exit_code_recorded, error_message, disable) == (4, 0, None, True)
+
+
+def test_main_retries_a_run_once_job_on_failure_instead_of_disabling():
+    job = JobRow(job_id=5, name="workitem-ingest", command=["quant-ingest"], interval_seconds=300, run_once=True)
+    database = FakeDispatchDatabase(jobs=[job])
+
+    exit_code = cli.main(
+        [],
+        settings_path=SETTINGS_PATH,
+        database_factory=_use_database(database),
+        subprocess_runner=lambda command: _completed(1, stderr="boom"),
+        now=lambda: _NOW,
+    )
+
+    assert exit_code == 1
+    job_id, exit_code_recorded, error_message, _next_run_at, disable = database.recorded_results[0]
+    assert (job_id, exit_code_recorded, error_message, disable) == (5, 1, "boom", False)
 
 
 def test_main_returns_one_when_a_job_fails():
@@ -65,8 +99,8 @@ def test_main_returns_one_when_a_job_fails():
     )
 
     assert exit_code == 1
-    job_id, exit_code_recorded, error_message, next_run_at = database.recorded_results[0]
-    assert (job_id, exit_code_recorded, error_message) == (2, 1, "boom")
+    job_id, exit_code_recorded, error_message, next_run_at, disable = database.recorded_results[0]
+    assert (job_id, exit_code_recorded, error_message, disable) == (2, 1, "boom", False)
     assert next_run_at == datetime(2026, 1, 2, 12, 30, 0, tzinfo=timezone.utc)
 
 
@@ -86,8 +120,8 @@ def test_main_records_launch_failure_as_exit_code_negative_one():
     )
 
     assert exit_code == 1
-    job_id, exit_code_recorded, error_message, _next_run_at = database.recorded_results[0]
-    assert (job_id, exit_code_recorded) == (3, -1)
+    job_id, exit_code_recorded, error_message, _next_run_at, disable = database.recorded_results[0]
+    assert (job_id, exit_code_recorded, disable) == (3, -1, False)
     assert "not found" in error_message
 
 
@@ -112,7 +146,7 @@ def test_main_dispatches_multiple_due_jobs_independently():
     assert len(database.recorded_results) == 2
 
 
-def test_default_database_factory_raises_when_schedule_not_configured():
+def test_default_database_factory_raises_when_worker_not_configured():
     settings = Settings.load(path=SETTINGS_PATH)
 
     with pytest.raises(AppError):

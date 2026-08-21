@@ -583,7 +583,7 @@ single shared date, since tickers may already have different amounts of history.
 ## `quant_ingest` database
 
 A **separate Postgres database**, not a schema or table inside `quant_data` — same server/instance
-(CroicuWS1), own connection (`settings.postgres.archiveDbname`), own `schema_migrations`, own
+(CroicuWS1), own connection (`settings.postgres.archiver.dbname`), own `schema_migrations`, own
 migration sequence (`migrations/quant_ingest/*.sql`, independently numbered from `migrations/*.sql`).
 Added by [croicu/quant-data#52](https://github.com/croicu/quant-data/issues/52) as the append-only
 record of every provider fetch (see `provider_source_archive` below for exactly what "append-only"
@@ -676,7 +676,7 @@ never archived without its coverage range also reflecting it.
 ## `quant_schedule` database
 
 A **separate Postgres database**, not a schema or table inside `quant_data` — same server/instance,
-own connection (`settings.postgres.schedule`), own `schema_migrations`, own migration sequence
+own connection (`settings.postgres.worker`), own `schema_migrations`, own migration sequence
 (`migrations/quant_schedule/*.sql`, independently numbered from `migrations/*.sql`). Added by
 [croicu/quant-data#66](https://github.com/croicu/quant-data/issues/66) as the table-driven schedule
 `quant-dispatch` reads. Deliberately its own database, not just a table: `jobs` is meant to
@@ -687,10 +687,13 @@ writes go through `ScheduleDatabase` (`quant_data._internal.shared.schedule`), a
 separate from `PostgresDatabase`, same reasoning as `ProviderSourceArchiveWriter`/`Reader` for
 `quant_ingest` above.
 
-Its own two-role split, deliberately separate from `quant_writer`/`quant_reader`: `quant_scheduler`
-(read/insert/update — for hand-managing job definitions directly with `psql`; no code in this repo
-ever authenticates as it) and `quant_worker` (read/update only — what `quant-dispatch` itself
-connects as via `settings.postgres.schedule`; it never inserts a row). See `docs/DATABASE.md`'s
+Its own role split, deliberately separate from `quant_writer`/`quant_reader`: `quant_scheduler`
+(full CRUD on `jobs`/`job_dependencies` — `SELECT`, `INSERT`, `UPDATE`, `DELETE` — what
+`quant-schedule` (croicu/quant-data#68) connects as via `settings.postgres.scheduler` to create and
+manage a work item's job graph) and `quant_worker` (read/update on `jobs`, read-only on
+`job_dependencies` — `fetch_due_jobs`'s dependency-gating query joins against it — what
+`quant-dispatch` itself connects as via `settings.postgres.worker`; it never inserts a row). See
+`docs/DATABASE.md`'s
 "Setting up the `quant_schedule` database" section for the exact `CREATE ROLE`/`GRANT` statements.
 
 ### `jobs`
@@ -707,14 +710,16 @@ connects as via `settings.postgres.schedule`; it never inserts a row). See `docs
 | `last_run_at` | `TIMESTAMP` | |
 | `last_exit_code` | `INT` | |
 | `last_error` | `TEXT` | |
+| `run_once` | `BOOLEAN NOT NULL DEFAULT false` | added in `002_add_dependencies_and_run_once` |
 
 Added in `001_add_jobs_table` — a generic, table-driven schedule for the repo's recurring
 processes (`quant-ingest`/`quant-stage`/`quant-reconcile`), reviving the postponed brainstorm at
 `tasks/scheduled_jobs.md` (issue #3). Job definitions live here as data rather than committed code
 specifically so the public repo never has to name a specific host — only the table shape and
 generic dispatch code are checked in. **Ships empty** — real job rows (real intervals, real
-`command` values, anything host-specific) are inserted by hand afterward by the `quant_scheduler`
-role, same precedent as `quant_data.dataset_inception`.
+`command` values, anything host-specific) are inserted programmatically by `quant-schedule`
+(connecting as `quant_scheduler`, see below) or by hand via the same role, same precedent as
+`quant_data.dataset_inception`.
 
 `command` is passed straight to `subprocess.run` without `shell=True`, so there is no shell
 injection/quoting concern from its contents. `status` guards against double-dispatch:
@@ -727,11 +732,35 @@ failed run is still a finished run, and `next_run_at` (computed by
 `dispatch.algorithm.compute_next_run_at`, always `now + interval_seconds`, not the job's own
 prior `next_run_at`, so a dispatcher that was down or delayed doesn't pile up a burst of
 immediately-due catch-up runs on resume) still advances so the job is retried on schedule rather
-than stuck.
+than stuck. Exception: a `run_once` job that just succeeded is disabled (`enabled = false`)
+instead of rescheduled — `record_job_result`'s `disable` parameter, set by `dispatch/cli.py`
+exactly when `job.run_once` and the run succeeded; a `run_once` job that failed still
+reschedules/retries normally.
 
 `quant-dispatch` itself is one-shot, not a daemon: it checks `jobs` once, dispatches whatever's
 due, and exits. The actual "run every minute" trigger (a cron entry or systemd timer) is a
 host-level concern outside this repo, consistent with the rest of this table's design goal.
+
+### `job_dependencies`
+
+| Column | Type | Notes |
+|---|---|---|
+| `job_id` | `INT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE` | |
+| `depends_on_job_id` | `INT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE` | |
+
+`PRIMARY KEY (job_id, depends_on_job_id)`, `CHECK (job_id <> depends_on_job_id)`.
+
+Added in `002_add_dependencies_and_run_once` (croicu/quant-data#68). `001`'s original design
+deliberately left job *ordering* (e.g. `ingest` before `stage` before `reconcile`) to each job's
+own `interval_seconds`/`next_run_at` offset rather than a `depends_on`/DAG mechanism — an
+accepted risk for recurring jobs, mitigated by `ingest`/`stage` being idempotent. `quant-schedule`
+(a one-shot backfill breaker) doesn't get that same self-healing from retries, so real dependency
+tracking was added for it specifically: `fetch_due_jobs`'s query excludes any job with a row here
+whose `depends_on_job_id` points to a job that hasn't yet succeeded (`last_exit_code IS NULL OR
+<> 0`). A gated job is simply omitted that dispatch cycle — its own `next_run_at` doesn't move, so
+it's re-considered on every later invocation with no separate bookkeeping needed. Populated only
+by `WorkItemScheduleWriter.create_jobs` (`quant-schedule`, connecting as `quant_scheduler`), never
+by `quant-dispatch` itself.
 
 ## Indexes
 
