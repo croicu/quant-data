@@ -28,7 +28,7 @@ rather than picking a provider on the caller's behalf.
 - Fetches 1-minute bars from every provider in `settings.providers` (no default — must be
   configured, or passed via `--providers`/a response file, e.g. `@configs/all-providers.args`) and
   archives each provider's fetch into the separate
-  `quant_ingest` database's `provider_source_archive` (`settings.postgres.archiveDbname`, required
+  `quant_ingest` database's `provider_source_archive` (`settings.postgres.archiver.dbname`, required
   — croicu/quant-data#52). **As of croicu/quant-data#56, this is `quant-ingest`'s entire job — it
   writes to `quant_ingest` only and no longer touches `quant_data` at all**, not even
   `staging_market_data_1min`. A separate command, `quant-stage` (see below), reads what's archived
@@ -51,7 +51,7 @@ rather than picking a provider on the caller's behalf.
   section for why, and the issue for the follow-up).
 - `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
   instead of printing a one-line error, for upfront failures (settings load, no ticker/date
-  configured at all, every configured provider failing to connect, `archiveDbname` unconfigured).
+  configured at all, every configured provider failing to connect, `archiver` unconfigured).
 - `--providers` — comma-separated provider names (e.g. `yfinance,massive`) overriding
   `settings.providers` entirely for this invocation; omit to use `settings.providers` as-is. Still
   no per-ticker override — scoping a provider to a subset of tickers (e.g. a pilot rollout) means a
@@ -87,13 +87,13 @@ rather than picking a provider on the caller's behalf.
   unlimited when omitted. `MassiveIntraDay` also retries on HTTP 429 internally (3 attempts, 15s
   apart) since Massive's documented rate limit isn't strictly enforced in practice
   (croicu/quant-scratch#24's live testing) — the pre-emptive `RateLimiter` above is the primary
-  defense, this is a fallback for the cases it doesn't strictly hold. `settings.postgres.archiveDbname`
+  defense, this is a fallback for the cases it doesn't strictly hold. `settings.postgres.archiver.dbname`
   (croicu/quant-data#52) — a second database on the same server/role as `settings.postgres`'s
   existing `host`/`port`/`user`/`password`/`sshUser`/`sshKeyPath`, just a different `dbname`.
   **Required** as of croicu/quant-data#56 (`quant-ingest` raises at startup if unconfigured — there
   is nowhere else for it to write).
 - Exit codes: `0` every (ticker, date) pair had at least one provider succeed; `1` settings load
-  failure, no ticker/date-range configured at all, `archiveDbname` unconfigured or unreachable,
+  failure, no ticker/date-range configured at all, `archiver` unconfigured or unreachable,
   every configured provider failing to connect, or one or more (ticker, date) pairs where every
   provider failed (an individual provider failing for one pair — bad ticker on that source, gateway
   unreachable, its own archive write failing — logs a warning and the run continues with whatever
@@ -124,7 +124,7 @@ rather than picking a provider on the caller's behalf.
   to `quant-ingest`'s own flags above, just applied to the archive-read/staging-write step instead
   of the provider-fetch step. `--backfill` is not supported here either, for the same reason as
   `quant-ingest`.
-- `settings.providers`/`settings.postgres.archiveDbname` are read the same way as `quant-ingest`
+- `settings.providers`/`settings.postgres.archiver.dbname` are read the same way as `quant-ingest`
   (which providers to process; where to read archived fetches from — **required** here too, same
   reasoning). `settings.postgres` (the primary `quant_data` connection) is also required, same as
   every other command in this repo.
@@ -220,25 +220,33 @@ rather than picking a provider on the caller's behalf.
   back to `'idle'` once it finishes (success or failure alike), so a `quant-dispatch` invocation
   overlapping a still-running prior one skips that job rather than double-dispatching it (e.g. two
   concurrent `quant-reconcile` runs against the same database).
-- `next_run_at` is always rescheduled to the moment this dispatch actually ran a job, plus that
-  job's own `interval_seconds` — not the job's prior `next_run_at` — so a dispatcher that was down
-  or delayed doesn't pile up a burst of immediately-due catch-up runs the moment it resumes.
+- `next_run_at` is rescheduled to the moment this dispatch actually ran a job, plus that job's own
+  `interval_seconds` — not the job's prior `next_run_at` — so a dispatcher that was down or delayed
+  doesn't pile up a burst of immediately-due catch-up runs the moment it resumes. Exception: a
+  `run_once` job (croicu/quant-data#68) that just succeeded is disabled instead — `next_run_at` is
+  still recorded but irrelevant, since `fetch_due_jobs` filters on `enabled`. A `run_once` job that
+  failed still reschedules/retries normally.
+- A job is only considered due if every job it depends on (`job_dependencies`, croicu/quant-data#68)
+  has already succeeded (`last_exit_code = 0`) — a gated job is simply excluded that cycle, with no
+  separate bookkeeping, since its own `next_run_at` doesn't move.
 - `--debug` overrides `settings.json`'s `debug` flag; also re-raises the underlying exception
   instead of printing a one-line error.
 - `settings.postgres` is required, same as every other command in this repo, **and
-  `settings.postgres.schedule` is required specifically for `quant-dispatch`** — `jobs` lives in its
+  `settings.postgres.worker` is required specifically for `quant-dispatch`** — `jobs` lives in its
   own `quant_schedule` database, not `quant_data` (croicu/quant-data#66's design pivoted away from
   the original `quant_data`-embedded plan before it shipped, once it was clear `jobs` should
   eventually schedule work against other databases this repo doesn't own too). `quant-dispatch`
-  connects to `quant_schedule` as `quant_worker` (read/update only); a separate `quant_scheduler`
-  role (read/insert/update) exists for hand-managing job definitions via `psql`, never used by any
-  code in this repo. Omitting `settings.postgres.schedule` raises a clear `AppError` at startup.
+  connects to `quant_schedule` as `quant_worker` (read/update on `jobs`, read-only on
+  `job_dependencies`); a separate `quant_scheduler`
+  role (full CRUD) is what `quant-schedule` (croicu/quant-data#68) connects as to create job rows —
+  `quant-dispatch` never authenticates as it. Omitting `settings.postgres.worker` raises a clear
+  `AppError` at startup.
 - Exit codes: `0` no jobs were due, or every due job's subprocess exited `0`; `1` settings load
-  failure, `settings.postgres`/`settings.postgres.schedule` not configured, or one or more due jobs
+  failure, `settings.postgres`/`settings.postgres.worker` not configured, or one or more due jobs
   exited non-zero/failed to launch; `2` argument parsing error.
-- `jobs` ships empty by `migrations/quant_schedule/001_add_jobs_table.sql` — real schedules (real
-  intervals, real `command` values) are inserted by hand per host by the `quant_scheduler` role; see
-  `docs/DATABASE.md`/`docs/SCHEMA.md`'s `quant_schedule`/`jobs` sections.
+- `jobs` ships empty by `migrations/quant_schedule/001_add_jobs_table.sql` — real job rows are
+  created by `quant-schedule` (connecting as `quant_scheduler`) or inserted by hand via the same
+  role; see `docs/DATABASE.md`/`docs/SCHEMA.md`'s `quant_schedule`/`jobs` sections.
 - **Deployment assumptions** (relevant to whatever cron entry/systemd timer invokes
   `quant-dispatch`): a job's `command[0]` is resolved against `sys.executable`'s own directory
   first (falling back to a plain `PATH` lookup if not found there) — not the inherited `PATH` —
@@ -249,9 +257,43 @@ rather than picking a provider on the caller's behalf.
   `Settings.load()` to find `settings.json` in the first place, so a due job's subprocess inherits
   that same correct `cwd` for free.
 
+### `quant-schedule`
+
+- Usage: `quant-schedule --ticker TICKER --start-date YYYY-MM-DD [--end-date YYYY-MM-DD]
+  [--providers NAME,...] [--ibkr-methods METHOD,...] [--retry-interval-seconds N] [--dry-run]
+  [--debug]`
+- Decomposes a bulk backfill request into a job graph and writes it into `quant_schedule.jobs`/
+  `job_dependencies` (croicu/quant-data#68) — it never runs anything itself; `quant-dispatch` picks
+  the jobs up as they become due. `--ticker`/`--start-date` are required (unlike `quant-ingest`,
+  there's no "every ticker in `settings.tickers`" mode — a work item is always one ticker).
+  `--end-date` defaults to `--start-date`.
+- One ingest job per (trading day, provider), skipping weekends — or per (day, method) for `ibkr`
+  specifically, since it's the only provider with more than one method — followed by one staging
+  job depending on every ingest job, followed by one reconcile job depending only on the staging
+  job (`quant-reconcile` itself takes no ticker/date arguments, so this is always the bare
+  `quant-reconcile` command). Every created job is `run_once=True`: it's disabled once it succeeds,
+  and simply retries on `--retry-interval-seconds` (default 300) if it fails.
+- `--providers`/`--ibkr-methods` default to `settings.providers`/`settings.ibkr.methods` (falling
+  back to `ibkr`'s own default method list if neither is set), same resolution as `quant-ingest`.
+- `--dry-run` prints the planned jobs (name, command, `run_once`, `depends_on`) without writing
+  anything — the way to review a plan before committing it to the real database.
+- All jobs for one work item are created in a single transaction — either the whole graph is
+  created, or none of it is. Re-submitting the same work item (same ticker/date range/providers)
+  fails with a clear error instead of a raw database error, since job `name`s collide.
+- `settings.postgres` is required, and **`settings.postgres.scheduler` is required specifically for
+  `quant-schedule`** — it connects to `quant_schedule` as `quant_scheduler` (full CRUD — `SELECT`,
+  `INSERT`, `UPDATE`, `DELETE` — on `jobs`/`job_dependencies`), distinct from `quant_worker`
+  (`quant-dispatch`'s own connection, `settings.postgres.worker`); see `docs/DATABASE.md`.
+  Omitting it raises a clear `AppError` at startup (skipped on `--dry-run`, which never opens a
+  database connection at all).
+- Exit codes: `0` success (including a completed `--dry-run`); `1` settings load failure,
+  `settings.postgres`/`settings.postgres.scheduler` not configured, no provider configured, or job
+  creation failed (e.g. a name collision); `2` argument parsing error.
+
 There is no generic `quant-data` command — `quant-ingest`/`quant-stage`/`quant-reconcile`/
-`quant-dispatch` (write side, packages `ingest`/`stage`/`reconcile`/`dispatch`, outside the
-`quant_data` namespace — no importable surface, console script only) and `quant_data.MarketData`
+`quant-dispatch`/`quant-schedule` (write side, packages `ingest`/`stage`/`reconcile`/`dispatch`/
+`schedule`, outside the `quant_data` namespace — no importable surface, console script only) and
+`quant_data.MarketData`
 (read side — a library, not a CLI) are the consumer-facing entry points. `MarketData`, `OHLCV`, `DataQuality`, `LoggingSink`, `PendingResolutionBar`, `ProviderRole`,
 `RejectedWhistleblowerBar`, and `create_postgres_provider` are re-exported at the `quant_data` top
 level (`from quant_data import MarketData, OHLCV, create_postgres_provider, ...`);

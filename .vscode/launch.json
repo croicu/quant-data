@@ -7,6 +7,7 @@
       "request": "launch",
       "module": "ingest.cli",
       "args": [
+        "@configs/all-providers.args",
         "--ticker", "${input:ingestTicker}",
         "--start-date", "${input:ingestStartDate}",
         "--end-date", "${input:ingestEndDate}"
@@ -20,11 +21,74 @@
       "request": "launch",
       "module": "ingest.cli",
       "args": [
+        "@configs/all-providers.args",
         "--ticker", "${input:ingestTicker}",
         "--start-date", "${input:ingestStartDate}",
         "--end-date", "${input:ingestEndDate}",
         "--debug"
       ],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Schedule",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "schedule.cli",
+      "args": [
+        "@configs/all-providers.args",
+        "--ticker", "${input:scheduleTicker}",
+        "--start-date", "${input:scheduleStartDate}",
+        "--end-date", "${input:scheduleEndDate}"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Schedule (dry run)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "schedule.cli",
+      "args": [
+        "@configs/all-providers.args",
+        "--ticker", "${input:scheduleTicker}",
+        "--start-date", "${input:scheduleStartDate}",
+        "--end-date", "${input:scheduleEndDate}",
+        "--dry-run"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Schedule (debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "schedule.cli",
+      "args": [
+        "@configs/all-providers.args",
+        "--ticker", "${input:scheduleTicker}",
+        "--start-date", "${input:scheduleStartDate}",
+        "--end-date", "${input:scheduleEndDate}",
+        "--debug"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Dispatch",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "dispatch.cli",
+      "args": [],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Dispatch (debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "dispatch.cli",
+      "args": ["--debug"],
       "console": "integratedTerminal",
       "justMyCode": true
     },
@@ -62,6 +126,24 @@
     },
     {
       "id": "ingestEndDate",
+      "type": "promptString",
+      "description": "Date for --end-date, YYYY-MM-DD",
+      "default": "2026-08-14"
+    },
+    {
+      "id": "scheduleTicker",
+      "type": "promptString",
+      "description": "Ticker for --ticker (quant-schedule always requires --ticker, unlike quant-ingest -- there's no settings.tickers fallback)",
+      "default": "SPY"
+    },
+    {
+      "id": "scheduleStartDate",
+      "type": "promptString",
+      "description": "Date for --start-date, YYYY-MM-DD",
+      "default": "2026-08-14"
+    },
+    {
+      "id": "scheduleEndDate",
       "type": "promptString",
       "description": "Date for --end-date, YYYY-MM-DD",
       "default": "2026-08-14"

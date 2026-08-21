@@ -228,9 +228,11 @@ independent top-level packages.
   earlier layouts this was carried over from.
 - `settings.py` additionally defines `PostgresSettings` (`host`, `port`, `user`, `password`,
   `dbname`, plus optional `ssh_user`/`ssh_key_path` — parsed from `sshUser`/`sshKeyPath`, must be
-  set together or both omitted; plus optional `archive_dbname`, parsed from `archiveDbname`,
-  croicu/quant-data#52 — the separate `quant_ingest` database, same server/role as `dbname`,
-  `None` disables archiving entirely) and a `Settings.postgres` field, parsed from a `postgres` object
+  set together or both omitted; plus optional `archive_dbname`, parsed from the nested
+  `archiver.dbname`, croicu/quant-data#52 — the separate `quant_ingest` database, same server/role
+  as `dbname` (`archiver` carries no `user`/`password` of its own, unlike `worker`/`scheduler`
+  below — it deliberately reuses `PostgresSettings.user`/`.password`), `None` disables archiving
+  entirely) and a `Settings.postgres` field, parsed from a `postgres` object
   under `settings.json`/`settings.local.json`'s `settings` key. `ssh_user`/`ssh_key_path` select an
   `SshTunnelTransport` (see below) instead of the default `DirectTransport` — omitting them
   reproduces the exact behavior from before `ConnectionTransport` existed, so this is additive, not
@@ -505,7 +507,7 @@ patching `ingest`'s own internals.
   a warning) rather than aborting it; if every configured provider fails to connect, that *does*
   abort the run (`AppError`, no data source left to use).
 - One `quant_ingest` connection is opened for the whole run and reused across every (ticker, date)
-  pair. `_default_archive_writer_factory` raises `AppError` if `settings.postgres.archiveDbname`
+  pair. `_default_archive_writer_factory` raises `AppError` if `settings.postgres.archiver.dbname`
   isn't configured — unlike before the split, there's no staging write to gracefully fall back to,
   so an unconfigured archive database means `quant-ingest` has nothing to do at all.
 - Fetch and archive are attempted independently **per provider, per (ticker, date) pair** — one
@@ -1032,20 +1034,71 @@ importable surface, same public/private-split reasoning as `ingest`/`stage`.
   `ScheduleDatabase` (`quant_data._internal.shared.schedule`) owns `JobRow` and the three methods
   (`fetch_due_jobs`, `mark_job_running`, `record_job_result`) with its own connection — same
   separate-class reasoning as `ProviderSourceArchiveWriter`/`Reader` for `quant_ingest`. Its own
-  two-role split, distinct from `quant_writer`/`quant_reader`: `quant_scheduler` (read/insert/
-  update, for hand-managing job definitions via `psql` — no code here ever authenticates as it) and
-  `quant_worker` (read/update only — what `ScheduleDatabase`/`quant-dispatch` itself connects as; it
-  never inserts a row). New `PostgresSettings.schedule: ScheduleSettings | None` (`dbname`/`user`/
-  `password`, parsed from `settings.postgres.schedule` — see `docs/DATABASE.md`) is required for
+  role split, distinct from `quant_writer`/`quant_reader`: `quant_scheduler` (full CRUD on
+  `jobs`/`job_dependencies` — what `WorkItemScheduleWriter`/`quant-schedule` connects as,
+  croicu/quant-data#68; see the `schedule` module below) and `quant_worker` (read/update on `jobs`,
+  read-only on `job_dependencies` since `fetch_due_jobs`'s dependency-gating query joins against
+  it — what `ScheduleDatabase`/`quant-dispatch` itself connects as; it never inserts a row). New
+  `PostgresSettings.worker: ScheduleSettings | None` (`dbname`/`user`/
+  `password`, parsed from `settings.postgres.worker` — see `docs/DATABASE.md`) is required for
   `quant-dispatch` to run at all (`_default_database_factory` raises a clear `AppError` if
   unconfigured) — unlike `archive_dbname`, there's no degraded-but-working mode, since `jobs` is
   `quant-dispatch`'s entire reason to exist.
-- No date-range/ticker flags, no scheduling logic beyond "is this job due" — deliberately no
-  `depends_on`/DAG modeling either; job *ordering* (e.g. `ingest` before `stage` before
-  `reconcile`) is left to each job's own `interval_seconds`/`next_run_at` offset (e.g. `ingest`
-  hourly at `:00`, `stage` hourly at `:15`, `reconcile` hourly at `:30`), not tracked by this code
-  at all — see croicu/quant-data#66 for the accepted-risk reasoning (mitigated by `ingest`/`stage`
-  both already being idempotent/safe to re-run).
+- No date-range/ticker flags, no scheduling logic beyond "is this job due, and are its
+  dependencies (if any) satisfied." #66's original design deliberately left job *ordering* (e.g.
+  `ingest` before `stage` before `reconcile`) to each job's own `interval_seconds`/`next_run_at`
+  offset rather than a `depends_on`/DAG mechanism — accepted-risk reasoning, mitigated by
+  `ingest`/`stage` both being idempotent/safe to re-run. croicu/quant-data#68 (the `schedule`
+  module below) revisits that specifically for one-shot backfill jobs, which don't get the
+  self-healing retries that made offset timing acceptable for recurring jobs: `jobs` gained
+  `run_once` (a job that succeeds once is disabled instead of rescheduled — `record_job_result`'s
+  new `disable` parameter, set by `dispatch/cli.py`'s `_run_job` exactly when `job.run_once` and
+  the run succeeded) and a `job_dependencies` table (`job_id`, `depends_on_job_id`, both
+  `ON DELETE CASCADE`). `fetch_due_jobs`'s query grew a `NOT EXISTS` clause excluding any job with
+  an unsatisfied dependency (a dependency counts as satisfied once `last_exit_code = 0`) — a
+  gated job is simply omitted that cycle, with no separate bookkeeping: its own `next_run_at`
+  doesn't move, so it's re-considered every later invocation until every dependency succeeds.
+
+### `schedule`
+
+`cli.py` — `quant-schedule --ticker TICKER --start-date YYYY-MM-DD [--end-date YYYY-MM-DD]
+[--providers ...] [--ibkr-methods ...] [--retry-interval-seconds N] [--dry-run] [--debug]`
+(croicu/quant-data#68): decomposes a bulk backfill request into a job graph and writes it into
+`quant_schedule.jobs`/`job_dependencies` for `quant-dispatch` to actually execute — it never runs
+anything itself. Console-script-only, no importable surface, same convention as `ingest`/`stage`/
+`dispatch` (named as a verb, like every other CLI in this repo, even though `WorkItemScheduleWriter`/
+`NewJob` keep "work item" as the domain term — `ScheduleDatabase` already owns the unqualified
+"schedule" name for `quant-dispatch`'s own connection). The DB role it connects as, `quant_scheduler`,
+repurposes a name this repo's docs had previously reserved for a human/`psql`-only role that was
+never actually created on any real box — see the role-split note above.
+
+- `algorithm.py`'s pure `build_job_plan(ticker, start_date, end_date, providers, ibkr_methods, now,
+  retry_interval_seconds) -> list[NewJob]`: one ingest job per (trading day, provider) — or per
+  (day, method) for `ibkr` specifically, since it's the only provider with more than one method —
+  followed by one staging job depending on every ingest job, followed by one reconcile job
+  depending only on the staging job (`quant-reconcile` itself takes no ticker/date arguments at
+  all, so a work item's reconcile job is always the bare `["quant-reconcile"]` command; the
+  staging job's own success already implies every ingest job succeeded, so reconcile doesn't
+  redundantly depend on them directly). Every job is `run_once=True`. Trading days skip weekends
+  (a local `_is_weekend`, the same plain `weekday() >= 5` check already duplicated in
+  `ingest/cli.py` and `stage/cli.py`).
+- `WorkItemScheduleWriter` (`quant_data._internal.shared.schedule_writer`) — a separate class from
+  `ScheduleDatabase`, same reasoning as `ProviderSourceArchiveWriter`/`Reader`: `ScheduleDatabase`'s
+  own docstring records that it connects as `quant_worker` and never inserts a row, so job creation
+  needed a different class connecting as a different role, `quant_scheduler` (full CRUD — `SELECT`,
+  `INSERT`, `UPDATE`, `DELETE` — on `jobs`/`job_dependencies`; see `docs/DATABASE.md`). Its
+  `create_jobs(jobs: list[NewJob]) -> dict[str, int]` inserts a whole work item's job graph in one
+  transaction — either the entire graph is created or none of it is — resolving each job's
+  `depends_on_names` against job IDs created earlier in the same call (callers must list a job
+  after everything it depends on; `build_job_plan` already returns them in that order). A `name`
+  collision (re-submitting the same work item) surfaces as a clear `AppError` rather than a raw
+  `psycopg` error.
+- New `PostgresSettings.scheduler: ScheduleSettings | None` (same dataclass shape as `.schedule`,
+  different role's credentials) is required for `quant-schedule` to run, same treatment as
+  `.schedule` for `quant-dispatch`.
+- `--dry-run` prints the planned jobs (name, command, `run_once`, `depends_on`) without touching
+  the database — the safety valve for reviewing a plan before committing it to a real,
+  branch-protected-adjacent write path.
 
 ### `quant_data.client`
 

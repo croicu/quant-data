@@ -179,7 +179,7 @@ def _provider_never_has_weekend_data(provider_name: str) -> bool:
 
 def _default_archive_writer_factory(postgres_settings: PostgresSettings) -> ProviderSourceArchiveWriter:
     if postgres_settings.archive_dbname is None:
-        raise AppError("settings.postgres.archiveDbname is required to run quant-ingest -- there is nowhere to archive fetches to without it.")
+        raise AppError("settings.postgres.archiver.dbname is required to run quant-ingest -- there is nowhere to archive fetches to without it.")
     transport = resolve_transport(
         host=postgres_settings.host,
         port=postgres_settings.port,

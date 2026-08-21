@@ -228,38 +228,83 @@ def test_load_postgres_settings_defaults_archive_dbname_to_none(tmp_path):
 
 
 def test_load_postgres_settings_parses_archive_dbname_when_given(tmp_path):
-    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload(archiveDbname="quant_ingest")})
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload(archiver={"dbname": "quant_ingest"})})
 
     settings = Settings.load(path=settings_path)
 
     assert settings.postgres.archive_dbname == "quant_ingest"
 
 
-def test_load_postgres_settings_defaults_schedule_to_none(tmp_path):
+def test_load_postgres_settings_raises_when_archiver_missing_dbname(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload(archiver={})})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_postgres_settings_raises_when_archiver_not_an_object(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload(archiver="quant_ingest")})
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_postgres_settings_defaults_worker_to_none(tmp_path):
     settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload()})
 
     settings = Settings.load(path=settings_path)
 
-    assert settings.postgres.schedule is None
+    assert settings.postgres.worker is None
 
 
-def test_load_postgres_settings_parses_schedule_when_given(tmp_path):
+def test_load_postgres_settings_parses_worker_when_given(tmp_path):
     settings_path = _write_settings(
         tmp_path / "settings.json",
-        {"postgres": _postgres_payload(schedule={"dbname": "quant_schedule", "user": "quant_worker", "password": "x"})},
+        {"postgres": _postgres_payload(worker={"dbname": "quant_schedule", "user": "quant_worker", "password": "x"})},
     )
 
     settings = Settings.load(path=settings_path)
 
-    assert settings.postgres.schedule.dbname == "quant_schedule"
-    assert settings.postgres.schedule.user == "quant_worker"
-    assert settings.postgres.schedule.password == "x"
+    assert settings.postgres.worker.dbname == "quant_schedule"
+    assert settings.postgres.worker.user == "quant_worker"
+    assert settings.postgres.worker.password == "x"
 
 
-def test_load_postgres_settings_raises_when_schedule_missing_a_required_key(tmp_path):
+def test_load_postgres_settings_raises_when_worker_missing_a_required_key(tmp_path):
     settings_path = _write_settings(
         tmp_path / "settings.json",
-        {"postgres": _postgres_payload(schedule={"dbname": "quant_schedule", "user": "quant_worker"})},
+        {"postgres": _postgres_payload(worker={"dbname": "quant_schedule", "user": "quant_worker"})},
+    )
+
+    with pytest.raises(TaskError):
+        Settings.load(path=settings_path)
+
+
+def test_load_postgres_settings_defaults_scheduler_to_none(tmp_path):
+    settings_path = _write_settings(tmp_path / "settings.json", {"postgres": _postgres_payload()})
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.postgres.scheduler is None
+
+
+def test_load_postgres_settings_parses_scheduler_when_given(tmp_path):
+    settings_path = _write_settings(
+        tmp_path / "settings.json",
+        {"postgres": _postgres_payload(scheduler={"dbname": "quant_schedule", "user": "quant_scheduler", "password": "x"})},
+    )
+
+    settings = Settings.load(path=settings_path)
+
+    assert settings.postgres.scheduler.dbname == "quant_schedule"
+    assert settings.postgres.scheduler.user == "quant_scheduler"
+    assert settings.postgres.scheduler.password == "x"
+
+
+def test_load_postgres_settings_raises_when_scheduler_missing_a_required_key(tmp_path):
+    settings_path = _write_settings(
+        tmp_path / "settings.json",
+        {"postgres": _postgres_payload(scheduler={"dbname": "quant_schedule", "user": "quant_scheduler"})},
     )
 
     with pytest.raises(TaskError):
