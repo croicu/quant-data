@@ -267,8 +267,10 @@ rather than picking a provider on the caller's behalf.
   the jobs up as they become due. `--ticker`/`--start-date` are required (unlike `quant-ingest`,
   there's no "every ticker in `settings.tickers`" mode — a work item is always one ticker).
   `--end-date` defaults to `--start-date`.
-- One ingest job per (trading day, provider), skipping weekends — or per (day, method) for `ibkr`
-  specifically, since it's the only provider with more than one method — followed by one staging
+- One ingest job per (calendar day, provider), weekends included (`quant-ingest` handles a weekend
+  date correctly on its own, marking it covered without data instead of wasting an API call) — or
+  per (day, method) for `ibkr` specifically, since it's the only provider with more than one
+  method — followed by one staging
   job depending on every ingest job, followed by one reconcile job depending only on the staging
   job (`quant-reconcile` itself takes no ticker/date arguments, so this is always the bare
   `quant-reconcile` command). Every created job is `run_once=True`: it's disabled once it succeeds,
