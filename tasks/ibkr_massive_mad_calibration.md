@@ -1,7 +1,8 @@
 # Task: IBKR/Massive MAD Calibration Experiment
 
 **Status:** E0 done (gate passed); E1 done (lag 0, no correction needed); E2 done (absent, as
-expected for SPY); E3-E8 not started
+expected for SPY); E3 done (data supports MAD switch, but raw MAD is degenerate — needs a
+materiality floor); E4-E8 not started
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -267,6 +268,35 @@ after this point assumes the ratio is materially above 1.
 follow-up needs either a retained window or a streaming quantile approximation.
 Record the window size implied by the winning configuration — it is a real
 operational cost and belongs in the recommendation.
+
+**Status: done — data SUPPORTS the MAD switch, with a real caveat.** Run:
+`.exp/dispersion/sigma_vs_mad.py`. Ticker: SPY, pooled `ohlc` field group (all four fields
+together, reusing `reconcile.algorithm.fields_for_group` per the task's own method — one row per
+field is also written as a diagnostic breakdown, not the requested grouping). σ collapses by
+**-92.67%** when just the top 0.1% of `|d|` is trimmed (532,584 pooled observations →
+532,051) — Welford's own σ is dominated by a small contaminating tail, exactly the argument this
+task exists to quantify. Per-field σ-collapse ranges from -63.8% (`close`, most stable) to -95.8%
+(`low`, least stable) — consistent with E1's finding that RTH/low-field disagreement runs highest.
+
+**Real wrinkle not anticipated by the task's method: raw MAD is exactly 0.0**, both pooled and
+per-field, before *and* after trimming. Not a bug — E1 already established match rates well above
+50% on every field, so both the pooled sample's median and its MAD collapse to an exact zero. This
+makes the `σ / (1.4826 × MAD)` ratio **mathematically undefined** (division by zero) rather than
+merely "close to 1" or "far above 1" — a more extreme outcome than the task's gate anticipated,
+and the σ-collapse-under-trimming evidence had to substitute for the ratio as the operative signal
+for this gate. **Consequence for any production follow-up**: a raw `1.4826 × MAD` tolerance would
+be exactly `0`, rejecting *any* nonzero disagreement — unusable without pairing it with a nonzero
+floor. `materiality_floor` already exists in production for exactly this shape of problem
+(croicu/quant-data#40), so this isn't a new mechanism to build, but it must be explicitly part of
+the production-tolerance follow-up task, not assumed away.
+
+**State cost**: 532,584 pooled observations over the 7-month range (`2025-12-31`–`2026-07-31`) is
+the implied retained-window size if MAD-based tolerance is adopted as specified here — a real
+operational cost (no O(1) streaming update, unlike Welford), flagged for the recommendation
+per this section's own note, not resolved here.
+
+Output: `results/ibkr_massive_mad/dispersion/sigma_vs_mad.parquet` (pooled `ALL` row plus one row
+per field, both raw and trimmed estimators).
 
 ---
 
