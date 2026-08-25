@@ -317,6 +317,60 @@ ranges.
 **Output:** `e4_budget.parquet` — a (k, g) → (flags, ranges, billed_minutes) table.
 This is the exchange rate that turns k into a budget.
 
+**Dispersion-basis deviation, confirmed with the repo owner before implementation**: E3 found raw
+pooled/per-field MAD is exactly 0.0 (more than half of all bars match exactly on every field), so
+a literal `k × 1.4826×MAD` band would flag every non-exact-match bar regardless of `k` — the
+k-sweep would do nothing. **Fixed by using "conditional MAD" instead**: median(`|d|`) computed only
+among bars where `d ≠ 0` for that field (excludes the exact-match point mass), scaled by 1.4826 as
+usual. A bar is flagged if **any** of open/high/low/close exceeds `k × conditional_MAD` for that
+field — mirrors `reconcile.algorithm._agrees_within_tolerance`'s own per-field-independent
+structure. **Every later experiment that references "the band" (E5, E6, E8) must use this same
+conditional-MAD basis, not the raw pooled MAD from E3** — carry this forward, don't silently
+re-derive a different definition.
+
+**Status: done.** Run: `.exp/budget/k_sweep.py`. Ticker: SPY, 133,146 lag-0-joined bars.
+Conditional MAD (scaled, fractional) per field: open 7.84e-6, high 5.14e-6, low 4.99e-6, close
+7.89e-6 — notably `open`/`close` have *larger* conditional MAD than `high`/`low` here (the
+opposite of what "yfinance noise concentrates in high/low" trained everyone to expect from the
+existing production tolerance work) — worth a second look before assuming that prior applies to
+the `ibkr`/`massive` pair too.
+
+Flag rate drops smoothly from 15.9% at k=1 to 0.074% at k=20. **At production's own default
+(`DEFAULT_RECONCILE_K = 3.0`)**: 1,473 flagged bars (1.106%), clustering into 1,063 ranges
+(g=5)/890 (g=15)/528 (g=60), billing 1,723/3,310/14,968 minutes respectively — the g=60 case
+costs roughly 8.7x the g=5 case in billed minutes for the same flag set, purely from how
+aggressively nearby flags get merged into one paid pull. Full (k, g) → (flags, ranges,
+billed_minutes) exchange-rate table in `results/ibkr_massive_mad/budget/k_g_budget.parquet`.
+**Recommended k not yet chosen here** — E4 only produces the exchange rate; E6 picks k from the
+intersection of this spend curve and E6's own quality proxy, per that section's gate.
+
+**Dollar cost, added same session (repo owner supplied Databento's rate)**: schema is **OHLCV-1m**
+(repo owner's call), record size confirmed live against `databento/dbn`'s Rust source
+(`record.rs`) — `RecordHeader` (16 bytes) + `OhlcvMsg`'s open/high/low/close/volume (five 8-byte
+fields) = **56 bytes/record**, one record per symbol-minute. At the repo owner's stated
+**$35.00/GB**, the entire explored (k, g) grid costs **$0.0002 – $0.24 *per ticker*** for SPY over
+the 7-month range — at k=3/g=5 (production's default), **$0.0034/ticker**. **This is the actual
+headline finding**: for the OHLCV-1m schema specifically, this section's own "why" ("k is no
+longer only a false-positive dial; it sets paid spend") turns out to be true in principle but
+practically negligible in dollars — Databento spend is not a meaningful constraint on choosing `k`
+for this schema. `k`/`g` should be chosen on quality grounds (E6) essentially unconstrained by
+budget, *unless* a richer schema (trades/quotes, for a more authoritative oracle read than another
+OHLCV-1m bar) is used instead later — that would change this conclusion by orders of magnitude and
+hasn't been evaluated. `config.py` gained `DATABENTO_OHLCV_1M_BYTES_PER_RECORD=56`,
+`DATABENTO_PRICE_PER_GB=35.00`; `k_g_budget.parquet` gained a `cost_usd` column.
+
+**Per-ticker caveat, flagged when the repo owner pointed out the multi-ticker case**: the figures
+above are for SPY alone — real total spend multiplies by however many tickers actually get
+flagged through this. Live `dim_ticker` check (2026-08-25): the current universe is just **DIA,
+QQQ, SPY** (3 tickers) — the DOG/PSQ/SH/IWM set referenced in older session notes no longer exists
+after a later clean-slate DB reset. Naively scaling SPY's rate by 3 tickers gives roughly
+**$0.0006 – $0.73 total**, still trivial — but that assumes every ticker disagrees at SPY's rate,
+which is **unverified**: DIA/QQQ don't have a frozen unpurged staging window the way SPY does (see
+the Preliminary section), so their own conditional-MAD/flag-rate has never actually been measured.
+Repo owner's explicit call: note this caveat rather than build DIA/QQQ's own frozen datasets to
+measure it for real — the conclusion ("Databento isn't budget-constrained for OHLCV-1m") is robust
+to it either way given how cheap even the worst explored case is.
+
 ---
 
 ## E5 — Stationarity (highest-value experiment)
