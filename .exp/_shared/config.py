@@ -48,3 +48,8 @@ PRE_POST_GRID_END_HOUR_ET: int = 20
 # actually samples, but the seed is pinned here so the first one that does doesn't have to
 # introduce a new config surface for it.
 RANDOM_SEED: int = 20260825
+
+# E1 (alignment): lag applied to massive's timestamp when pairing against ibkr(t), in minutes.
+# ibkr(t) is compared against massive(t + lag) for each lag in this grid -- see
+# tasks/ibkr_massive_mad_calibration.md's E1 section for why +/-1 bracket 0.
+ALIGNMENT_LAGS_MINUTES: list[int] = [-1, 0, 1]
