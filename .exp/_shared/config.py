@@ -74,3 +74,25 @@ DISPERSION_TRIM_TOP_PCT: float = 0.1
 # Both must hold to read as "recommend against MAD" per the task's gate wording.
 DISPERSION_RATIO_NEAR_ONE_MAX: float = 1.15
 DISPERSION_SIGMA_STABLE_PCT: float = 10.0
+
+# E4 (k -> Databento spend): k multiplies each field's *conditional* MAD -- median(|d|) computed
+# only among bars where d != 0, scaled by 1.4826, then MAD taken relative to that nonzero
+# subsample's own median -- not the raw pooled MAD from E3, which was exactly 0.0 (repo owner's
+# explicit call, given E1/E3 both showed match rates well above 50% on every field: a plain MAD
+# over the full population -- including the exact-match point mass -- can't ever produce a
+# meaningful k sweep). Centered around reconcile's own production default,
+# quant_data._internal.shared.settings.DEFAULT_RECONCILE_K = 3.0.
+E4_K_GRID: list[float] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
+
+# Gap-merge parameter for clustering flagged minutes into contiguous Databento-billable ranges, in
+# minutes -- task's own suggested grid.
+E4_G_GRID_MINUTES: list[int] = [5, 15, 60]
+
+# E4, continued: turning billed_minutes into dollars. Schema is OHLCV-1m (repo owner's call --
+# same aggregate-bar shape already used throughout this task, not raw trades/quotes). Record size
+# confirmed live against databento/dbn's Rust source (record.rs, 2026-08-25): RecordHeader (16
+# bytes: length/rtype/publisher_id/instrument_id/ts_event) + OhlcvMsg's open/high/low/close/volume
+# (five 8-byte fields) = 56 bytes/record, one record per symbol-minute. Price is the repo owner's
+# own stated rate; decimal GB (1e9 bytes), Databento's own convention.
+DATABENTO_OHLCV_1M_BYTES_PER_RECORD: int = 56
+DATABENTO_PRICE_PER_GB: float = 35.00
