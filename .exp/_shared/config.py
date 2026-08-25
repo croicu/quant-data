@@ -74,3 +74,15 @@ DISPERSION_TRIM_TOP_PCT: float = 0.1
 # Both must hold to read as "recommend against MAD" per the task's gate wording.
 DISPERSION_RATIO_NEAR_ONE_MAX: float = 1.15
 DISPERSION_SIGMA_STABLE_PCT: float = 10.0
+
+# E5 (stationarity): fixed k applied to the band calibrated on the most recent month, per that
+# section's method. Production's own default (quant_data._internal.shared.settings.
+# DEFAULT_RECONCILE_K) -- E3/E4 already anchored their own reporting to this value, so it's the
+# natural fixed point here too rather than a new choice. E6 may later pick a different recommended
+# k; if it does, this fixed value should be revisited and E5 rerun with it.
+E5_K_FIXED: float = 3.0
+
+# A month with fewer than this many lag-0-joined bars is flagged as low-sample in E5's output
+# (e.g. a partial calendar month at the range's edge) rather than silently plotted on equal
+# footing with a full month.
+E5_MIN_BARS_FOR_FULL_CONFIDENCE: int = 5000
