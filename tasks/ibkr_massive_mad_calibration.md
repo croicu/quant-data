@@ -1,6 +1,6 @@
 # Task: IBKR/Massive MAD Calibration Experiment
 
-**Status:** E0 done (gate passed); E1-E8 not started
+**Status:** E0 done (gate passed); E1 done (lag 0, no correction needed); E2-E8 not started
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -178,6 +178,28 @@ gentle optimum. Run separately:
 correction becomes part of `load.py` and **all later experiments rerun on the
 corrected join**. If no lag shows a clear spike, escalate — that pattern suggests
 a deeper mismatch than an offset.
+
+**Status: done, no correction needed.** Run: `.exp/alignment/match_rate.py`. Ticker: SPY, same
+range as E0. Lag 0 wins with a clear step-function spike (75-89 point margin over the runner-up)
+in **every** (segment, DST regime) combination — no alignment correction needed in `load.py`.
+**Notable finding to carry forward**: even at the correct lag, the exact-match rate on `high`/`low`
+tops out well under 100% — RTH lowest (81.6% EST / 87.5% EDT), pre-market highest (93.3% EDT /
+97.1% EST), post-market in between (~87.6-87.8%). This isn't an alignment artifact (the spike is
+unambiguous) — it's genuine baseline `ibkr`/`massive` disagreement even when bars are correctly
+paired, and RTH being the *lowest*-agreement segment (not highest, despite being the most liquid)
+is worth carrying into E3/E6 rather than assuming pre/post is where the real noise concentrates.
+
+**Ad-hoc addendum, same run**: tested (and rejected) the hypothesis that `ibkr` volume explains
+this — a natural first guess given `materiality_floor`'s own established `ibkr`-volume-vs-
+disagreement correlation on the unrelated `ibkr`/`yfinance` pair (issue #40, R²=0.32). Pooling all
+segments together, matched bars do show much lower median volume than mismatched bars (~9,600 vs
+~39,000) — but that's a **segment confound**, not a real effect: restricted to RTH alone, matched
+and mismatched median volume are essentially identical (~86,730 vs ~84,932), and a log-log
+regression of volume against disagreement magnitude among mismatched RTH bars gives **R² ≈
+0.001–0.003** — no relationship. RTH simply has both higher volume *and* higher disagreement than
+pre/post as two separate facts, not one driving the other. The RTH-vs-pre/post agreement gap
+remains unexplained by volume; if revisited, trade count/tick density is a more promising next
+angle than raw volume. Output: `results/ibkr_massive_mad/alignment/volume_correlation.parquet`.
 
 ---
 
