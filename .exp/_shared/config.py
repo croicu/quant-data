@@ -53,3 +53,14 @@ RANDOM_SEED: int = 20260825
 # ibkr(t) is compared against massive(t + lag) for each lag in this grid -- see
 # tasks/ibkr_massive_mad_calibration.md's E1 section for why +/-1 bracket 0.
 ALIGNMENT_LAGS_MINUTES: list[int] = [-1, 0, 1]
+
+# E2 (adjustment mismatch): a day's median ibkr.close/massive.close ratio counts as "deviating"
+# once it's off 1.0 by at least this many percentage points -- small enough to catch a real split
+# or dividend-adjustment step, large enough to not be tripped by ordinary tick noise (E1 already
+# showed high/low can differ by a fraction of a percent even at the correct lag).
+ADJUSTMENT_MATERIALITY_PCT: float = 0.5
+
+# A deviating day's ratio counts as "near" one of these multiples (common split ratios and their
+# reverse-split reciprocals) when within ADJUSTMENT_JUMP_TOLERANCE_PCT of it, relatively.
+ADJUSTMENT_RATIONAL_MULTIPLES: list[float] = [0.2, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0]
+ADJUSTMENT_JUMP_TOLERANCE_PCT: float = 2.0
