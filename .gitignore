@@ -34,3 +34,9 @@ backups/
 
 # Artifacts that go to the secondary (non-GitHub) git remote only.
 /local/
+
+# .exp/ (tasks/ibkr_massive_mad_calibration.md) output -- specific to the current data pipeline
+# state on this box, not a stable artifact worth version-controlling. The task file's own
+# conclusions/findings get updated by hand instead; results/ is regenerable by rerunning the
+# relevant .exp/ script.
+/results/
