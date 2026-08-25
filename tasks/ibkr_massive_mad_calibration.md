@@ -2,8 +2,9 @@
 
 **Status:** E0 done (gate passed); E1 done (lag 0, no correction needed); E2 done (absent, as
 expected for SPY); E3 done (data supports MAD switch, but raw MAD is degenerate — needs a
-materiality floor); E4 done (k→spend exchange rate built on "conditional MAD", repo owner's
-explicit call — see E4's own status note); E5-E8 not started
+materiality floor); E4 done, submitted (PR #77, not yet merged — k→spend exchange rate built on
+"conditional MAD"); E5 done (not rising going back — good result; one unexplained March outlier);
+E6-E8 not started
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -391,6 +392,31 @@ month marked.
   backfill scope and must surface in the recommendation.
 - Cross-reference any inflection against E2's step dates before concluding it's a
   reconstruction difference rather than an unhandled corporate action.
+
+**Status: done — NOT rising going back (good result), but not perfectly flat either.** Run:
+`.exp/stationarity/monthly_flag_rate.py`. Ticker: SPY. Band calibrated on the most recent month
+(**2026-07**) using the same conditional-MAD basis as E4, `k` fixed at **3.0** (production's
+default — E3/E4's own reference point; revisit if E6 recommends a different `k`), then applied
+unchanged to each earlier month. December 2025 (the frozen range's first day, `2025-12-31`)
+produces zero lag-0-joined bars at all — `massive` doesn't start until `2026-01-02` (E0's own
+finding) — so it can't appear in this table; the earliest month measured is `2026-01`.
+
+Flag rate across the 7 full months (`2026-01`–`2026-07`, all ≥17.5k bars, no low-sample months):
+0.685% (Jan) → 1.144% (Feb) → **1.917% (Mar, the outlier)** → 0.988% (Apr) → 0.847% (May) → 1.329%
+(Jun) → 0.997% (Jul, calibration month). **The earliest month (Jan) is the lowest rate, not the
+highest** — no systematic temporal-drift pattern, which is the actual question this gate cares
+about: there's no evidence the band degrades further back in history over this range. March is a
+genuine ~2x outlier that doesn't fit a trend story; cross-referenced against E2 (zero step/split
+dates for SPY) — **not explained by an adjustment mismatch**, so it's an open question (real
+March-specific volatility or event? a `massive`-side data quality blip that month?) rather than a
+stationarity failure. Plot: `results/ibkr_massive_mad/stationarity/spy_flag_rate_by_month.png`.
+Output: `results/ibkr_massive_mad/stationarity/monthly_flag_rate.parquet`. `config.py` gained
+`E5_K_FIXED=3.0`, `E5_MIN_BARS_FOR_FULL_CONFIDENCE=5000`.
+
+**Caveat carried from E4's own per-ticker note**: only SPY has been measured here (the only ticker
+with a frozen unpurged window) — this stationarity read doesn't necessarily generalize to DIA/QQQ
+or the other tickers now seeded in `dim_ticker` (SH/PSQ/DOG/IWM/RWM), none of which have been
+run through E0–E5 yet.
 
 ---
 

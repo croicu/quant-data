@@ -269,7 +269,11 @@ def _ingest_one(
         category=CATEGORY_INGEST,
     )
 
-    any_provider_succeeded = False
+    # True once at least one provider/method combination for this (ticker, date) is handled in a
+    # way that needs no retry -- either real data was archived, or it was correctly marked covered
+    # without data (a weekend). Both are terminal outcomes; only an actual fetch/archive failure
+    # should make this (ticker, date) count as failed and get retried.
+    any_provider_handled = False
     archived_count = 0
 
     for provider_name, provider in providers.items():
@@ -302,6 +306,7 @@ def _ingest_one(
                     f"is a weekend -- marked covered without data instead of fetching.",
                     category=CATEGORY_INGEST,
                 )
+                any_provider_handled = True
                 continue
 
             rate_limiter = rate_limiters.get(provider_name)
@@ -338,10 +343,10 @@ def _ingest_one(
                 )
                 continue
 
-            any_provider_succeeded = True
+            any_provider_handled = True
             archived_count += 1
 
-    if not any_provider_succeeded:
+    if not any_provider_handled:
         return None
 
     Logger.info(

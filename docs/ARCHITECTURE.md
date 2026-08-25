@@ -1073,15 +1073,20 @@ repurposes a name this repo's docs had previously reserved for a human/`psql`-on
 never actually created on any real box — see the role-split note above.
 
 - `algorithm.py`'s pure `build_job_plan(ticker, start_date, end_date, providers, ibkr_methods, now,
-  retry_interval_seconds) -> list[NewJob]`: one ingest job per (trading day, provider) — or per
+  retry_interval_seconds) -> list[NewJob]`: one ingest job per (calendar day, provider) — or per
   (day, method) for `ibkr` specifically, since it's the only provider with more than one method —
   followed by one staging job depending on every ingest job, followed by one reconcile job
   depending only on the staging job (`quant-reconcile` itself takes no ticker/date arguments at
   all, so a work item's reconcile job is always the bare `["quant-reconcile"]` command; the
   staging job's own success already implies every ingest job succeeded, so reconcile doesn't
-  redundantly depend on them directly). Every job is `run_once=True`. Trading days skip weekends
-  (a local `_is_weekend`, the same plain `weekday() >= 5` check already duplicated in
-  `ingest/cli.py` and `stage/cli.py`).
+  redundantly depend on them directly). Every job is `run_once=True`. **Every calendar day gets an
+  ingest job, weekends included** — `quant-ingest` already handles a weekend date correctly on its
+  own (checks the calendar before fetching, marks it covered without data for yfinance/massive
+  instead of wasting an API call, per #56's follow-up fix). An earlier version filtered weekends
+  out of the plan entirely, which meant `quant-ingest` was never invoked for those dates at all, so
+  its own weekend handling never ran — `archive_coverage` ended up with a real gap (disjoint ranges
+  instead of one continuous one) rather than a weekend marked covered-without-data. Confirmed live
+  against a real QQQ backfill and fixed in the same session #68 shipped.
 - `WorkItemScheduleWriter` (`quant_data._internal.shared.schedule_writer`) — a separate class from
   `ScheduleDatabase`, same reasoning as `ProviderSourceArchiveWriter`/`Reader`: `ScheduleDatabase`'s
   own docstring records that it connects as `quant_worker` and never inserts a row, so job creation

@@ -7,8 +7,11 @@ from schedule.algorithm import build_job_plan
 _NOW = datetime(2026, 8, 20, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def test_build_job_plan_skips_weekends():
-    # 2026-08-08 is a Saturday, 2026-08-09 a Sunday.
+def test_build_job_plan_includes_weekends():
+    # 2026-08-08 is a Saturday, 2026-08-09 a Sunday -- included on purpose (croicu/quant-data#68
+    # follow-up): quant-ingest already handles a weekend date correctly on its own (marks it
+    # covered without data rather than wasting an API call), and skipping it here entirely used to
+    # leave a real gap in archive_coverage instead of a continuous range.
     plan = build_job_plan(
         ticker="QQQ",
         start_date=date(2026, 8, 7),
@@ -22,6 +25,8 @@ def test_build_job_plan_skips_weekends():
     ingest_names = [job.name for job in plan if "ingest" in job.name]
     assert ingest_names == [
         "workitem-QQQ-ingest-2026-08-07-yfinance",
+        "workitem-QQQ-ingest-2026-08-08-yfinance",
+        "workitem-QQQ-ingest-2026-08-09-yfinance",
         "workitem-QQQ-ingest-2026-08-10-yfinance",
     ]
 
