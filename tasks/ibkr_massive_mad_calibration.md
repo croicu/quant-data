@@ -1,6 +1,7 @@
 # Task: IBKR/Massive MAD Calibration Experiment
 
-**Status:** E0 done (gate passed); E1 done (lag 0, no correction needed); E2-E8 not started
+**Status:** E0 done (gate passed); E1 done (lag 0, no correction needed); E2 done (absent, as
+expected for SPY); E3-E8 not started
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -227,6 +228,17 @@ step dates.
 3. **Present at unidentifiable dates** — vendor archive reconstruction difference.
    This is the bad case: it caps how far back the band can be trusted and feeds
    directly into E5. Do not paper over it.
+
+**Status: done — ABSENT, as expected for SPY.** Run: `.exp/adjustment/close_ratio.py`. Ticker:
+SPY, same range as E0/E1 (145 trading days). Daily median `ibkr.close/massive.close` ratio is
+**exactly 1.0 on every single day** — zero deviating days at the 0.5% materiality threshold, no
+jumps, no persistent offset. Confirms the repo owner's expectation going in: SPY is an ETF with no
+splits/adjustment mismatches expected over a 7-month window, and this only became worth an actual
+check (rather than assuming it) because it *will* matter once individual symbols get traded —
+those do split, and E2's method/output (the ratio-series plot, the rational-multiple detector)
+stays available unchanged for that case. `ibkr` method is `TRADES` (raw/unadjusted) throughout,
+as pinned since E0. Output: `results/ibkr_massive_mad/adjustment/close_ratio_by_day.parquet`,
+`spy_ratio_series.png` (flat line at 1.0, no jumps visible).
 
 ---
 
