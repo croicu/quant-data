@@ -85,11 +85,14 @@ def test_main_records_ingestion_coverage_on_successful_stage():
     assert database.recorded_coverage == [("yfinance", "AAPL", date(2026, 1, 2))]
 
 
-def test_main_skips_weekend_dates_without_touching_the_archive():
+def test_main_skips_weekend_staging_but_still_records_coverage():
     # 2026-01-03/2026-01-04 are a Sat/Sun -- even though something's archived under those exact
     # dates (e.g. ibkr's own quirk of returning the prior trading day's session for a weekend
     # request, see croicu/quant-data#56), stage shouldn't re-stage it a second time under the
-    # weekend date.
+    # weekend date. It should still record ingestion_coverage for those dates though
+    # (croicu/quant-data#71's sibling fix) -- skipping that too left ingestion_coverage fragmented
+    # into disjoint ranges at every weekend, exactly like archive_coverage was before quant-ingest's
+    # own weekend handling got wired up correctly.
     database = MockPostgresDatabase()
     archive_reader = MockProviderSourceArchiveReader(
         {
@@ -110,6 +113,11 @@ def test_main_skips_weekend_dates_without_touching_the_archive():
     # Only Friday 01-02's 2 bars land -- the weekend dates are skipped entirely, not staged and
     # not counted as failures either.
     assert len(database.written_staging_bars) == 2
+    assert database.recorded_coverage == [
+        ("yfinance", "AAPL", date(2026, 1, 2)),
+        ("yfinance", "AAPL", date(2026, 1, 3)),
+        ("yfinance", "AAPL", date(2026, 1, 4)),
+    ]
 
 
 def test_main_fails_fast_when_no_providers_configured(tmp_path):

@@ -202,8 +202,9 @@ def test_main_returns_one_when_no_ticker_and_no_settings_tickers():
 def test_main_iterates_over_date_range_and_tolerates_gaps():
     archive_writer = MockProviderSourceArchiveWriter()
 
-    # 2026-01-02 (Fri) and 2026-01-05 (Mon) have fixture data; 01-03/01-04 (weekend) don't --
-    # those two days should fail per-date without aborting the rest of the range.
+    # 2026-01-02 (Fri) and 2026-01-05 (Mon) have fixture data and archive for real; 01-03/01-04
+    # (weekend) get marked covered-without-data instead (croicu/quant-data#60) -- both outcomes
+    # count as handled, not failed (croicu/quant-data#71), so the whole range succeeds.
     exit_code = cli.main(
         ["--ticker", "aapl", "--start-date", "2026-01-02", "--end-date", "2026-01-05"],
         settings_path=SETTINGS_PATH,
@@ -211,7 +212,7 @@ def test_main_iterates_over_date_range_and_tolerates_gaps():
         archive_writer_factory=_use_archive_writer(archive_writer),
     )
 
-    assert exit_code == 1
+    assert exit_code == 0
     assert len(archive_writer.recorded_fetches) == 2  # 01-02 and 01-05 each archive once
 
 
@@ -797,9 +798,13 @@ def test_main_marks_weekend_covered_without_data_instead_of_fetching_for_non_ibk
         assert provider_name == "yfinance"
         assert method == "PRIMARY"
         assert fetch_version == "1"
-    # Weekend-skip never counts as an actual archived fetch -- same "failed" accounting as before
-    # this feature existed, since no real data was ever written either way.
-    assert exit_code == 1
+    # Marked-covered-without-data counts as handled, not failed (croicu/quant-data#71) -- the
+    # opposite of this feature's original accounting. A weekend genuinely has no data to write, but
+    # it's still a correct, terminal outcome, not an error to retry. Counting it as "failed" was
+    # harmless for a human-run --catch-up, but became a real bug once quant-schedule (#68) started
+    # creating real run_once jobs for weekend dates: those jobs would never report success, so
+    # they'd retry forever instead of disabling once handled.
+    assert exit_code == 0
 
 
 def test_main_does_not_skip_weekend_fetch_for_ibkr():

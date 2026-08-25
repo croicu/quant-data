@@ -6,6 +6,15 @@ breaks it into a job graph for quant_schedule.jobs: one ingest job per (day, pro
 staging job depending on every ingest job, followed by one reconcile job depending on the staging
 job. quant-reconcile itself takes no ticker/date arguments (it processes the whole pending/staging
 backlog), so a work item's reconcile job is always the same bare command.
+
+Every calendar day in the range gets an ingest job, weekends included -- quant-ingest already
+handles a weekend date correctly on its own (checks the calendar before fetching, marking it
+covered without data for yfinance/massive rather than wasting an API call, per croicu/quant-data#56's
+follow-up fix). An earlier version of this module filtered weekends out of the plan entirely,
+which meant quant-ingest was never invoked for those dates at all -- so its own weekend handling
+never ran, and archive_coverage ended up with a real gap (three disjoint ranges instead of one
+continuous one) instead of a weekend marked covered-without-data. Confirmed live: a QQQ
+2026-08-03..08-18 backfill produced archive_coverage rows split at both weekends.
 """
 
 from __future__ import annotations
@@ -17,16 +26,11 @@ from quant_data._internal.shared.schedule_writer import NewJob
 _IBKR_PROVIDER_NAME = "ibkr"
 
 
-def _is_weekend(target_date: date) -> bool:
-    return target_date.weekday() >= 5
-
-
-def _trading_days(start_date: date, end_date: date) -> list[date]:
+def _calendar_days(start_date: date, end_date: date) -> list[date]:
     days: list[date] = []
     current = start_date
     while current <= end_date:
-        if not _is_weekend(current):
-            days.append(current)
+        days.append(current)
         current += timedelta(days=1)
     return days
 
@@ -44,12 +48,12 @@ def build_job_plan(
     the staging job, then the reconcile job) -- the order WorkItemScheduleWriter.create_jobs
     requires, since it resolves depends_on_names against job IDs created earlier in the same
     batch."""
-    trading_days = _trading_days(start_date, end_date)
+    calendar_days = _calendar_days(start_date, end_date)
     date_range_label = f"{start_date.isoformat()}-{end_date.isoformat()}"
 
     ingest_jobs: list[NewJob] = []
-    for trading_day in trading_days:
-        day_label = trading_day.isoformat()
+    for calendar_day in calendar_days:
+        day_label = calendar_day.isoformat()
         for provider in providers:
             if provider == _IBKR_PROVIDER_NAME:
                 for method in ibkr_methods:

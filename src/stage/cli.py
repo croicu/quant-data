@@ -354,10 +354,25 @@ def main(
                     # trading day's session rather than "no data" for one, so there's real -- if
                     # redundant -- archived content there) but staging that here would just
                     # re-upsert the same bars already staged under their own correct trading date.
+                    # Still record ingestion_coverage for it, though (croicu/quant-data#71's
+                    # sibling bug on the stage side): skipping the write is correct, but skipping
+                    # the *coverage record* too left it fragmented into disjoint ranges at every
+                    # weekend, exactly like archive_coverage was before quant-ingest's own weekend
+                    # handling got wired up correctly.
                     Logger.diagnostic(
                         f"quant-stage: skipping {target_date.isoformat()} (weekend) -- nothing genuinely new to stage.",
                         category=CATEGORY_STAGE,
                     )
+                    for ticker in tickers:
+                        for provider_name in settings.providers:
+                            try:
+                                database.record_ingestion_coverage(provider_name, ticker, target_date)
+                            except AppError as error:
+                                Logger.warning(
+                                    f"quant-stage: failed to record weekend coverage for '{ticker.upper()}' on "
+                                    f"{target_date.isoformat()} via '{provider_name}': {error}",
+                                    category=CATEGORY_STAGE,
+                                )
                     continue
                 for ticker in tickers:
                     written = _stage_one(settings.providers, archive_reader, database, ticker, target_date)
