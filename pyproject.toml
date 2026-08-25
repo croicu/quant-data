@@ -28,6 +28,17 @@ quant-schedule = "schedule.cli:main"
 dev = [
     "pytest>=8.3",
     "ruff>=0.11",
+    "ipykernel>=6.29",
+]
+# For .exp/ (tasks/ibkr_massive_mad_calibration.md) only -- not part of what quant-scratch
+# or anyone else installs quant_data for, so kept out of the base dependencies list. pandas/numpy
+# are already present transitively via yfinance; declared here explicitly since .exp/ code
+# depends on them directly. pyarrow/matplotlib are genuinely new (parquet + .png outputs).
+experiments = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyarrow>=17.0",
+    "matplotlib>=3.9",
 ]
 
 [tool.ruff]

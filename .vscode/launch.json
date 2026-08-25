@@ -109,6 +109,15 @@
       "python": "${workspaceFolder}/.venv/bin/python",
       "console": "integratedTerminal",
       "justMyCode": true
+    },
+    {
+      "name": "Python: E0 Join Integrity",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/.exp/join_integrity/coverage.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": true
     }
   ],
   "inputs": [
