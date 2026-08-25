@@ -64,3 +64,13 @@ ADJUSTMENT_MATERIALITY_PCT: float = 0.5
 # reverse-split reciprocals) when within ADJUSTMENT_JUMP_TOLERANCE_PCT of it, relatively.
 ADJUSTMENT_RATIONAL_MULTIPLES: list[float] = [0.2, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0]
 ADJUSTMENT_JUMP_TOLERANCE_PCT: float = 2.0
+
+# E3 (MAD vs Welford): top-tail fraction of |d| dropped for the trimmed recompute, per the task's
+# own "top 0.1% of |d| removed" method.
+DISPERSION_TRIM_TOP_PCT: float = 0.1
+
+# Heuristic read (not a hard gate -- same spirit as E1's CLEAR_SPIKE_MARGIN_PCT): "ratio near 1.0"
+# means <= this; "sigma stable under trimming" means its pct change is within +/- this many points.
+# Both must hold to read as "recommend against MAD" per the task's gate wording.
+DISPERSION_RATIO_NEAR_ONE_MAX: float = 1.15
+DISPERSION_SIGMA_STABLE_PCT: float = 10.0
