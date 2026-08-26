@@ -1,12 +1,13 @@
 # Task: IBKR/Massive MAD Calibration Experiment
 
-**Status:** E0-E5 done and merged (gate passed; lag 0; no adjustment mismatch; MAD switch
+**Status:** E0-E6 done and merged (gate passed; lag 0; no adjustment mismatch; MAD switch
 supported but raw-MAD-degenerate; k→spend exchange rate on "conditional MAD"; flat, not rising
-going back). E6 done (recommend k=3.0, now well-supported after the 2026-08-25 overlap-window
-extension to 26 days/7,420 bars — see E6's own status note for the real float32 data-quality
-catch and the E6b independence finding); E7-E8 not started. `config.END_DATE` extended from
-`2026-07-31` to `2026-08-21` same session; E0-E5 all re-run and re-verified against the wider
-range (see each section's "Rerun 2026-08-25" note).
+going back; recommend k=3.0, well-supported after the overlap-window extension to 26 days/7,420
+bars — see E6's own status note for the real float32 data-quality catch and the E6b independence
+finding). `config.END_DATE` extended from `2026-07-31` to `2026-08-21` as part of E6's work;
+E0-E5 all re-run and re-verified against the wider range (see each section's "Rerun 2026-08-25"
+note). E7 done (stable + modest center, but a real fat tail — recommend k_volume≈18.8, much
+larger than the price band's k=3.0 — see E7's own status note); E8 not started.
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -574,6 +575,44 @@ per ticker, by session segment.
   parameters.
 - Unstable → **recommend excluding volume from reconciliation entirely** and say so
   plainly.
+
+**Status: done — STABLE + MODEST, recommend a separate volume band, but with a real fat-tail
+wrinkle.** Run: `.exp/volume/log_ratio.py`. Ticker: SPY, 146,272 lag-0-joined bars (1 excluded for
+zero volume on one side).
+
+**What this is and isn't testing, stated explicitly to avoid a real ambiguity**: production
+**does not run any cross-provider comparison on volume today** — `005_remove_volume_field_group`
+deliberately removed it as an independently-reconciled field group; a promoted bar's `volume`
+just rides along with whichever provider won the `ohlc` vote, zero MAD/Welford check involved.
+E7 tests a hypothetical, not current behavior: *if* this task's new historical-period IBKR/Massive
+MAD band were extended to cover volume too, would that be viable, or should volume stay excluded
+the way it already is? "Unstable" would have confirmed today's exclusion is still right;
+"stable + modest" (what follows) means a volume band *could* be built if wanted — evidence for a
+possible future follow-up, per this task's own Non-goals ("do not implement the production
+tolerance path"), not a description of, or a change to, what reconciliation does today.
+
+Per-segment median log(`massive`/`ibkr`) volume: pre 0.114, RTH 0.105,
+post 0.090 — **consistently positive across every segment** (`massive` reports ~10-12% higher
+volume than `ibkr` `TRADES` throughout, as expected — `TRADES` isn't the consolidated tape).
+Max pairwise center spread **0.024** (threshold ≤1.0) → **STABLE**. Max segment MAD-scaled
+dispersion **0.103** (threshold ≤2.0) → **MODEST**. Gate passes: recommend volume gets its own
+log-ratio band, separate from the OHLC price band.
+
+**Real wrinkle, same shape as E3's own finding**: a "modest" MAD doesn't rule out a heavy tail —
+checked with the identical σ/(1.4826×MAD) diagnostic E3 used, and it comes back **5.62**, far above
+E3's own price-series ratio (which was undefined/degenerate from an exact-match point mass — this
+one is a genuine, cleanly-measured heavy tail, no point mass involved). Consequence: a coarse
+`k` sweep (1–10) only gets flag rate down to 4.07% at `k=10` — nowhere near a price-band-comparable
+~1.5% target. Computed the *exact* `k` via empirical percentile rather than accepting the grid's
+own ceiling as the answer: **k_volume ≈ 18.8** needed to reach a 1.5% flag rate. **Recommending
+k_volume ≈ 18.8** — a much larger multiplier than the price band's k=3.0, exactly because the
+distribution is fundamentally fatter-tailed, not because the center is unstable or the typical
+spread is large. Plot: `results/ibkr_massive_mad/volume/spy_log_ratio_boxplot.png` (box IQR only,
+matches the "modest" MAD read — the tail isn't visible there, only in the σ/MAD ratio and the
+k-sweep numbers, so don't read the plot alone as the full picture). Output:
+`results/ibkr_massive_mad/volume/log_ratio_summary.parquet`. `config.py` gained
+`E7_STABLE_CENTER_SPREAD_MAX=1.0`, `E7_MODEST_DISPERSION_MAX=2.0`, `E7_K_GRID`,
+`E7_TARGET_FLAG_RATE_PCT=1.5`.
 
 ---
 
