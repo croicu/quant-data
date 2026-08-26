@@ -160,11 +160,24 @@ agreement, not conditional-MAD sampling noise** (n=18,388 is not a small sample)
 unexplained, open question #5) is a separate, smaller anomaly (1.41% own-threshold) and is NOT closed by this --
 that question remains open.
 
-**Consequence for the recalibration-cadence follow-up (section 8)**: because January's elevated tail is real and
-sustained rather than noise, a purely rolling monthly recalibration is genuinely exposed to landing on a month
-like January and inheriting its (real, not spurious) `high`/`low` looseness -- the same mechanism already observed
-with August. This is a real tension with the "monthly recalibration" cadence proposed in section 8, not fully
-resolved here -- see that section's own note.
+**Consequence for the recalibration-cadence follow-up (section 8) -- resolved (R3a-R3f)**: pool the
+conditional-MAD *scale* (this section's basis) and keep it fixed; keep `k` rolling against the refreshing
+yfinance window (unaffected -- a different quantity, see section 8); add a separate drift monitor that
+recomputes each month's own conditional MAD and own-threshold rate and alerts on deviation without feeding back
+into the band. Rolling the scale itself would make drift structurally undetectable (every month would flag near
+its own design rate by construction) and is wrong in an unknowable direction (a degrading provider silently
+widens its own band); pooling is wrong in a knowable, observable direction instead.
+
+**Was January/August's pattern actually unmodeled volatility rather than a real regime difference? Checked and
+refuted.** The hypothesis: `high`/`low`'s outsized flag rates (vs. `open`/`close`'s near-zero ones) could reflect
+disagreement scaling with intrabar range rather than a genuine data-quality difference, which would have dissolved
+this tension instead of requiring a decision. Tested directly: per-bar correlation between `|d_high|`/`|d_low|` and
+intrabar range is ~0 (r=0.004-0.013, even restricted to disagreement-only bars); month-level, own-threshold flag
+rate vs. mean intrabar range is r=-0.32 (wrong sign) -- **August has the *lowest* mean intrabar range of all 8
+months despite being the second-most-elevated month for disagreement**, and March has the *highest* range but one
+of the *lowest* disagreement rates. January and August are not the high-volatility months this hypothesis needs
+them to be. **Confirms January/August are genuine data regimes, not a price-level-normalization artifact** -- no
+renormalization work is warranted on this evidence.
 
 ---
 
@@ -212,24 +225,40 @@ regardless, and the result holds for one window, one alignment regime, one k.
 
 ## 8. Proposed k recalibration cadence
 
-yfinance's ~30-day rolling window is the only mechanism for recalibrating k going forward (per the task's
-"Role of yfinance after this task" section). Proposed cadence, not yet implemented:
+**Revised 2026-08-26 (R3a-R3f) from the original proposal below** -- the original cadence rolled the
+conditional-MAD *scale* monthly, which section 4's investigation shows is the wrong quantity to roll (it makes
+drift structurally undetectable, since every month would then flag near its own design rate by construction).
+Three separate things could roll, and they resolve in opposite directions:
 
-- **Monthly**, aligned with E5's own calibration-month pattern: recompute the conditional-MAD band basis
-  on the trailing month, re-run E6's precision/recall proxy against that month's fresh overlap, and only
-  change the production k if the recommendation shifts by more than one grid step (E4_K_GRID granularity).
-- **Drift trigger**: if a monthly recalibration run's flag rate at the current k moves outside the range
-  observed in E5 (5.6%-8.4% across 8 months), treat that as a signal to investigate before
-  the next scheduled recalibration, not wait for it.
+- **Conditional-MAD scale: POOLED, fixed, not rolled.** The dispersion estimate underlying the band should
+  come from the full pooled range (E4's basis), not a trailing month. Standard control-chart reasoning:
+  control limits are fixed from a reference period specifically so drift can be detected against them;
+  recomputing them from the data being monitored makes the chart unable to ever fire. Pooling is also wrong
+  in a *knowable* direction (too loose in quiet months, too tight in volatile ones, and which is observable)
+  -- rolling would be wrong in an *unknowable* direction instead (a degrading provider silently widens its own
+  band with an unchanged flag rate).
+- **`k` (the operating point): rolling, as originally proposed.** Re-picking `k` against fresh yfinance labels
+  doesn't touch the dispersion estimate -- it re-chooses where to sit on a curve E6 measures. yfinance's
+  ~30-day rolling window is the only mechanism for this (per the task's "Role of yfinance after this task"
+  section). Monthly, re-run E6's precision/recall proxy against that month's fresh overlap, and only change
+  the production `k` if the recommendation shifts by more than one grid step (E4_K_GRID granularity). Caveat:
+  `k` rolled on recent data gets applied to a historical period with no labels, inheriting E5's flatness
+  result as an assumption rather than validating it directly there.
+- **Drift monitor (new, not in the original proposal): recomputes each month's own conditional MAD and
+  own-threshold flag rate and *alerts* on deviation without changing the band.** This is what recovers the
+  drift-detection capability that pooling the scale would otherwise cost -- an alert triggers a human
+  recalibration decision (consistent with Pass 2 already being manual/deliberate), not an automatic band
+  change. Reference range from E5: 5.6%-8.4% across 8 months.
 
-**Open tension, not resolved here (2026-08-26 second review pass, R3)**: section 4's finding that January's
-elevated own-threshold rate is a real, sustained monthly regime difference (not conditional-MAD sampling noise)
-means a purely rolling single-month calibration is genuinely exposed to inheriting a month's real idiosyncrasy
-(as already observed with both January and August) rather than tracking genuine drift. That pulls toward
-calibrating on the pooled full range instead (E4's basis) for stability -- but pooling also can't detect real
-drift if the underlying disagreement characteristics genuinely shift over time, which is the entire reason E5
-exists. **This is a real design choice between the two E0-E8 already computed, not a bug to fix -- flagged for
-the repo owner rather than decided unilaterally before this cadence is actually built.**
+**Why not renormalize instead of deciding this?** Checked and refuted -- see section 4's own resolution: January's
+and August's elevated flag rates are NOT explained by intrabar-range/volatility scaling (per-bar correlation ~0,
+month-level correlation wrong-signed, August is the *lowest*-volatility month despite being the second-most-elevated
+for disagreement). They are genuine data regimes, which is why pooling the scale (not renormalizing it) is
+the right fix.
+
+**Separate, unresolved follow-up**: whether `high`/`low` need their own field group and `k`, distinct from
+`open`/`close` (E6/E7 already do this for volume) -- January's own-threshold split (~9.5% vs ~0.3%) suggests they
+might. Independent of the scale-vs-k question above either way.
 
 ---
 
