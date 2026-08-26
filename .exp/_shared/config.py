@@ -150,3 +150,15 @@ E7_MODEST_DISPERSION_MAX: float = 2.0
 # band's own k=3 operating point (E4: ~1.1-1.4% flagged).
 E7_K_GRID: list[float] = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
 E7_TARGET_FLAG_RATE_PCT: float = 1.5
+
+# E8 (replace or coexist): the recommended k for the ibkr/massive MAD band, per E6's own gate
+# (intersection of E4 spend and E6 quality). Kept as its own named constant rather than reusing
+# E5_K_FIXED, even though both are 3.0 today -- they answer different questions (E5: what's a
+# reasonable fixed k for a stationarity check; E8: what's *the* recommended k) and could diverge
+# later if E6 is rerun with different evidence.
+E8_RECOMMENDED_K: float = 3.0
+
+# "MAD flags are a superset" of the whistleblower's flags when the fraction of whistleblower-
+# flagged bars the MAD band misses is at or below this percent (some slack, not literally 0 --
+# real data is noisy). Above it: substantially disjoint, coexistence is earned.
+E8_SUPERSET_MISS_MAX_PCT: float = 10.0

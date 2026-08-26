@@ -1,13 +1,15 @@
 # Task: IBKR/Massive MAD Calibration Experiment
 
-**Status:** E0-E6 done and merged (gate passed; lag 0; no adjustment mismatch; MAD switch
+**Status:** E0-E7 done and merged (gate passed; lag 0; no adjustment mismatch; MAD switch
 supported but raw-MAD-degenerate; k→spend exchange rate on "conditional MAD"; flat, not rising
 going back; recommend k=3.0, well-supported after the overlap-window extension to 26 days/7,420
 bars — see E6's own status note for the real float32 data-quality catch and the E6b independence
-finding). `config.END_DATE` extended from `2026-07-31` to `2026-08-21` as part of E6's work;
-E0-E5 all re-run and re-verified against the wider range (see each section's "Rerun 2026-08-25"
-note). E7 done (stable + modest center, but a real fat tail — recommend k_volume≈18.8, much
-larger than the price band's k=3.0 — see E7's own status note); E8 not started.
+finding; stable+modest volume center but a real fat tail, recommend k_volume≈18.8). E8 done
+(substantially disjoint — coexistence earned, not MAD-replaces-yfinance; `materiality_floor_
+tolerance.md`/`variance_floor_clamp.md` are NOT retirable on this evidence). `config.END_DATE`
+extended from `2026-07-31` to `2026-08-21` as part of E6's work; E0-E5 all re-run and re-verified
+against the wider range. **All nine experiments (E0-E8) now done — next is the final
+`findings.md` writeup** (`report.py`, not yet built).
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -644,6 +646,33 @@ it as a claim about band coverage, not about yfinance's necessity.
 - **Substantially disjoint** → the two bands detect different failure modes;
   coexistence is *earned*. Recommend it explicitly with the evidence, and specify
   which band owns which period.
+
+**Status: done — substantially disjoint, coexistence earned.** Run:
+`.exp/coexistence/flag_set_overlap.py`. Ticker: SPY, same 26-day overlap window as E6
+(`2026-07-27`–`2026-08-21`, 7,420 bars), at the recommended `k=3.0`.
+
+**Confusion matrix**: both flagged 42, MAD-only 58, whistleblower-only **574**, neither 6,746.
+MAD band total flagged 100; whistleblower total flagged 616. **Jaccard = 0.062**; MAD misses
+**93.2%** of what the whistleblower flags (threshold for "superset" was ≤10% missed) — nowhere
+close. This isn't a new finding so much as E6's own recall number (6.8% at k=3) formalized into
+the confusion-matrix framing the gate asks for — the two numbers say the same thing from different
+angles and agree.
+
+**Verdict: SUBSTANTIALLY DISJOINT — coexistence is earned, not MAD-replaces-yfinance.** The two
+bands detect different failure modes. Recommending: the MAD band owns the pre-overlap historical
+period (no `yfinance` available there at all — this was never in competition for that period
+anyway), the existing `yfinance`/Welford band keeps owning the recent/rolling period it already
+covers. **`materiality_floor_tolerance.md`/`variance_floor_clamp.md` are NOT retirable** for any
+period on this evidence — the disjoint result is exactly the gate outcome that keeps both
+mechanisms alive, not the one that would flag them for review.
+
+**Circularity caveat, per the task's own explicit instruction**: this comparison is computed
+*using* `yfinance` (same as E6) — stated prominently in the script's own output. Doesn't change the
+read here (a disjoint result isn't the direction circularity would bias toward — circularity would
+inflate an apparent *superset* finding, not manufacture a disjoint one, so if anything this result
+is on the more-trustworthy side of that concern), but recorded per the task's instruction
+regardless. Output: `results/ibkr_massive_mad/coexistence/flag_set_overlap.parquet`. `config.py`
+gained `E8_RECOMMENDED_K=3.0`, `E8_SUPERSET_MISS_MAX_PCT=10.0`.
 
 ---
 
