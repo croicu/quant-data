@@ -15,9 +15,13 @@ second review pass (2026-08-26) raised R1-R5, all now checked/resolved — see
 "Second review pass" below.** R1's reclassification worry (B4 blocking the `k` choice)
 was checked directly and did NOT hold at k=3.0 (58/42 ibkr/massive split among decisive
 flags, not the near-automatic split the worry predicted) — `k=3.0` stands, not
-conditional on further B4 work. R3 surfaced a genuine unresolved design tension (pooled
-vs. rolling-month calibration) flagged for the repo owner, not decided unilaterally. B4-B6
-remain open, non-blocking.
+conditional on further B4 work. **R3's pooled-vs-rolling tension is resolved (R3a-R3f):
+pool the conditional-MAD scale, keep `k` rolling against yfinance, add a separate drift
+monitor that doesn't feed back into the band.** R3d's volatility-normalization hypothesis
+(would have dissolved the question instead of deciding it) was checked live against the
+warehouse and refuted — January/August are genuine data regimes, not a normalization
+artifact. R3f (separate `high`/`low` vs `open`/`close` field grouping) is a real
+follow-up, independent of R3d. B4-B6 remain open, non-blocking.
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -163,6 +167,11 @@ sense as the OHLC k."
 
 ## Second review pass (2026-08-26, after B1–B3/B7/B8 resolution) — R1-R5 RESOLVED
 
+**R3's pooled-vs-rolling tension is now resolved (R3a–R3f, appended to R3).** Short
+version: pool the scale, keep rolling `k`, add a drift monitor, and test the
+intrabar-range normalization hypothesis first — it may dissolve the question rather than
+decide it.
+
 Review of the resolutions above. B7's root cause is a genuine find — a median
 collapsing to exactly zero on a majority-tie sample is the same failure shape as E3's
 raw MAD, and catching it twice in this task is a good sign about the method. R1 is the
@@ -195,7 +204,7 @@ the marginal-discovery framing: k=1 nets 93 genuine (bar, field) hits against k=
 cleaner, unit-consistent argument for k=3.0 than comparing the precision percentages
 directly.
 
-### R3 — B1's real consequence isn't drawn out, and it contradicts a follow-up — INVESTIGATED, not fully resolved (see below)
+### R3 — B1's real consequence isn't drawn out, and it contradicts a follow-up — INVESTIGATED, then RESOLVED (see R3 resolution below)
 
 **The 18.1% figure is January, not March** — checked directly. It is not conditional-MAD
 sampling noise: January's own-threshold rate (18.07%, n=18,388) is driven almost
@@ -217,6 +226,112 @@ detect genuine drift either, which is the entire reason E5 exists in the first p
 (pooled vs. rolling-month), not a bug — left for the repo owner to decide before the
 recalibration-cadence follow-up (Pending Tasks) is actually built, rather than picked
 unilaterally here.** `findings.md` sections 4 and 8 both state the tension explicitly.
+
+#### R3 resolution (2026-08-26) — three things could roll, and they have opposite answers
+
+The tension is partly an artifact of the framing. "Pooled vs rolling" was treated as one
+choice, but three separate quantities could roll:
+
+1. the conditional-MAD **scale** (the dispersion estimate),
+2. the multiplier **k**,
+3. neither.
+
+E5's stationarity test rolled the **scale** (August's own MAD, frozen, applied backward).
+The Pending Tasks follow-up rolls **k** against the refreshing yfinance window. R3 read
+these as the same decision. They are not, and they resolve in opposite directions.
+
+**R3a — Pool the scale. Rolling it destroys the drift signal.**
+
+If the band recalibrates to each month's own dispersion, then by construction every month
+flags near its own design rate and drift becomes invisible. E5 exists to test
+stationarity; adopting rolling scale calibration makes that property permanently
+untestable in production.
+
+This is the standard control-chart argument: control limits are fixed from a reference
+period precisely so the chart can fire. Recompute the limits from the data being
+monitored and it never can. Decisive for the scale.
+
+**R3b — Keep rolling `k`. It is a different animal.**
+
+Re-picking the operating point against fresh yfinance labels does not touch the
+dispersion estimate; it re-chooses where to sit on a curve whose shape E6 measures. The
+follow-up stands. Caveat to record: `k` rolled on recent data is applied to a historical
+period with no labels, so it inherits E5's flatness result as an assumption rather than
+being validated directly there.
+
+**R3c — The asymmetry seals it.**
+
+Pooled is wrong in a *knowable* direction: too loose in quiet months, too tight in
+volatile ones, and which is which is observable. Rolling is wrong in an *unknowable*
+direction — it silently adapts to degradation, so a provider getting worse produces a
+wider band and an unchanged flag rate. For a whistleblower, prefer the failure mode you
+can see.
+
+**R3d — Test the premise first: January's signature may dissolve it.**
+
+`high`/`low` at ~9.5% each while `open`/`close` sit at ~0.3% is precisely what you would
+expect if disagreement scales with **intrabar range** rather than price level. Extremal
+fields have room to differ in proportion to how far the bar travelled; `open`/`close` are
+single prints at fixed times and do not. A high-volatility month then produces exactly
+January's pattern with no data-quality regime change at all.
+
+The difference series currently uses `d = (ibkr − massive) / midpoint` — price-level
+normalization for every field. For extremal fields that is arguably the wrong
+denominator.
+
+Two cheap checks against data already loaded:
+
+- Per-bar, correlate `|d_high|` against intrabar range `(high − low) / midpoint`. Strong
+  positive correlation confirms the mechanism.
+- Regress each month's own-threshold flag rate on that month's realized volatility. If
+  January and August are the high-volatility months, the 0.86%–18.1% spread is largely
+  explained.
+
+**If it holds:** renormalize `high`/`low` by intrabar range instead of price level and
+re-run E5. The month-to-month spread should collapse and the pooled-vs-rolling tension
+largely *dissolves* rather than being decided — the variation was unmodeled volatility
+scaling, not a regime difference. **If it does not hold:** January is a genuine data
+regime, and R3a/R3c stand as the answer.
+
+**R3d checked live (2026-08-26) — TESTED, does NOT hold.** Both proposed checks run
+against the real warehouse data:
+
+- **Per-bar correlation** between `|d_high|`/`|d_low|` and intrabar range
+  `(high−low)/midpoint` (ibkr's own high/low as the volatility proxy): essentially zero.
+  Pooled: pearson r=0.0044 (`high`), 0.0033 (`low`). Restricted to disagreement-only bars
+  (the subset where the mechanism, if real, should show up most clearly): r=0.0094
+  (`high`), 0.0127 (`low`), spearman ρ=0.011/0.026. No relationship, in either direction.
+  (`open`/`close` show a *stronger* correlation than `high`/`low` in this same check —
+  0.11–0.42 depending on measure — which is the opposite of what the mechanism predicts,
+  since `open`/`close` are the fields the hypothesis says should be *unaffected*.)
+- **Month-level regression**: own-threshold flag rate vs. that month's mean intrabar
+  range gives r=−0.32 (wrong sign — higher volatility associated with *less*
+  disagreement, if anything) and R²=0.10 (essentially no explanatory power). Decisively:
+  **August has the *lowest* mean intrabar range of all 8 months (0.000190) despite being
+  the second-most-elevated month for disagreement (5.60% own-threshold)**; March has the
+  *highest* range (0.000486) but one of the *lowest* disagreement rates (1.41%). January
+  and August are not the high-volatility months this hypothesis needs them to be.
+
+**Conclusion: the volatility-scaling mechanism is refuted, not just unconfirmed.** Per
+R3d's own stated branching, this means **January (and August) are genuine data regimes,
+not an artifact of price-level normalization — R3a/R3c stand as the answer, not the
+renormalize-and-dissolve branch.** No renormalization or E5 re-run is warranted on this
+evidence; don't build it speculatively. R3f's field-grouping question (below) is
+unaffected by this either way and still stands on its own.
+
+**R3e — Recommendation, now unconditional (not "either way" — R3d's test settled which branch applies).**
+
+Pooled scale for the band, plus a **separate monitor** that recomputes each month's own
+conditional MAD and own-threshold rate and *alerts* on deviation **without changing the
+band**. This buys drift detection without exposing the band to it. Drift then triggers a
+human recalibration decision, which is the right place for it given Pass 2 is already
+deliberate.
+
+**R3f — Consequence for field grouping.**
+
+E6/E7 already treat volume as its own field group with its own `k`. January suggests
+`high`/`low` and `open`/`close` may need the same separation on the price side,
+independent of how the normalization question in R3d lands. Worth deciding alongside it.
 
 ### R4 — Precision has no null baseline — RESOLVED, and the naive 8.3% baseline was itself wrong
 
@@ -907,12 +1022,12 @@ gained `E8_RECOMMENDED_K=3.0`, `E8_SUPERSET_MISS_MAX_PCT=10.0`.
 
 yfinance is **not** retired if this method validates. Its role narrows and shifts:
 
-1. **Rolling calibration set.** The one-month window is *perpetually refreshing*, not
-   fixed. It is the only mechanism for recalibrating `k` going forward. Databento
-   cannot substitute — it is paid and sparse, usable as an oracle on already-flagged
-   bars but never as a rolling sample to measure flag-rate quality against. Without
-   yfinance the band has no feedback path and drifts silently until a bad promotion
-   surfaces it.
+1. **Rolling calibration set for `k`.** The one-month window is *perpetually refreshing*,
+   not fixed. It is the only mechanism for re-picking the operating point `k` going
+   forward. Databento cannot substitute — it is paid and sparse, usable as an oracle on
+   already-flagged bars but never as a rolling sample to measure flag-rate quality
+   against. **Note per R3a/R3b: this rolls `k` only. The conditional-MAD scale is pooled
+   and fixed; drift is caught by the R3e monitor, not by recalibrating the band.**
 2. **Correlated-error detector on recent data.** The only visibility into IBKR and
    Massive agreeing while both wrong. Subject to the E6b independence caveat.
 3. **Intra-provider MAD sanitizer stays unchanged.** That check is about yfinance's
@@ -964,4 +1079,19 @@ Open questions and anything that escalated go at the top, not the bottom.
   claim rather than a stated belief.
 - Rolling `k` recalibration against the refreshing yfinance window, at the cadence
   E6 recommends. Belongs in quant-scratch — recurring, runs on a refreshing window,
-  needs only flag rates.
+  needs only flag rates. **Per R3b: this rolls `k` only. The conditional-MAD scale is
+  pooled and must not roll** (R3a — a rolling scale makes drift undetectable by
+  construction).
+- **Drift monitor** (R3e): recomputes each month's own conditional MAD and own-threshold
+  flag rate and *alerts* on deviation without changing the band. This is what recovers
+  the drift detection that pooling the scale would otherwise cost. Pairs with the item
+  above; the alert triggers a human recalibration decision rather than an automatic one.
+- ~~Intrabar-range normalization for `high`/`low`~~ (R3d) — **checked live 2026-08-26,
+  refuted, not a follow-up**: per-bar correlation between `|d_high|`/`|d_low|` and
+  intrabar range is ~0 (r=0.004-0.013 even disagreement-only), and month-level flag rate
+  vs. mean intrabar range is r=-0.32 (wrong sign) with August the *lowest*-range month
+  despite being the second-most-elevated for disagreement. January/August are genuine
+  data regimes, not a volatility-normalization artifact — see R3d's resolution above.
+- **Separate field grouping for `high`/`low` vs `open`/`close`** (R3f), independent of
+  how R3d lands. January's signature (~9.5% vs ~0.3%) suggests they do not belong under
+  one `k`, the same way volume already does not.
