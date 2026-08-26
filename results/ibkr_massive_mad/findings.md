@@ -1,24 +1,33 @@
 # IBKR/Massive MAD Calibration -- Findings
 
-Assembled by `.exp/_shared/report.py` from `manifest.json` (git sha `1f80fd0aa3925e2ba6c071eb1897916c7aa7d25e`).
+Assembled by `.exp/_shared/report.py` from `manifest.json` (git sha `df2a04511298e627512abcde0b3d1e165fd7e908`).
 Range: `2025-12-31`..`2026-08-21`. Tickers measured: SPY (SPY only -- see caveats).
 
 ## Open questions and escalations (read this first)
 
-1. **Real production data-quality bug found mid-task, not yet fixed there**: `yfinance`'s stored OHLC
+1. **Headline finding: the historical (pre-overlap) period is roughly an order of magnitude less protected
+   than the whistleblower-covered period, and Databento cannot close that gap.** At the recommended k, the MAD
+   band catches only 6.8% of what the yfinance whistleblower catches on the overlap window
+   (E8: 93.2% missed) -- this is not a footnote, it is the actual finding this task exists to
+   surface. Databento only deepens resolution on bars the band *already* flagged (E4/E9's shortlist); it adds
+   nothing to sensitivity, since it is never consulted on a bar the band didn't flag in the first place. This
+   is a capability bound on the entire historical backfill, not just an E8 result -- it should shape
+   `tasks/retroactive_revision.md`'s scope, not just be noted alongside it.
+2. **Real production data-quality bug found mid-task, not yet fixed there**: `yfinance`'s stored OHLC
    values carry float32 rounding artifacts (e.g. `737.239990234375` instead of `737.24`) -- a storage-
    precision quirk in the ingest/staging path. Worked around locally in E6/E8 (round to cent precision
-   before comparing); the underlying production path still has it. **Needs its own follow-up issue.**
-2. **Every number in this document is SPY-only.** `dim_ticker` now has 8 tickers, but only SPY has a frozen
+   before comparing); the underlying production path still has it. **Needs its own follow-up issue,**
+   including whether accumulated `provider_pair_disagreement` stddev needs recomputation once fixed.
+3. **Every number in this document is SPY-only.** `dim_ticker` now has 8 tickers, but only SPY has a frozen
    unpurged staging window -- none of these recommendations (k=3.0, k_volume, the stationarity/coverage
    reads) have been verified on any other ticker.
-3. **E3's raw MAD is exactly 0.0 (degenerate)** -- any production adoption of a MAD-based tolerance MUST
+4. **E3's raw MAD is exactly 0.0 (degenerate)** -- any production adoption of a MAD-based tolerance MUST
    pair it with a nonzero floor (`materiality_floor` already exists for this) or it will reject every
    nonzero disagreement outright. Not optional, not solved here.
-4. **Two real anomalies remain unexplained**: E1's RTH-vs-pre/post agreement gap (volume hypothesis
+5. **Two real anomalies remain unexplained**: E1's RTH-vs-pre/post agreement gap (volume hypothesis
    tested and rejected, R^2~0) and E5's March 2026 flag-rate outlier (not a split/adjustment per E2).
    Neither blocks the recommendation below, both are worth a closer look if revisited.
-5. **Structural limitation, true regardless of any experiment's result**: a two-provider band cannot
+6. **Structural limitation, true regardless of any experiment's result**: a two-provider band cannot
    detect correlated error (both providers agreeing while both are wrong). This method does not retire
    `yfinance` -- see "Role of yfinance after this task" in the task file.
 
@@ -47,10 +56,46 @@ alignment already correct at lag 0, no split/adjustment mismatch. The method pro
 
 ## 3. Recommended k and g
 
+**Correction (2026-08-26 pre-report review)**: E6's precision proxy originally had a real bug -- its `typical`
+yfinance-deviation baseline was a plain median over *all* triple-overlap (bar, field) instances, but 82-89% of
+those are exact ties (yfinance matches one candidate to the cent), so the median silently collapsed to exactly
+0.0 for every field. That degenerate 0.0 changed what "decisive" meant and produced a non-monotonic, unreliable
+precision curve (originally reported: 50.4% / 38.2% / 82.7% at k=1/2/3). **Fixed** in `.exp/validation/
+overlap_validation.py` by using the conditional (nonzero-only) median instead -- the same convention already used
+for conditional MAD elsewhere in this task. Corrected precision curve below; k=3's number happens to be unchanged
+(82.7%), but k=1 and k=2 were both substantially wrong and are now much lower.
+
 - **Recommended k = 3.0** (OHLC price band) -- matches production's existing `DEFAULT_RECONCILE_K`.
 - **E6 quality at k=3.0**: precision and recall proxies computed over the 7,420-bar overlap window (`2026-07-27`..`2026-08-21`), `n_whistleblower_flagged=616`. See `e6_validation.parquet` for the full k sweep.
-- **E4 spend at k=3, all g**: the whole (k, g) grid costs **$0.0002-$0.27/ticker** for the OHLCV-1m schema -- spend does not discriminate between k choices at all; the pick above is driven entirely by E6 quality.
-- **Volume band (E7, separate multiplier, not comparable 1:1 to the OHLC k)**: recommend k_volume =~ 18.784 if a volume band is ever built (hypothetical -- see E7's own caveat; not implemented).
+
+  | k | field flags | precision | recall |
+  |---|---|---|---|
+  | 1.0 | 2016 | 4.6% | 84.7% |
+  | 2.0 | 304 | 30.6% | 20.9% |
+  | 3.0 | 104 | 82.7% | 6.8% |
+  | 4.0 | 49 | 75.5% | 4.2% |
+  | 5.0 | 48 | 75.0% | 4.1% |
+  | 6.0 | 34 | 73.5% | 2.6% |
+  | 8.0 | 27 | 70.4% | 1.8% |
+  | 10.0 | 20 | 75.0% | 1.1% |
+  | 15.0 | 13 | 76.9% | 0.5% |
+  | 20.0 | 13 | 76.9% | 0.5% |
+
+- **E4 spend at k=3, all g**: the whole (k, g) grid costs **$0.0002-$0.27/ticker** for the OHLCV-1m schema -- spend does not discriminate between k choices at all.
+- **`k` was NOT actually chosen from an intersection of quality and spend, despite the task's own gate wording**
+  -- E4 already showed spend is negligible everywhere in the grid, which removes spend from the intersection
+  entirely. The real binding constraint is **human review capacity**: Pass 2 (acting on a MAD flag) is a manual,
+  deliberate review step, and nothing in E0-E8 quantifies how many flags a reviewer can actually process. Under
+  that framing, and now that the precision bug above is fixed, **k=3.0 is the right pick on the corrected
+  numbers, not just the convenient one**: k=1's 84.7% recall comes at only ~4.6% precision (93 genuine hits
+  buried in 2,016 field flags -- a reviewer would wade through ~22 flags per real one), while k=3's 6.8% recall
+  comes at 82.7% precision (86 of 104 field flags genuine). **State `k=3.0` explicitly as a review-capacity
+  choice (favoring signal-to-noise for a human reviewer over completeness), not a spend-driven one** -- if
+  review capacity is ever large enough to absorb k=1/k=2's noise, recall could be traded back up, but nothing
+  here establishes that capacity exists.
+- **Volume band (E7, separate multiplier, not comparable 1:1 to the OHLC k)**: recommend k_volume =~ 18.784 if a volume band is ever built (hypothetical -- see E7's own caveat; not implemented). This is an empirical
+  quantile of the log-ratio distribution (inverted from a 1.5% target flag rate), not a MAD multiple in the same
+  sense as the OHLC k -- the 1.4826 scaling that gives MAD its distributional meaning doesn't apply here.
 
 ---
 
@@ -60,7 +105,26 @@ alignment already correct at lag 0, no split/adjustment mismatch. The method pro
 - Flag rate range: 5.60% - 8.39%. Trend: **flat**.
 
 **Verdict: one global band** -- flat, not rising going back. No time-varying band or hard trust cutoff
-date needed on this evidence. (See open question #4 above re: the March outlier.)
+date needed on this evidence. (See open question #5 above re: the March outlier.)
+
+**Why this range (5.6-8.4%) reads so much higher than E4's own flag rate at the same k (1.1-1.4%, section 3's
+budget figures) -- resolved 2026-08-26**: these two numbers are answering different questions and were never
+meant to match. E4 calibrates its conditional MAD once, pooled over the full 8-month range; E5 deliberately
+recalibrates on a single month (August) and freezes that. Verified directly against the warehouse: August's own
+per-field conditional MAD (3.6-4.8e-6) is roughly 1.4-2.1x smaller than the full-range pooled MAD E4 uses
+(4.7-7.7e-6), which alone would explain a tighter band and a higher rate. But the gap is larger than that ratio
+predicts, for a second, independent reason: **August 2026 is itself an atypically fat-tailed month relative to
+its own scale**, not just a smaller-scale one. Evaluated against its *own* threshold (i.e. self-referentially,
+the way a calibration month always is), August flags 5.60% of its own bars -- April through July, evaluated the
+same self-referential way, flag only 0.86-1.40% of their own bars. So the August-calibrated fixed threshold is
+both tighter in absolute terms AND happens to reflect a month with proportionally more large disagreements,
+and both effects push every month's flag rate up together. **This does not undermine the flat verdict** -- flat
+is a claim about the fixed threshold not diverging further as you go back in time, which held (Jan, the
+earliest month, is neither the highest nor lowest) -- but the specific 5.6-8.4% absolute numbers are an artifact
+of calibrating on an atypical month, not a stable property of the underlying ibkr/massive disagreement, which
+(checked month-by-month against each month's own threshold) actually varies quite a bit -- 0.86% to 18.1%. A
+future recalibration that lands on a more typical month would likely produce a materially lower absolute flag
+rate than this run did, even though the flat *trend* finding would probably still hold.
 
 ---
 

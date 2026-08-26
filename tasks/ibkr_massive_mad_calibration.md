@@ -8,11 +8,143 @@ finding; stable+modest volume center but a real fat tail, recommend k_volume≈1
 (substantially disjoint — coexistence earned, not MAD-replaces-yfinance; `materiality_floor_
 tolerance.md`/`variance_floor_clamp.md` are NOT retirable on this evidence). `config.END_DATE`
 extended from `2026-07-31` to `2026-08-21` as part of E6's work; E0-E5 all re-run and re-verified
-against the wider range. **All nine experiments (E0-E8) now done — next is the final
-`findings.md` writeup** (`report.py`, not yet built).
+against the wider range. **All nine experiments (E0-E8) done, `report.py` unblocked, `findings.md`
+rebuilt (2026-08-26).** B1-B3 (blocking) and B7 (a real bug B2 depended on) are resolved — see
+"Pre-report blockers, resolved" immediately below. B4-B6/B8 remain open, non-blocking follow-ups.
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
+
+---
+
+## Pre-report blockers, resolved (2026-08-26)
+
+Review of the E0–E8 status notes found B1–B3 blocking `report.py`; B4–B6 change what
+findings says; B7–B8 are corrections. All four (B1, B2, B3, B7) below are now resolved
+and reflected in `results/ibkr_massive_mad/findings.md` (rebuilt) and, for B7, in
+`.exp/validation/overlap_validation.py` (fixed and re-run). Nothing here invalidates
+E0–E2. B4–B6 and B8 remain open, non-blocking (see below).
+
+### B1 — "k=3" names two different thresholds — RESOLVED, not a bug
+
+Verified directly against the warehouse (own-threshold flag rate per month, and August's
+conditional MAD vs the full-range pooled MAD E4 uses): E4's ~1.1–1.4% and E5's 5.6–8.4%
+were never meant to be the same number — E4 pools conditional MAD over the full 8-month
+range, E5 deliberately recalibrates on August alone and freezes that. August's own
+per-field conditional MAD (3.6–4.8e-6) is ~1.4–2.1x smaller than the full-range pooled
+MAD (4.7–7.7e-6), which alone would tighten the band. But the internal-consistency worry
+(July's own MAD ~2x August's, yet July and August land at nearly the same fixed-threshold
+flag rate, 5.68% vs 5.60%) is real and has a second, independent cause: **August 2026 is
+itself an atypically fat-tailed month relative to its own scale, not just a smaller-scale
+one.** Evaluated self-referentially (each month against its own threshold), August flags
+5.60% of its own bars; April–July flag only 0.86–1.40% of their own bars. Both effects
+(tighter absolute threshold + August's own heavier relative tail) push every month's
+fixed-threshold flag rate up together, which is why July and August converge under the
+shared August threshold despite differing "typical" scale. **The flat verdict itself is
+unaffected** (a claim about trend, not absolute level — Jan is still neither highest nor
+lowest), but the 5.6–8.4% absolute numbers are now correctly attributed to calibrating on
+an atypical month, not treated as a stable property of the underlying disagreement (which,
+checked month-by-month, actually ranges 0.86%–18.1% by each month's own scale). Full
+writeup: `findings.md` section 4.
+
+### B2 — `k` was being chosen against the wrong constraint — RESOLVED
+
+Confirmed: E4 already showed spend is negligible everywhere in the grid, so the gate's
+stated "intersection of quality and spend" collapses to quality alone, and Pass 2 being
+manual/deliberate means the real constraint is human review capacity, which nothing in
+E0–E8 quantifies. `findings.md` section 3 now states `k=3.0` explicitly as a
+review-capacity choice, not a spend-driven one. **The original recall-first case for
+`k=1` (84.7% recall at 50.4% precision) does not survive** — see B7: that 50.4% precision
+figure was wrong. Corrected, `k=1`'s precision is ~4.6% (93 genuine hits in 2,016 field
+flags, roughly 1 in 22), which makes `k=3.0`'s 82.7% precision / 6.8% recall tradeoff the
+stronger pick on the numbers actually available, not just the convenient one. Full table:
+`findings.md` section 3.
+
+### B3 — The headline finding was missing from the document — RESOLVED
+
+`findings.md`'s "Open questions and escalations" section now leads with it as item 1: the
+pre-overlap historical period is roughly an order of magnitude less protected than the
+whistleblower-covered period (MAD band catches only ~6.8% of what yfinance catches on the
+overlap window), and Databento cannot close that gap since it's only ever invoked on bars
+the band already flagged. Framed explicitly as a capability bound on the whole backfill,
+not an E8 footnote — flagged as something `tasks/retroactive_revision.md`'s scope should
+reflect, not just note.
+
+### B7 — E6 precision non-monotonic at k=2 — RESOLVED, real bug found and fixed
+
+Root cause: `overlap_validation.py`'s "decisive" precision proxy computed its `typical`
+yfinance-deviation baseline as a plain median over *all* triple-overlap (bar, field)
+instances. 82–89% of those are exact ties (yfinance matches one candidate to the cent, a
+byproduct of E6's own float32-rounding fix), so the median silently collapsed to exactly
+`0.0` for every field — not "near zero," exactly zero. With `typical=0.0`, "decisive"
+silently degenerated to "closer deviation is an exact tie AND farther deviation is any
+nonzero value" instead of a real noise-scaled threshold, which is what produced the
+originally-reported non-monotonic curve (50.4% / 38.2% / 82.7% at k=1/2/3). **Fixed** by
+using the conditional (nonzero-only) median instead — the same convention this task
+already uses for conditional MAD elsewhere, for the same reason (majority-zero point
+mass). Corrected curve (monotonic through k=3, per E6's now-fixed `e6_validation.parquet`):
+4.6% / 30.6% / 82.7% / 75.5% / 75.0% / 73.5% / 70.4% / 75.0% / 76.9% / 76.9% at
+k=1/2/3/4/5/6/8/10/15/20. k=3's own number happens to be unchanged; k=1 and k=2 were both
+substantially wrong. `ruff`/`pytest` clean after the fix (391 passed).
+
+### B4 — E6b's result undercuts E6's precision proxy
+
+`im_my = −0.927` says Massive's deviation dominates both difference series on
+disagreement bars — equivalently, yfinance sits close to IBKR on exactly those bars.
+That is fine for the question E6b asked (no shared upstream with Massive) and the
+"not circular" conclusion stands.
+
+But E6's precision proxy counts bars where yfinance sides decisively with *one*
+provider. If yfinance tracks IBKR on the bars being scored, then 82.7% precision
+substantially measures yfinance–IBKR affinity rather than which provider was right.
+
+**Action:** report the sided-with-IBKR vs sided-with-Massive split among precision-
+positive bars. If lopsided toward IBKR, discount the proxy and weaken the framing —
+E6b's own instruction ("if E6b shows shared upstream, weaken the framing further")
+applies here in a direction it did not anticipate.
+
+### B5 — E6b has an unexploited three-cornered-hat solution
+
+E6b reports `massive−yfinance` conditional MAD at 9.46e-6 and `ibkr−massive` at
+4.53e-6, but never reports `ibkr−yfinance`.
+
+With all three pairwise dispersions and three providers, **per-provider error variance
+becomes identifiable** — the standard three-clock solve. On the overlap window this
+converts `preferredProvider = ibkr` from a stated belief into a derived claim, which
+is a question this project has carried unresolved since the two-provider era. The
+−0.927 already hints the answer is that Massive carries the larger share.
+
+Cheap: one more dispersion from data already loaded in `.exp/validation/`. Scope note:
+the result holds for the overlap window only and inherits B4's caveat if yfinance and
+IBKR turn out to be less independent than assumed.
+
+### B6 — float32 may have contaminated production, not just this experiment
+
+E6 scopes the yfinance float32 rounding artifact to a follow-up issue. But
+`provider_pair_disagreement` stddev has been accumulating over yfinance values
+carrying sub-cent artifact noise for as long as that ingest path has existed.
+
+That makes it a possible **invalidation of existing production Welford state**, not
+only a new bug to file. Check whether stored stddev needs recomputation after the
+ingest fix, and note the interaction with E6's other observation that
+`materiality_floor` is currently empty/0 on this DB.
+
+### B7 — E6 precision is non-monotonic at k=2
+
+50.4% (k=1) → 38.2% (k=2) → 82.7% (k=3). Precision should rise as the band tightens.
+At n=304 field flags this is not sample noise. Suspect the decisive-multiple logic or
+a per-field vs. per-bar counting inconsistency. Fix before the table is published.
+
+### B8 — E7's `k_volume ≈ 18.8` is a quantile, not a MAD multiple
+
+It was derived by inverting to a 1.5% target flag rate via empirical percentile. At
+that multiplier the 1.4826 scaling carries no distributional meaning. State it as an
+empirical quantile of the log-ratio distribution — that is more honest and more
+directly reusable than a multiplier that only looks like the price band's `k`.
+
+**RESOLVED, same pass as B1-B3/B7**: `findings.md` section 3 now states this explicitly
+— "an empirical quantile of the log-ratio distribution ... not a MAD multiple in the same
+sense as the OHLC k."
 
 ---
 
@@ -729,5 +861,12 @@ Open questions and anything that escalated go at the top, not the bottom.
 - Adjustment dimension, if E2 outcome 2.
 - Retirement review of `materiality_floor_tolerance.md` / `variance_floor_clamp.md`,
   scoped to the historical period only, if E8 says replace.
+- **yfinance float32 precision loss in the production ingest/staging path** (B6), plus
+  an assessment of whether accumulated `provider_pair_disagreement` stddev needs
+  recomputation once fixed.
+- **Per-provider error attribution via three-cornered hat** (B5), if the overlap-window
+  solve proves informative — this is the path to making `preferredProvider` a derived
+  claim rather than a stated belief.
 - Rolling `k` recalibration against the refreshing yfinance window, at the cadence
-  E6 recommends.
+  E6 recommends. Belongs in quant-scratch — recurring, runs on a refreshing window,
+  needs only flag rates.

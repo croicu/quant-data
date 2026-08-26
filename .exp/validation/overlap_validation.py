@@ -101,6 +101,21 @@ def _conditional_mad_scaled(d_values: np.ndarray) -> float:
     return MAD_SCALE * mad
 
 
+def _conditional_median(values: pd.Series) -> float:
+    """Median restricted to nonzero observations -- same "conditional" convention as
+    `_conditional_mad_scaled` above, for the same reason: 82-89% of pooled yfinance-vs-candidate
+    deviations are exact ties (yfinance matches one candidate to the cent), so a plain median over
+    all instances collapses to exactly 0.0 for every field (confirmed live, 2026-08-26 pre-report
+    review). That degenerate 0.0 silently changed what "decisive" meant -- with typical=0, decisive
+    reduced to "closer deviation is an exact tie, farther deviation is any nonzero value" rather
+    than a real noise-scaled threshold, which is what produced E6's originally-reported
+    non-monotonic precision curve (50.4% -> 38.2% -> 82.7% at k=1/2/3)."""
+    nonzero = values[values != 0]
+    if len(nonzero) == 0:
+        return 0.0
+    return float(nonzero.median())
+
+
 def _pairwise_d(a: pd.Series, b: pd.Series) -> pd.Series:
     reference = (a + b) / 2.0
     return (a - b) / reference
@@ -165,7 +180,7 @@ def run_for_ticker(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         reference = (ibkr_col + massive_col) / 2.0
         dev_ibkr = (yf_col - ibkr_col).abs() / reference
         dev_massive = (yf_col - massive_col).abs() / reference
-        typical = float(pd.concat([dev_ibkr, dev_massive]).median())
+        typical = _conditional_median(pd.concat([dev_ibkr, dev_massive]))
         typical_dev[field_name] = typical
         closer = pd.concat([dev_ibkr, dev_massive], axis=1).min(axis=1)
         farther = pd.concat([dev_ibkr, dev_massive], axis=1).max(axis=1)
