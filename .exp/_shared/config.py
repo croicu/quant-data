@@ -16,15 +16,21 @@ from datetime import date
 TICKERS: list[str] = ["SPY"]
 
 # Widest range of the *frozen* dataset (quant-reconcile deliberately disabled for this range so
-# candidate rows stay unpurged), confirmed live 2026-08-25: ibkr 2025-12-31..2026-07-31 (140,160
-# rows), massive 2026-01-02..2026-07-31 (133,146 rows). Intentionally asymmetric at the start --
-# ibkr's extra day is exactly the kind of gap E0 exists to surface, not an input error to correct.
-# Deliberately excludes a handful of stray rows dated 2026-08-03/2026-08-10 (1-2 rows per provider
-# each) -- confirmed these are ordinary same-day pipeline activity outside the frozen window
-# (the big backfill's own reconcile job is disabled, but small routine jobs for recent dates keep
-# running), not part of the dataset this task is measuring.
+# candidate rows stay unpurged). Originally 2025-12-31..2026-07-31; extended to 2026-08-21 on
+# 2026-08-25 (repo owner's explicit request) specifically to widen E6's overlap window with
+# yfinance, which had rolled forward past the original END_DATE on its own trailing-30-day
+# window -- ran quant-ingest + quant-stage for SPY/ibkr+massive over 2026-08-01..2026-08-21
+# (deliberately not quant-reconcile, same reasoning as the original backfill: confirmed live
+# first that no quant_schedule job was enabled, so nothing would race in and purge these new
+# staging rows). Confirmed live post-extension: ibkr 2025-12-31..2026-08-21 (154,560 rows, 172
+# distinct days), massive 2026-01-02..2026-08-21 (146,272 rows, 170 distinct days) -- both now
+# span the full range with no gap (the old stray 2026-08-03/2026-08-10 rows merged into the
+# continuous run). ibkr's extra day at the start is exactly the kind of gap E0 exists to surface,
+# not an input error to correct. E0-E6 were originally calibrated against the 2026-07-31 cutoff;
+# rerun after this extension, see each experiment's own status note in the task file for any
+# resulting changes.
 START_DATE: date = date(2025, 12, 31)
-END_DATE: date = date(2026, 7, 31)
+END_DATE: date = date(2026, 8, 21)
 
 CANDIDATE_PROVIDERS: tuple[str, str] = ("ibkr", "massive")
 
@@ -96,6 +102,7 @@ E4_G_GRID_MINUTES: list[int] = [5, 15, 60]
 # own stated rate; decimal GB (1e9 bytes), Databento's own convention.
 DATABENTO_OHLCV_1M_BYTES_PER_RECORD: int = 56
 DATABENTO_PRICE_PER_GB: float = 35.00
+
 # E5 (stationarity): fixed k applied to the band calibrated on the most recent month, per that
 # section's method. Production's own default (quant_data._internal.shared.settings.
 # DEFAULT_RECONCILE_K) -- E3/E4 already anchored their own reporting to this value, so it's the
@@ -107,3 +114,23 @@ E5_K_FIXED: float = 3.0
 # (e.g. a partial calendar month at the range's edge) rather than silently plotted on equal
 # footing with a full month.
 E5_MIN_BARS_FOR_FULL_CONFIDENCE: int = 5000
+
+# E6 (semi-labeled validation): the whistleblower providing the "overlap month". Widened
+# 2026-08-25 (repo owner's request, see END_DATE's own comment) from 5 to 26 real days
+# (2026-07-27..2026-08-21, yfinance's own trailing-30-day window intersected with
+# START_DATE/END_DATE) -- still not a full month, but no longer the thin 5-day placeholder this
+# task's data-prep phase originally shipped with.
+WHISTLEBLOWER_PROVIDER: str = "yfinance"
+
+# Precision proxy's "decisive" threshold: a flagged (bar, field) counts as yfinance deciding the
+# discrepancy (not sitting as noise between the two candidates) when yfinance's deviation from the
+# farther candidate exceeds this multiple of yfinance's own typical (median) deviation from the
+# ibkr/massive midpoint on ordinary (non-flagged) bars, AND its deviation from the closer candidate
+# is within that same typical baseline. Task's own instruction: "a configured multiple ... record
+# the definition."
+E6_DECISIVE_MULTIPLE: float = 3.0
+
+# E6b (independence check): Massive-yfinance's dispersion counts as "materially tighter" than both
+# ibkr-yfinance's and ibkr-massive's own dispersions (suggesting a shared upstream) when it's at
+# least this many percent smaller than both.
+E6B_SHARED_UPSTREAM_MARGIN_PCT: float = 30.0

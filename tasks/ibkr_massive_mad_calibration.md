@@ -1,10 +1,12 @@
 # Task: IBKR/Massive MAD Calibration Experiment
 
-**Status:** E0 done (gate passed); E1 done (lag 0, no correction needed); E2 done (absent, as
-expected for SPY); E3 done (data supports MAD switch, but raw MAD is degenerate — needs a
-materiality floor); E4 done, submitted (PR #77, not yet merged — k→spend exchange rate built on
-"conditional MAD"); E5 done (not rising going back — good result; one unexplained March outlier);
-E6-E8 not started
+**Status:** E0-E5 done and merged (gate passed; lag 0; no adjustment mismatch; MAD switch
+supported but raw-MAD-degenerate; k→spend exchange rate on "conditional MAD"; flat, not rising
+going back). E6 done (recommend k=3.0, now well-supported after the 2026-08-25 overlap-window
+extension to 26 days/7,420 bars — see E6's own status note for the real float32 data-quality
+catch and the E6b independence finding); E7-E8 not started. `config.END_DATE` extended from
+`2026-07-31` to `2026-08-21` same session; E0-E5 all re-run and re-verified against the wider
+range (see each section's "Rerun 2026-08-25" note).
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -160,6 +162,11 @@ be ordinary same-day pipeline activity outside the frozen backfill window, not p
 dataset — excluded by setting `config.END_DATE = 2026-07-31` (not `2026-08-10`, which the earliest
 live check had suggested before this was caught).
 
+**Rerun 2026-08-25 after the range extension to `2026-08-21`** (see E6's status note for why —
+this ran `quant-ingest`+`quant-stage` for real, widening the frozen dataset). Result essentially
+unchanged: 161 trading days, RTH `both` coverage **99.379%** — still passes, `massive_only` still
+never occurs. E0's conclusion holds under the wider range.
+
 ---
 
 ## E1 — Timestamp alignment
@@ -205,6 +212,10 @@ pre/post as two separate facts, not one driving the other. The RTH-vs-pre/post a
 remains unexplained by volume; if revisited, trade count/tick density is a more promising next
 angle than raw volume. Output: `results/ibkr_massive_mad/alignment/volume_correlation.parquet`.
 
+**Rerun 2026-08-25 after the range extension to `2026-08-21`**: essentially unchanged. Lag 0 still
+wins everywhere with the same clear-spike margins; volume hypothesis still rejected (R² 0.0007 for
+high, 0.0024 for low — both still ~0). E1's conclusions hold under the wider range.
+
 ---
 
 ## E2 — Adjustment mismatch
@@ -242,6 +253,9 @@ those do split, and E2's method/output (the ratio-series plot, the rational-mult
 stays available unchanged for that case. `ibkr` method is `TRADES` (raw/unadjusted) throughout,
 as pinned since E0. Output: `results/ibkr_massive_mad/adjustment/close_ratio_by_day.parquet`,
 `spy_ratio_series.png` (flat line at 1.0, no jumps visible).
+
+**Rerun 2026-08-25 after the range extension to `2026-08-21`**: unchanged — still exactly 1.0 on
+every one of 160 trading days, 0 deviating days.
 
 ---
 
@@ -299,6 +313,10 @@ per this section's own note, not resolved here.
 
 Output: `results/ibkr_massive_mad/dispersion/sigma_vs_mad.parquet` (pooled `ALL` row plus one row
 per field, both raw and trimmed estimators).
+
+**Rerun 2026-08-25 after the range extension to `2026-08-21`**: essentially unchanged — σ
+collapses **-92.43%** under trimming (585,088 pooled observations now), raw MAD still exactly 0.0.
+Same conclusion, same caveat.
 
 ---
 
@@ -361,15 +379,24 @@ hasn't been evaluated. `config.py` gained `DATABENTO_OHLCV_1M_BYTES_PER_RECORD=5
 
 **Per-ticker caveat, flagged when the repo owner pointed out the multi-ticker case**: the figures
 above are for SPY alone — real total spend multiplies by however many tickers actually get
-flagged through this. Live `dim_ticker` check (2026-08-25): the current universe is just **DIA,
-QQQ, SPY** (3 tickers) — the DOG/PSQ/SH/IWM set referenced in older session notes no longer exists
-after a later clean-slate DB reset. Naively scaling SPY's rate by 3 tickers gives roughly
-**$0.0006 – $0.73 total**, still trivial — but that assumes every ticker disagrees at SPY's rate,
-which is **unverified**: DIA/QQQ don't have a frozen unpurged staging window the way SPY does (see
-the Preliminary section), so their own conditional-MAD/flag-rate has never actually been measured.
-Repo owner's explicit call: note this caveat rather than build DIA/QQQ's own frozen datasets to
-measure it for real — the conclusion ("Databento isn't budget-constrained for OHLCV-1m") is robust
-to it either way given how cheap even the worst explored case is.
+flagged through this. Live `dim_ticker` check (2026-08-25): at the time this was written, the
+universe was just DIA, QQQ, SPY (3 tickers); **`dim_ticker` was since reseeded the same session to
+8** (SPY, SH, QQQ, PSQ, DIA, DOG, IWM, RWM, at the repo owner's explicit request) — but that's only
+the dimension row, **none of the 5 newly-added tickers have any actual staging/fact data**, so the
+"unverified for non-SPY tickers" caveat below still applies unchanged. Naively scaling SPY's rate
+by ticker count stays trivial regardless (even ×8 is nowhere near a real constraint) — but that
+assumes every ticker disagrees at SPY's rate, which is **unverified**: no other ticker has a frozen
+unpurged staging window the way SPY does (see the Preliminary section), so their own
+conditional-MAD/flag-rate has never actually been measured. Repo owner's explicit call: note this
+caveat rather than build other tickers' own frozen datasets to measure it for real — the conclusion
+("Databento isn't budget-constrained for OHLCV-1m") is robust to it either way given how cheap even
+the worst explored case is.
+
+**Rerun 2026-08-25 after the range extension to `2026-08-21`**: essentially unchanged. Conditional
+MAD per field: open 7.55e-6, high 4.94e-6, low 4.73e-6, close 7.65e-6 (same `open`/`close` >
+`high`/`low` pattern). At k=3: 2,030 flagged (1.388%, up slightly from 1.106% — expected, more
+data), billing 2,436/4,994/24,075 minutes (g=5/15/60). Cost range now **$0.0002 – $0.27/ticker**
+(was $0.0002–$0.24) — same conclusion, spend still negligible everywhere in the grid.
 
 ---
 
@@ -393,30 +420,38 @@ month marked.
 - Cross-reference any inflection against E2's step dates before concluding it's a
   reconstruction difference rather than an unhandled corporate action.
 
-**Status: done — NOT rising going back (good result), but not perfectly flat either.** Run:
-`.exp/stationarity/monthly_flag_rate.py`. Ticker: SPY. Band calibrated on the most recent month
-(**2026-07**) using the same conditional-MAD basis as E4, `k` fixed at **3.0** (production's
-default — E3/E4's own reference point; revisit if E6 recommends a different `k`), then applied
-unchanged to each earlier month. December 2025 (the frozen range's first day, `2025-12-31`)
-produces zero lag-0-joined bars at all — `massive` doesn't start until `2026-01-02` (E0's own
-finding) — so it can't appear in this table; the earliest month measured is `2026-01`.
+**Status: done — flat, no rising-going-back pattern (good result).** Run:
+`.exp/stationarity/monthly_flag_rate.py`. Ticker: SPY. **Superseded numbers below reflect the
+2026-08-25 range extension to `2026-08-21`** (see E6's status note for why) — the original
+July-calibration run (5 months narrower) is kept out of this section entirely rather than left to
+confuse a future read, since the calibration month itself changed and the two runs aren't
+directly comparable point-by-point.
 
-Flag rate across the 7 full months (`2026-01`–`2026-07`, all ≥17.5k bars, no low-sample months):
-0.685% (Jan) → 1.144% (Feb) → **1.917% (Mar, the outlier)** → 0.988% (Apr) → 0.847% (May) → 1.329%
-(Jun) → 0.997% (Jul, calibration month). **The earliest month (Jan) is the lowest rate, not the
-highest** — no systematic temporal-drift pattern, which is the actual question this gate cares
-about: there's no evidence the band degrades further back in history over this range. March is a
-genuine ~2x outlier that doesn't fit a trend story; cross-referenced against E2 (zero step/split
-dates for SPY) — **not explained by an adjustment mismatch**, so it's an open question (real
-March-specific volatility or event? a `massive`-side data quality blip that month?) rather than a
-stationarity failure. Plot: `results/ibkr_massive_mad/stationarity/spy_flag_rate_by_month.png`.
-Output: `results/ibkr_massive_mad/stationarity/monthly_flag_rate.parquet`. `config.py` gained
+Band calibrated on the most recent month (now **2026-08**, a partial month — 13,126 bars, still
+above the 5,000-bar low-sample threshold) using the same conditional-MAD basis as E4, `k` fixed at
+**3.0**, applied unchanged to each earlier month. December 2025 still produces zero lag-0-joined
+bars (`massive` starts `2026-01-02`) so it's absent; 8 months measured, `2026-01`–`2026-08`.
+
+Flag rate across all 8 months (all ≥13k bars, no low-sample months): 7.12% (Jan) → 7.02% (Feb) →
+**8.39% (Mar, highest)** → 6.66% (Apr) → **5.66% (May, lowest)** → 5.98% (Jun) → 5.68% (Jul) →
+5.60% (Aug, calibration month). Notably higher across the board than the pre-extension run (was
+0.7–1.9%) — expected, not a red flag: August's own conditional MAD (the new calibration basis) is
+roughly half of July's, so every month's threshold got tighter and flag rates rose accordingly;
+recalibrating monthly is exactly what E5 tests the safety of, and this shift is why. **The
+earliest month (Jan, 7.12%) is neither the highest nor the lowest** — genuinely flat, no
+systematic temporal-drift pattern; the actual question this gate cares about reads the same as
+before the extension, now on materially more data (8 months vs 7, and every month's own sample
+grew). March remains the relative outlier (~25% above the mean, down from ~2x before — the wider
+range diluted its apparent severity) — still not explained by E2 (zero step/split dates for SPY),
+still an open question, not investigated further. Plot:
+`results/ibkr_massive_mad/stationarity/spy_flag_rate_by_month.png`. Output:
+`results/ibkr_massive_mad/stationarity/monthly_flag_rate.parquet`. `config.py` gained
 `E5_K_FIXED=3.0`, `E5_MIN_BARS_FOR_FULL_CONFIDENCE=5000`.
 
 **Caveat carried from E4's own per-ticker note**: only SPY has been measured here (the only ticker
-with a frozen unpurged window) — this stationarity read doesn't necessarily generalize to DIA/QQQ
-or the other tickers now seeded in `dim_ticker` (SH/PSQ/DOG/IWM/RWM), none of which have been
-run through E0–E5 yet.
+with a frozen unpurged window) — this stationarity read doesn't necessarily generalize to the
+other 7 tickers now seeded in `dim_ticker` (none have any actual staging/fact data, just the
+dimension row).
 
 ---
 
@@ -455,6 +490,71 @@ framing further and say so explicitly in findings.
 
 **Gate:** Pick the recommended k from the intersection of E6 (quality) and E4
 (spend). State both numbers in the recommendation.
+
+**Status: done — recommend k=3.0 (production's existing default), now on a meaningfully wider
+evaluation set.** Run: `.exp/validation/overlap_validation.py`. Ticker: SPY.
+
+**Overlap window — widened 2026-08-25 from 5 days to 26 days, at the repo owner's explicit
+request.** Originally `2026-07-27`–`2026-07-31` (1,952 triple-overlap bars) — flagged since
+data-prep as thin evidence and never resolved. Fixed for real this session: ran `quant-ingest` +
+`quant-stage` (live IBKR Gateway + Massive API calls, real writes to `quant_ingest` and
+`staging_market_data_1min`, deliberately not `quant-reconcile`) for SPY `ibkr`+`massive` over
+`2026-08-01`–`2026-08-21`, after confirming live that no `quant_schedule` job was enabled (so
+nothing would race in and purge the new staging rows), then extended `config.END_DATE` to match.
+**Overlap window is now `2026-07-27`–`2026-08-21`, 7,420 triple-overlap bars** (3.8x wider),
+`n_whistleblower_flagged=616` (3x more). E0–E5 were re-run against the extended range too — see
+each section's own "Rerun 2026-08-25" note; all conclusions held, only E5's absolute numbers
+shifted materially (recalibration month changed from July to August).
+
+**Real data-quality finding, caught before it silently corrupted every number below**: `yfinance`'s
+stored OHLC values carry **float32 rounding artifacts** (e.g. `737.239990234375` instead of
+`737.24`, confirmed by spot-checking raw rows against `ibkr`/`massive`'s clean 2-decimal values) —
+a storage-precision quirk somewhere in the ingest/staging path, not real price noise. Uncorrected,
+this inflated the "typical yfinance deviation" baseline with sub-cent artifact noise and (much more
+seriously) produced a spurious 0.97 naive correlation between `ibkr−yfinance` and
+`massive−yfinance` in E6b (see below). Fixed here by rounding `yfinance`'s fields to cent precision
+before any comparison — **the underlying production `yfinance` ingest/staging path itself still has
+this precision loss; not fixed there, out of scope per this task's Non-goals, worth its own
+follow-up issue.**
+
+**E6 precision/recall by k** (`n_whistleblower_flagged=616`; production tolerance, `k=3.0`, real
+`provider_pair_disagreement` stddev, `materiality_floor` currently empty/0 on this DB):
+
+| k | field flags | precision | recall |
+|---|---|---|---|
+| 1 | 2,016 | 50.4% | 84.7% |
+| 2 | 304 | 38.2% | 20.9% |
+| 3 | 104 | **82.7%** | 6.8% |
+| 4 | 49 | 75.5% | 4.2% |
+| 5–8 | 48→27 | 70–75% | 4.1→1.8% |
+| 10–20 | 20→13 | 75–77% | <1.2% |
+
+**Remarkably close to the 5-day numbers** (k=3 was 84.2%/7.8% before, now 82.7%/6.8% — within
+noise) — reassuring, not a coincidence to dismiss: the original thin-sample read held up under
+3.8x more data. Recall is now much better-measured at low `k` (84.7% at k=1, up from 62.4% —
+smaller samples were understating it). Same shape as before: recall craters fast as `k` rises,
+precision stabilizes 75–83% for `k≥3`. Spend still doesn't discriminate (E4). **Recommending
+k=3.0** stands, now with substantially more confidence than the original pick: `n=616`
+whistleblower-flagged bars over 26 days is real evidence, not the `n=205`/5-day placeholder this
+section used to carry. Still not final — the task's own rolling-recalibration cadence (see "Role
+of yfinance after this task") means this should keep being revisited as more overlap accumulates,
+but it's no longer a low-confidence stopgap.
+
+**E6b — independence check, confirmed on the wider window.** Dispersion test still says **NOT
+tighter** — `massive−yfinance`'s conditional MAD (9.46e-6) isn't smaller than `ibkr−massive`'s
+(4.53e-6). The naive pooled correlation is still a **construction artifact** (still ~0.97,
+mechanically inevitable wherever `ibkr==massive` exactly — see the original finding's explanation,
+unchanged). **Restricting to the 5,831 (bar, field) disagreement instances** (up from 1,264) gives
+essentially the *same* real finding as the 5-day run: `im_my` = **−0.927** (was −0.921), `im_iy` ≈
+−0.006 (was 0.015, still ~none), `iy_my` = 0.380 (was 0.375). **This robustness across a 4.6x
+larger disagreement sample is itself worth noting** — `yfinance` tracking `ibkr` on disagreement
+bars isn't a small-sample fluke, it's a stable, repeatable pattern. Same conclusion as before:
+good news for E6's proxies, not bad — `yfinance`'s vote isn't circular with the `ibkr`/`massive`
+comparison being tested. Output: `results/ibkr_massive_mad/validation/e6_validation.parquet`,
+`e6b_independence.parquet`. `config.py` gained `WHISTLEBLOWER_PROVIDER="yfinance"`,
+`E6_DECISIVE_MULTIPLE=3.0`, `E6B_SHARED_UPSTREAM_MARGIN_PCT=30.0`. `load.py` gained
+`fetch_provider_pair_disagreement_stddev` (new read-only query, reused by future experiments if
+needed).
 
 ---
 
