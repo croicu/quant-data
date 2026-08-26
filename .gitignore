@@ -36,7 +36,13 @@ backups/
 /local/
 
 # .exp/ (tasks/ibkr_massive_mad_calibration.md) output -- specific to the current data pipeline
-# state on this box, not a stable artifact worth version-controlling. The task file's own
-# conclusions/findings get updated by hand instead; results/ is regenerable by rerunning the
-# relevant .exp/ script.
-/results/
+# state on this box, not a stable artifact worth version-controlling; regenerable by rerunning the
+# relevant .exp/ script. Ignored by file type rather than as a whole /results/ directory, so that
+# results/ibkr_massive_mad/findings.md -- the task's own named final deliverable, a synthesized
+# recommendation rather than a per-run byproduct -- stays tracked without needing a negation
+# pattern (git prunes an entire ignored directory's subtree before evaluating any negation nested
+# inside it, so `!/results/.../findings.md` under a bare `/results/` rule silently does nothing --
+# confirmed live with `git check-ignore`; ignoring by extension avoids the problem entirely).
+/results/**/*.parquet
+/results/**/*.png
+/results/ibkr_massive_mad/manifest.json
