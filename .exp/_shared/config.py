@@ -134,3 +134,19 @@ E6_DECISIVE_MULTIPLE: float = 3.0
 # ibkr-yfinance's and ibkr-massive's own dispersions (suggesting a shared upstream) when it's at
 # least this many percent smaller than both.
 E6B_SHARED_UPSTREAM_MARGIN_PCT: float = 30.0
+
+# E7 (volume): log(massive.volume / ibkr.volume)'s per-segment median (center) counts as "stable"
+# across pre/RTH/post when every pair of segment centers is within this many natural-log units of
+# each other (e^1.0 ~= 2.72x -- a coarse bar, since there's no natural materiality scale for a
+# volume-count ratio the way there was for a price relative-difference).
+E7_STABLE_CENTER_SPREAD_MAX: float = 1.0
+
+# ... and counts as "modest" dispersion when the per-segment conditional-MAD-scaled spread (same
+# 1.4826x-MAD convention used throughout this task) is at or below this many natural-log units.
+E7_MODEST_DISPERSION_MAX: float = 2.0
+
+# k grid searched for the recommended volume-band k, if the gate says "stable, modest" -- picks
+# whichever k lands closest to E7_TARGET_FLAG_RATE_PCT, for rough comparability with the price
+# band's own k=3 operating point (E4: ~1.1-1.4% flagged).
+E7_K_GRID: list[float] = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+E7_TARGET_FLAG_RATE_PCT: float = 1.5
