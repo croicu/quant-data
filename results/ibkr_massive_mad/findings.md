@@ -93,6 +93,30 @@ for conditional MAD elsewhere in this task. Corrected precision curve below; k=3
   choice (favoring signal-to-noise for a human reviewer over completeness), not a spend-driven one** -- if
   review capacity is ever large enough to absorb k=1/k=2's noise, recall could be traded back up, but nothing
   here establishes that capacity exists.
+
+**Units mismatch, and a marginal-discovery framing (2026-08-26 second review pass, R2)**: precision above is
+counted per (bar, field) -- e.g. k=3's 104 field flags can exceed its 42 whistleblower-caught *bars* because one bar
+can contribute flags on multiple fields. Read the precision percentages only within a fixed k, never compared
+across the precision/recall columns as if they shared a denominator. On the corrected numbers, k=1 nets 93 genuine
+(bar, field) hits against k=3's 86 -- **only 7 more genuine hits for roughly 19x the review volume (2,016 vs 104
+field flags)** -- a cleaner argument for k=3.0 than either percentage alone.
+
+**Is the precision proxy just measuring yfinance-IBKR affinity, not correctness? (R1/B4) -- checked, not
+disqualifying at k=3.** E6b found yfinance tracks ibkr closely on disagreement bars (`im_my=-0.927`), raising the
+concern that a "decisive" flag might just mean "yfinance agreed with ibkr" rather than genuinely picking the
+correct side. Checked directly: among k=3's 86 decisive field flags, yfinance sides with ibkr on 58.1% (50) and
+with massive on 41.9% (36) -- a real lean toward ibkr, but far from the near-automatic 90%+ split B4's concern
+would predict if the proxy were purely measuring affinity rather than correctness. **The split does widen sharply
+at higher k** (59% at k=1-2, 58% at k=3, rising to 84% at k=8 and 93% at k=10) -- so the affinity concern is real
+and grows at the tail, but at the recommended k=3.0 specifically it is not the dominant driver of the precision
+number. **k=3.0 does not need to be held conditional on further B4 work; the high-k end of the grid should be
+read with more caution than the k=3 recommendation itself.**
+
+**Null baseline for precision (R4)**: the unconditional "decisive" rate over all 29,680 (bar, field) instances in
+the overlap window (not just MAD-flagged ones) is **0.313%** -- the correct like-for-like chance comparator (same
+units as the precision column, unlike the whistleblower's bar-level 8.3% flag rate, which is a different
+denominator). Every k in the grid clears this by a wide margin: even k=1's corrected 4.6% is ~15x the null rate,
+and k=3's 82.7% is ~264x it. **No operating point tested is anywhere near indistinguishable from chance.**
 - **Volume band (E7, separate multiplier, not comparable 1:1 to the OHLC k)**: recommend k_volume =~ 18.784 if a volume band is ever built (hypothetical -- see E7's own caveat; not implemented). This is an empirical
   quantile of the log-ratio distribution (inverted from a 1.5% target flag rate), not a MAD multiple in the same
   sense as the OHLC k -- the 1.4826 scaling that gives MAD its distributional meaning doesn't apply here.
@@ -125,6 +149,22 @@ of calibrating on an atypical month, not a stable property of the underlying ibk
 (checked month-by-month against each month's own threshold) actually varies quite a bit -- 0.86% to 18.1%. A
 future recalibration that lands on a more typical month would likely produce a materially lower absolute flag
 rate than this run did, even though the flat *trend* finding would probably still hold.
+
+**Which month carries the 18.1% figure, and is it estimator noise or a real event? (2026-08-26 second review pass,
+R3) -- it is January, not March**, and it is not noise: checked directly, January's own-threshold rate (18.07%) is
+driven almost entirely by `high`/`low` (1,791 and 1,724 of 18,388 bars, ~9.4-9.7% each) while `open`/`close` barely
+flag at all (63 and 56 bars, ~0.3%). It is also sustained through the whole month, not front-loaded on the dataset's
+first few days (day-by-day range 12.6%-23.1%, first-5-trading-days average 18.8% vs. the remaining 15 days' 17.8%
+-- no onboarding-artifact signature). **This looks like a real, sustained monthly regime difference in `high`/`low`
+agreement, not conditional-MAD sampling noise** (n=18,388 is not a small sample). March's own outlier (still
+unexplained, open question #5) is a separate, smaller anomaly (1.41% own-threshold) and is NOT closed by this --
+that question remains open.
+
+**Consequence for the recalibration-cadence follow-up (section 8)**: because January's elevated tail is real and
+sustained rather than noise, a purely rolling monthly recalibration is genuinely exposed to landing on a month
+like January and inheriting its (real, not spurious) `high`/`low` looseness -- the same mechanism already observed
+with August. This is a real tension with the "monthly recalibration" cadence proposed in section 8, not fully
+resolved here -- see that section's own note.
 
 ---
 
@@ -181,6 +221,15 @@ yfinance's ~30-day rolling window is the only mechanism for recalibrating k goin
 - **Drift trigger**: if a monthly recalibration run's flag rate at the current k moves outside the range
   observed in E5 (5.6%-8.4% across 8 months), treat that as a signal to investigate before
   the next scheduled recalibration, not wait for it.
+
+**Open tension, not resolved here (2026-08-26 second review pass, R3)**: section 4's finding that January's
+elevated own-threshold rate is a real, sustained monthly regime difference (not conditional-MAD sampling noise)
+means a purely rolling single-month calibration is genuinely exposed to inheriting a month's real idiosyncrasy
+(as already observed with both January and August) rather than tracking genuine drift. That pulls toward
+calibrating on the pooled full range instead (E4's basis) for stability -- but pooling also can't detect real
+drift if the underlying disagreement characteristics genuinely shift over time, which is the entire reason E5
+exists. **This is a real design choice between the two E0-E8 already computed, not a bug to fix -- flagged for
+the repo owner rather than decided unilaterally before this cadence is actually built.**
 
 ---
 
