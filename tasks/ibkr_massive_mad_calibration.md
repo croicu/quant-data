@@ -10,7 +10,14 @@ tolerance.md`/`variance_floor_clamp.md` are NOT retirable on this evidence). `co
 extended from `2026-07-31` to `2026-08-21` as part of E6's work; E0-E5 all re-run and re-verified
 against the wider range. **All nine experiments (E0-E8) done, `report.py` unblocked, `findings.md`
 rebuilt (2026-08-26).** B1-B3 (blocking) and B7 (a real bug B2 depended on) are resolved — see
-"Pre-report blockers, resolved" immediately below. B4-B6/B8 remain open, non-blocking follow-ups.
+"Pre-report blockers, resolved" immediately below. B8 resolved in the same pass. **A
+second review pass (2026-08-26) raised R1-R5, all now checked/resolved — see
+"Second review pass" below.** R1's reclassification worry (B4 blocking the `k` choice)
+was checked directly and did NOT hold at k=3.0 (58/42 ibkr/massive split among decisive
+flags, not the near-automatic split the worry predicted) — `k=3.0` stands, not
+conditional on further B4 work. R3 surfaced a genuine unresolved design tension (pooled
+vs. rolling-month calibration) flagged for the repo owner, not decided unilaterally. B4-B6
+remain open, non-blocking.
 **Type:** Experiment (offline analysis, no production code path)
 **Depends on:** One year of ingested IBKR + Massive 1-minute bars already on disk
 **Blocks:** `tasks/retroactive_revision.md`, Massive backfill scope, Databento integration decision
@@ -23,7 +30,13 @@ Review of the E0–E8 status notes found B1–B3 blocking `report.py`; B4–B6 c
 findings says; B7–B8 are corrections. All four (B1, B2, B3, B7) below are now resolved
 and reflected in `results/ibkr_massive_mad/findings.md` (rebuilt) and, for B7, in
 `.exp/validation/overlap_validation.py` (fixed and re-run). Nothing here invalidates
-E0–E2. B4–B6 and B8 remain open, non-blocking (see below).
+E0–E2. B8 is resolved too (see its own note). **A second review pass checked whether B4
+should block the `k` choice specifically (R1) — it does not, at k=3.0** (see R1's
+resolution below). B4–B6 remain open and non-blocking.
+
+Note: B7 appears twice below — once as the resolution and once as the original
+statement. Left as-is deliberately so the original diagnosis stays readable next to what
+it turned out to be.
 
 ### B1 — "k=3" names two different thresholds — RESOLVED, not a bug
 
@@ -87,7 +100,7 @@ mass). Corrected curve (monotonic through k=3, per E6's now-fixed `e6_validation
 k=1/2/3/4/5/6/8/10/15/20. k=3's own number happens to be unchanged; k=1 and k=2 were both
 substantially wrong. `ruff`/`pytest` clean after the fix (391 passed).
 
-### B4 — E6b's result undercuts E6's precision proxy
+### B4 — E6b's result undercuts E6's precision proxy — checked at k=3.0, not blocking (see R1)
 
 `im_my = −0.927` says Massive's deviation dominates both difference series on
 disagreement bars — equivalently, yfinance sits close to IBKR on exactly those bars.
@@ -145,6 +158,88 @@ directly reusable than a multiplier that only looks like the price band's `k`.
 **RESOLVED, same pass as B1-B3/B7**: `findings.md` section 3 now states this explicitly
 — "an empirical quantile of the log-ratio distribution ... not a MAD multiple in the same
 sense as the OHLC k."
+
+---
+
+## Second review pass (2026-08-26, after B1–B3/B7/B8 resolution) — R1-R5 RESOLVED
+
+Review of the resolutions above. B7's root cause is a genuine find — a median
+collapsing to exactly zero on a majority-tie sample is the same failure shape as E3's
+raw MAD, and catching it twice in this task is a good sign about the method. R1 is the
+one that matters; R2–R4 change what `findings.md` should say; R5 is a verification. All
+five checked live against the warehouse; results below. `findings.md` section 3
+(R1/R2/R4), section 4 (R3), and section 8 (R3's tension) all updated to match.
+
+### R1 — B2's resolution depends on B4, which is filed non-blocking — CHECKED, not blocking at k=3
+
+Verified directly: among k=3's 86 decisive field flags, yfinance sides with `ibkr` on
+58.1% (50) and `massive` on 41.9% (36). That's a real lean toward `ibkr` — not nothing —
+but far short of the near-automatic 90%+ split the "decisive fires near-automatically"
+worry in R1 would predict if the proxy were purely measuring yfinance–IBKR affinity
+rather than genuine correctness. The lean **does** widen sharply with `k`: 59% at k=1–2,
+58% at k=3, rising to 84% at k=8 and 93% at k=10 — so B4's concern is real and gets worse
+at the tail of the grid, but at the recommended k=3.0 specifically it is not the
+dominant driver of the 82.7% number. **`k=3.0` does not need to be held conditional on
+further B4 work.** B4 stays open as a general follow-up (its own three-cornered-hat
+angle, R5's own note about B7 mirroring E3's raw-MAD failure shape) but is *not*
+reclassified as blocking — the specific worry motivating that reclassification didn't
+hold up at the operating point actually recommended. The high-k end of the grid (k≥8)
+should be read with more caution than k=3 itself.
+
+### R2 — The two proxies now disagree about `k=1`; picking one is not resolving it — RESOLVED
+
+Confirmed: precision is counted per (bar, field), recall per bar — different
+denominators, not an error. `findings.md` section 3 now states this explicitly and adds
+the marginal-discovery framing: k=1 nets 93 genuine (bar, field) hits against k=3's 86 —
+**only 7 more genuine hits for ~19x the review volume (2,016 vs 104 field flags)** — a
+cleaner, unit-consistent argument for k=3.0 than comparing the precision percentages
+directly.
+
+### R3 — B1's real consequence isn't drawn out, and it contradicts a follow-up — INVESTIGATED, not fully resolved (see below)
+
+**The 18.1% figure is January, not March** — checked directly. It is not conditional-MAD
+sampling noise: January's own-threshold rate (18.07%, n=18,388) is driven almost
+entirely by `high`/`low` (~9.4–9.7% each) while `open`/`close` barely flag (~0.3% each),
+and it is sustained through the whole month (day range 12.6%–23.1%, first-5-days average
+18.8% vs. the rest at 17.8% — no onboarding-artifact front-loading). **This looks like a
+real, sustained monthly regime difference in `high`/`low` agreement, not an estimator
+noise artifact** — the opposite of R3's original hypothesis ("conditional MAD is a noisy
+estimator of a quantity whose tail is actually stable"). March's own outlier (open
+question #5, findings.md) is a separate, smaller anomaly (1.41% own-threshold) and is
+**NOT** closed by this — that question stays open.
+
+Because January's elevated tail is real rather than noise, the tension R3 raised doesn't
+resolve cleanly in either direction: a rolling monthly recalibration is genuinely exposed
+to landing on an atypical-but-real month (as already seen with both January and August)
+and inheriting its real, non-spurious looseness — but pooling over the full range can't
+detect genuine drift either, which is the entire reason E5 exists in the first place.
+**This is a real design choice between the two calibration bases E0-E8 already computed
+(pooled vs. rolling-month), not a bug — left for the repo owner to decide before the
+recalibration-cadence follow-up (Pending Tasks) is actually built, rather than picked
+unilaterally here.** `findings.md` sections 4 and 8 both state the tension explicitly.
+
+### R4 — Precision has no null baseline — RESOLVED, and the naive 8.3% baseline was itself wrong
+
+Computed the correct like-for-like comparator: the unconditional "decisive" rate over
+*all* 29,680 (bar, field) instances in the overlap window (not just MAD-flagged ones) is
+**0.313%** — not the ~8.3% naively guessed in the original R4 note (which used the
+whistleblower's bar-level flag rate, a different denominator than precision's per-field
+one, the same units mismatch R2 flags). Every k in the grid clears the *correct* 0.313%
+baseline by a wide margin: k=1's corrected 4.6% is ~15x it, k=3's 82.7% is ~264x it. **No
+operating point tested is anywhere near indistinguishable from chance** — k=1 is not
+below chance, contrary to what R4 worried might be the case.
+
+### R5 — Verify the B7 fix propagated — CONFIRMED, genuine, not a coincidence
+
+Checked field-by-field at k=3: the decisive (bar, field) set under the fixed
+(conditional-median) definition and the buggy (plain-median, typical=0) definition is
+**exactly identical** — 86/104 both ways, zero mismatches in any field among the flagged
+set. This is for the reason expected, not coincidence: at k=3 every flagged difference is
+large enough that "closer ≤ typical" resolves the same way whether `typical` is 0.0 or
+the real ~6.5e-6 conditional median — the boundary case where the bug and the fix would
+diverge only bites at smaller, near-tie differences, which k=3's threshold already
+excludes. The fix is genuinely propagated, confirmed by mechanism, not just by an
+unchanged number.
 
 ---
 
