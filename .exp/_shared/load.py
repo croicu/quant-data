@@ -91,3 +91,30 @@ def fetch_staging_rows(connection: psycopg.Connection, ticker: str, providers: t
         rows = cursor.fetchall()
 
     return pd.DataFrame(rows, columns=STAGING_COLUMNS)
+
+
+def fetch_provider_pair_disagreement_stddev(connection: psycopg.Connection, ticker: str, provider: str) -> dict[str, float]:
+    """The real, currently-calibrated Welford stddev per field for (provider, ticker) from
+    provider_pair_disagreement -- production's own live measurement of that candidate's
+    disagreement against the whistleblower (yfinance), not a value this module computes itself.
+    Used by E6's recall proxy to faithfully reproduce "the existing yfinance whistleblower"'s real
+    flag decision (reconcile.algorithm._agrees_within_tolerance), not a redefinition of it.
+
+    Read-only: a plain SELECT, same as fetch_staging_rows.
+    """
+    query = """
+        SELECT f.name AS field, d.stddev
+        FROM provider_pair_disagreement d
+        JOIN dim_provider p ON p.provider_id = d.provider_id
+        JOIN dim_ticker t ON t.ticker_id = d.ticker_id
+        JOIN dim_field f ON f.field_id = d.field_id
+        WHERE p.name = %s AND t.ticker = %s
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query, (provider, ticker.upper()))
+        rows = cursor.fetchall()
+
+    result = {}
+    for field_name, stddev in rows:
+        result[field_name] = float(stddev)
+    return result
