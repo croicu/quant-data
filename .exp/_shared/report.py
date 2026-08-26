@@ -123,7 +123,11 @@ def _fmt_pct(value, digits: int = 2) -> str:
     return f"{value:.{digits}f}%"
 
 
-def build_findings_markdown(manifest_data: dict, shortlist_by_ticker: dict[str, pd.DataFrame]) -> str:
+def build_findings_markdown(
+    manifest_data: dict,
+    shortlist_by_ticker: dict[str, pd.DataFrame],
+    e6_validation_by_ticker: dict[str, pd.DataFrame],
+) -> str:
     experiments = manifest_data["experiments"]
     e0 = experiments["join_integrity"]
     e1 = experiments["alignment"]
@@ -146,20 +150,30 @@ def build_findings_markdown(manifest_data: dict, shortlist_by_ticker: dict[str, 
     # --- Open questions / escalations, at the top per the task's own instruction ---
     lines.append("## Open questions and escalations (read this first)")
     lines.append("")
-    lines.append("1. **Real production data-quality bug found mid-task, not yet fixed there**: `yfinance`'s stored OHLC")
+    e8v0 = experiments["coexistence"]["verdicts"][tickers[0]]
+    lines.append("1. **Headline finding: the historical (pre-overlap) period is roughly an order of magnitude less protected")
+    lines.append("   than the whistleblower-covered period, and Databento cannot close that gap.** At the recommended k, the MAD")
+    lines.append(f"   band catches only {round(100 - e8v0['whistleblower_miss_pct'], 1)}% of what the yfinance whistleblower catches on the overlap window")
+    lines.append(f"   (E8: {_fmt_pct(e8v0['whistleblower_miss_pct'], 1)} missed) -- this is not a footnote, it is the actual finding this task exists to")
+    lines.append("   surface. Databento only deepens resolution on bars the band *already* flagged (E4/E9's shortlist); it adds")
+    lines.append("   nothing to sensitivity, since it is never consulted on a bar the band didn't flag in the first place. This")
+    lines.append("   is a capability bound on the entire historical backfill, not just an E8 result -- it should shape")
+    lines.append("   `tasks/retroactive_revision.md`'s scope, not just be noted alongside it.")
+    lines.append("2. **Real production data-quality bug found mid-task, not yet fixed there**: `yfinance`'s stored OHLC")
     lines.append("   values carry float32 rounding artifacts (e.g. `737.239990234375` instead of `737.24`) -- a storage-")
     lines.append("   precision quirk in the ingest/staging path. Worked around locally in E6/E8 (round to cent precision")
-    lines.append("   before comparing); the underlying production path still has it. **Needs its own follow-up issue.**")
-    lines.append("2. **Every number in this document is SPY-only.** `dim_ticker` now has 8 tickers, but only SPY has a frozen")
+    lines.append("   before comparing); the underlying production path still has it. **Needs its own follow-up issue,**")
+    lines.append("   including whether accumulated `provider_pair_disagreement` stddev needs recomputation once fixed.")
+    lines.append("3. **Every number in this document is SPY-only.** `dim_ticker` now has 8 tickers, but only SPY has a frozen")
     lines.append("   unpurged staging window -- none of these recommendations (k=3.0, k_volume, the stationarity/coverage")
     lines.append("   reads) have been verified on any other ticker.")
-    lines.append("3. **E3's raw MAD is exactly 0.0 (degenerate)** -- any production adoption of a MAD-based tolerance MUST")
+    lines.append("4. **E3's raw MAD is exactly 0.0 (degenerate)** -- any production adoption of a MAD-based tolerance MUST")
     lines.append("   pair it with a nonzero floor (`materiality_floor` already exists for this) or it will reject every")
     lines.append("   nonzero disagreement outright. Not optional, not solved here.")
-    lines.append("4. **Two real anomalies remain unexplained**: E1's RTH-vs-pre/post agreement gap (volume hypothesis")
+    lines.append("5. **Two real anomalies remain unexplained**: E1's RTH-vs-pre/post agreement gap (volume hypothesis")
     lines.append("   tested and rejected, R^2~0) and E5's March 2026 flag-rate outlier (not a split/adjustment per E2).")
     lines.append("   Neither blocks the recommendation below, both are worth a closer look if revisited.")
-    lines.append("5. **Structural limitation, true regardless of any experiment's result**: a two-provider band cannot")
+    lines.append("6. **Structural limitation, true regardless of any experiment's result**: a two-provider band cannot")
     lines.append("   detect correlated error (both providers agreeing while both are wrong). This method does not retire")
     lines.append('   `yfinance` -- see "Role of yfinance after this task" in the task file.')
     lines.append("")
@@ -214,6 +228,15 @@ def build_findings_markdown(manifest_data: dict, shortlist_by_ticker: dict[str, 
     # 3. Recommended k and g
     lines.append("## 3. Recommended k and g")
     lines.append("")
+    lines.append("**Correction (2026-08-26 pre-report review)**: E6's precision proxy originally had a real bug -- its `typical`")
+    lines.append("yfinance-deviation baseline was a plain median over *all* triple-overlap (bar, field) instances, but 82-89% of")
+    lines.append("those are exact ties (yfinance matches one candidate to the cent), so the median silently collapsed to exactly")
+    lines.append('0.0 for every field. That degenerate 0.0 changed what "decisive" meant and produced a non-monotonic, unreliable')
+    lines.append("precision curve (originally reported: 50.4% / 38.2% / 82.7% at k=1/2/3). **Fixed** in `.exp/validation/")
+    lines.append("overlap_validation.py` by using the conditional (nonzero-only) median instead -- the same convention already used")
+    lines.append("for conditional MAD elsewhere in this task. Corrected precision curve below; k=3's number happens to be unchanged")
+    lines.append("(82.7%), but k=1 and k=2 were both substantially wrong and are now much lower.")
+    lines.append("")
     for ticker in tickers:
         e6v = e6["verdicts"][ticker]
         e8v = e8["verdicts"][ticker]
@@ -223,15 +246,35 @@ def build_findings_markdown(manifest_data: dict, shortlist_by_ticker: dict[str, 
             f"overlap window (`{e6v['overlap_start']}`..`{e6v['overlap_end']}`), `n_whistleblower_flagged={e6v['n_whistleblower_flagged']}`. "
             f"See `e6_validation.parquet` for the full k sweep."
         )
+        pr = e6_validation_by_ticker[ticker]
+        lines.append("")
+        lines.append("  | k | field flags | precision | recall |")
+        lines.append("  |---|---|---|---|")
+        for _, row in pr.iterrows():
+            lines.append(f"  | {row['k']} | {int(row['n_field_flags'])} | {_fmt_pct(row['precision_pct'], 1)} | {_fmt_pct(row['recall_pct'], 1)} |")
+        lines.append("")
     lines.append(
         "- **E4 spend at k=3, all g**: the whole (k, g) grid costs **$0.0002-$0.27/ticker** for the OHLCV-1m schema -- "
-        "spend does not discriminate between k choices at all; the pick above is driven entirely by E6 quality."
+        "spend does not discriminate between k choices at all."
     )
+    lines.append("- **`k` was NOT actually chosen from an intersection of quality and spend, despite the task's own gate wording**")
+    lines.append("  -- E4 already showed spend is negligible everywhere in the grid, which removes spend from the intersection")
+    lines.append("  entirely. The real binding constraint is **human review capacity**: Pass 2 (acting on a MAD flag) is a manual,")
+    lines.append("  deliberate review step, and nothing in E0-E8 quantifies how many flags a reviewer can actually process. Under")
+    lines.append("  that framing, and now that the precision bug above is fixed, **k=3.0 is the right pick on the corrected")
+    lines.append("  numbers, not just the convenient one**: k=1's 84.7% recall comes at only ~4.6% precision (93 genuine hits")
+    lines.append("  buried in 2,016 field flags -- a reviewer would wade through ~22 flags per real one), while k=3's 6.8% recall")
+    lines.append("  comes at 82.7% precision (86 of 104 field flags genuine). **State `k=3.0` explicitly as a review-capacity")
+    lines.append("  choice (favoring signal-to-noise for a human reviewer over completeness), not a spend-driven one** -- if")
+    lines.append("  review capacity is ever large enough to absorb k=1/k=2's noise, recall could be traded back up, but nothing")
+    lines.append("  here establishes that capacity exists.")
     volume_k = e7["verdicts"][tickers[0]]["exact_k_for_target"]
     lines.append(
         f"- **Volume band (E7, separate multiplier, not comparable 1:1 to the OHLC k)**: recommend k_volume =~ {volume_k} "
-        f"if a volume band is ever built (hypothetical -- see E7's own caveat; not implemented)."
+        f"if a volume band is ever built (hypothetical -- see E7's own caveat; not implemented). This is an empirical"
     )
+    lines.append("  quantile of the log-ratio distribution (inverted from a 1.5% target flag rate), not a MAD multiple in the same")
+    lines.append("  sense as the OHLC k -- the 1.4826 scaling that gives MAD its distributional meaning doesn't apply here.")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -250,7 +293,26 @@ def build_findings_markdown(manifest_data: dict, shortlist_by_ticker: dict[str, 
         lines.append(f"- Flag rate range: {min_rate} - {max_rate}. Trend: **{v['trend_direction']}**.")
     lines.append("")
     lines.append("**Verdict: one global band** -- flat, not rising going back. No time-varying band or hard trust cutoff")
-    lines.append("date needed on this evidence. (See open question #4 above re: the March outlier.)")
+    lines.append("date needed on this evidence. (See open question #5 above re: the March outlier.)")
+    lines.append("")
+    lines.append("**Why this range (5.6-8.4%) reads so much higher than E4's own flag rate at the same k (1.1-1.4%, section 3's")
+    lines.append("budget figures) -- resolved 2026-08-26**: these two numbers are answering different questions and were never")
+    lines.append("meant to match. E4 calibrates its conditional MAD once, pooled over the full 8-month range; E5 deliberately")
+    lines.append("recalibrates on a single month (August) and freezes that. Verified directly against the warehouse: August's own")
+    lines.append("per-field conditional MAD (3.6-4.8e-6) is roughly 1.4-2.1x smaller than the full-range pooled MAD E4 uses")
+    lines.append("(4.7-7.7e-6), which alone would explain a tighter band and a higher rate. But the gap is larger than that ratio")
+    lines.append("predicts, for a second, independent reason: **August 2026 is itself an atypically fat-tailed month relative to")
+    lines.append("its own scale**, not just a smaller-scale one. Evaluated against its *own* threshold (i.e. self-referentially,")
+    lines.append("the way a calibration month always is), August flags 5.60% of its own bars -- April through July, evaluated the")
+    lines.append("same self-referential way, flag only 0.86-1.40% of their own bars. So the August-calibrated fixed threshold is")
+    lines.append("both tighter in absolute terms AND happens to reflect a month with proportionally more large disagreements,")
+    lines.append("and both effects push every month's flag rate up together. **This does not undermine the flat verdict** -- flat")
+    lines.append("is a claim about the fixed threshold not diverging further as you go back in time, which held (Jan, the")
+    lines.append("earliest month, is neither the highest nor lowest) -- but the specific 5.6-8.4% absolute numbers are an artifact")
+    lines.append("of calibrating on an atypical month, not a stable property of the underlying ibkr/massive disagreement, which")
+    lines.append("(checked month-by-month against each month's own threshold) actually varies quite a bit -- 0.86% to 18.1%. A")
+    lines.append("future recalibration that lands on a more typical month would likely produce a materially lower absolute flag")
+    lines.append("rate than this run did, even though the flat *trend* finding would probably still hold.")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -401,7 +463,13 @@ def main() -> int:
         k = experiments["coexistence"]["verdicts"][ticker]["k"]
         shortlist_by_ticker[ticker] = build_databento_shortlist(ticker, conditional_mad_scaled, k)
 
-    findings_markdown = build_findings_markdown(manifest_data, shortlist_by_ticker)
+    e6_validation_path = Path(experiments["validation"]["outputs"][0])
+    e6_validation_all = pd.read_parquet(e6_validation_path)
+    e6_validation_by_ticker = {}
+    for ticker in tickers:
+        e6_validation_by_ticker[ticker] = e6_validation_all[e6_validation_all["ticker"] == ticker].reset_index(drop=True)
+
+    findings_markdown = build_findings_markdown(manifest_data, shortlist_by_ticker, e6_validation_by_ticker)
 
     FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     FINDINGS_PATH.write_text(findings_markdown, encoding="utf-8")
