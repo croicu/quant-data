@@ -8,10 +8,12 @@ from reconcile.algorithm import (
     RESOLUTION_BOUNDARY_FIX,
     RESOLUTION_COMPLETENESS,
     RESOLUTION_FINALIZED,
+    RESOLUTION_HISTORICAL_MAD_AGREEMENT,
     RESOLUTION_UNADJUDICATED,
     ROLE_CANDIDATE,
     ROLE_WHISTLEBLOWER,
     DisagreementStats,
+    FieldMadBand,
     FieldTolerance,
     ProviderBar,
     relative_diffs_for_stats_update,
@@ -162,6 +164,114 @@ def test_unadjudicated_returns_none_when_preferred_provider_did_not_report():
     ]
 
     resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={}, k=3.0, preferred_provider_id=999)
+
+    assert resolution is None
+
+
+def _uniform_mad_band(conditional_mad_scaled: float, k: float) -> dict[str, FieldMadBand]:
+    return {
+        "open": FieldMadBand(conditional_mad_scaled, k),
+        "high": FieldMadBand(conditional_mad_scaled, k),
+        "low": FieldMadBand(conditional_mad_scaled, k),
+        "close": FieldMadBand(conditional_mad_scaled, k),
+    }
+
+
+def test_historical_mad_agreement_promotes_preferred_provider_when_within_band():
+    # tasks/retroactive_revision.md: no whistleblower, but this ticker has a seeded historical MAD
+    # band and the two candidates agree within it -- promotes preferredProvider under its own
+    # resolution_path, not RESOLUTION_UNADJUDICATED.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.001, high=101.001, low=99.001, close=100.501),
+    ]
+
+    resolution = resolve_automatic(
+        bars,
+        FIELD_GROUP_OHLC,
+        windows={},
+        tolerances={},
+        k=3.0,
+        preferred_provider_id=IBKR,
+        mad_bands=_uniform_mad_band(conditional_mad_scaled=1e-5, k=3.0),
+    )
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == IBKR
+    assert resolution.resolution_path == RESOLUTION_HISTORICAL_MAD_AGREEMENT
+
+
+def test_historical_mad_agreement_stays_stuck_when_disagreement_exceeds_band():
+    # Same shape as the unadjudicated regression tests above, but this time a seeded band exists
+    # and the candidates disagree beyond it -- must NOT fall back to blind promotion the way
+    # RESOLUTION_UNADJUDICATED would; stays stuck (Tier 4) for a human to review.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=101.0, high=102.0, low=100.0, close=101.5),
+    ]
+
+    resolution = resolve_automatic(
+        bars,
+        FIELD_GROUP_OHLC,
+        windows={},
+        tolerances={},
+        k=3.0,
+        preferred_provider_id=IBKR,
+        mad_bands=_uniform_mad_band(conditional_mad_scaled=1e-5, k=3.0),
+    )
+
+    assert resolution is None
+
+
+def test_historical_mad_agreement_falls_back_to_unadjudicated_when_band_partially_seeded():
+    # A ticker with a band for only some of the group's fields is treated as unseeded -- falls
+    # back to today's blind-promotion behavior for the whole group, not a partial check.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+    partial_band = {"open": FieldMadBand(1e-5, 3.0), "high": FieldMadBand(1e-5, 3.0)}
+
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={}, k=3.0, preferred_provider_id=MASSIVE, mad_bands=partial_band)
+
+    assert resolution is not None
+    assert resolution.winning_provider_id == MASSIVE
+    assert resolution.resolution_path == RESOLUTION_UNADJUDICATED
+
+
+def test_historical_mad_agreement_defaults_to_unadjudicated_when_no_mad_bands_argument_given():
+    # Backward-compatibility check: every pre-existing call site that doesn't pass mad_bands at all
+    # (the default) must behave exactly as before this parameter was added.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    resolution = resolve_automatic(bars, FIELD_GROUP_OHLC, windows={}, tolerances={}, k=3.0, preferred_provider_id=IBKR)
+
+    assert resolution is not None
+    assert resolution.resolution_path == RESOLUTION_UNADJUDICATED
+
+
+def test_historical_mad_agreement_stays_stuck_with_more_than_two_candidates():
+    # The validated band is a pairwise (exactly two candidates) formula -- a third candidate must
+    # not silently reuse it. Deliberately conservative (stays stuck) rather than falling back to
+    # blind promotion.
+    bars = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(4, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    resolution = resolve_automatic(
+        bars,
+        FIELD_GROUP_OHLC,
+        windows={},
+        tolerances={},
+        k=3.0,
+        preferred_provider_id=IBKR,
+        mad_bands=_uniform_mad_band(conditional_mad_scaled=1e-5, k=3.0),
+    )
 
     assert resolution is None
 

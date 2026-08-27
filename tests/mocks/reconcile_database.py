@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from quant_data._internal.shared.postgres import (
+    CandidatePairMadBandRow,
     DataQualityThresholdRow,
     DisagreementStatsRow,
     FieldGroupRow,
@@ -29,6 +30,7 @@ class FakeReconcileDatabase:
         ingestion_coverage: list[IngestionCoverageRow] | None = None,
         data_quality_thresholds: list[DataQualityThresholdRow] | None = None,
         materiality_floors: list[MaterialityFloorRow] | None = None,
+        candidate_pair_mad_bands: list[CandidatePairMadBandRow] | None = None,
     ) -> None:
         self.providers = providers
         self.field_groups = field_groups
@@ -41,6 +43,7 @@ class FakeReconcileDatabase:
         self.ingestion_coverage = ingestion_coverage if ingestion_coverage is not None else []
         self.data_quality_thresholds = data_quality_thresholds if data_quality_thresholds is not None else []
         self.materiality_floors = materiality_floors if materiality_floors is not None else []
+        self.candidate_pair_mad_bands = candidate_pair_mad_bands if candidate_pair_mad_bands is not None else []
 
         self.fact_reconciliation: list[tuple[int, int, int, int, int, str]] = []
         self.fact_reconciliation_participant: list[tuple[int, int, int, int, int, bool]] = []
@@ -69,6 +72,9 @@ class FakeReconcileDatabase:
 
     def fetch_materiality_floors(self) -> list[MaterialityFloorRow]:
         return list(self.materiality_floors)
+
+    def fetch_candidate_pair_mad_bands(self) -> list[CandidatePairMadBandRow]:
+        return list(self.candidate_pair_mad_bands)
 
     def fetch_whistleblower_accepted_staging_rows(self) -> list[StagingRow]:
         whistleblower_provider_ids: set[int] = set()

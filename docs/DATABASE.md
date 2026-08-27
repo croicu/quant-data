@@ -256,6 +256,17 @@ GRANT SELECT ON materiality_floor TO quant_writer;
 No `quant_reader` grant needed — like `data_quality_thresholds`, this is a purely internal
 reconcile-tuning table, never read via `MarketData`.
 
+Migration `019` (`candidate_pair_mad_band`, `tasks/retroactive_revision.md`) needs `quant_writer`
+to read it (`PostgresDatabase.fetch_candidate_pair_mad_bands`, called once per `quant-reconcile`
+run, same pattern as `materiality_floor` above):
+
+```sql
+GRANT SELECT ON candidate_pair_mad_band TO quant_writer;
+```
+
+No `quant_reader` grant needed here either — same reasoning as `materiality_floor`. Applied live on
+CroicuWS2 (2026-08-26) alongside migrations `019`/`020` themselves.
+
 ## Setting up the `quant_ingest` database
 
 `quant_ingest` (croicu/quant-data#52) is a separate database on the same Postgres instance as

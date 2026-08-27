@@ -444,6 +444,54 @@ under `/local/` to the box:
 
 ## Pending Tasks
 
+- **Historical MAD band (`candidate_pair_mad_band`)** —
+  [issue #85](https://github.com/croicu/quant-data/issues/85), `status:implementation` — branch
+  `retroactive-revision-mad-band`. Production integration of `tasks/ibkr_massive_mad_calibration.md`'s
+  validated E0-E8 findings (`tasks/retroactive_revision.md`'s Brainstorm converged in the same
+  session, then trimmed to a pointer per this file's own convention once the issue existed).
+  **Motivating discovery, checked live against production before any code was written**: of SPY's
+  13,437 already-promoted `fact_reconciliation` rows, 6,736 (50.1%) went through
+  `resolution_path = 'unadjudicated'` — `resolve_automatic()`'s no-whistleblower branch promotes
+  `preferredProvider`'s raw value with zero comparison against the other candidate at all, for the
+  entire historical period before `yfinance`'s ~30-day rolling window can reach. New
+  `candidate_pair_mad_band` table (`ticker_id, field_id, conditional_mad_scaled, k`) — pooled over
+  the full historical range and deliberately fixed, not rolled (per the calibration task's own R3a
+  finding that rolling this value makes drift structurally undetectable). New
+  `_resolve_historical_mad_agreement` tier fires only when no `ACCEPTED` whistleblower exists and
+  this ticker has a fully-seeded band: agreement promotes `preferredProvider` under a new
+  `resolution_path = 'historical_mad_agreement'` (distinct from `'agreement'`, which must not feed
+  `provider_pair_disagreement`'s Welford variance here — there's no whistleblower observation to
+  record); disagreement beyond the band does **not** fall back to blind promotion like
+  `'unadjudicated'` does — stays stuck (Tier 4) for `--finalize`/manual review. `resolve_automatic()`
+  gained an optional `mad_bands` parameter defaulting to `None`, so every pre-existing call site is
+  unaffected. Two design decisions confirmed explicitly with the repo owner rather than assumed:
+  **backfill scope is going-forward only** (the 6,736 existing `unadjudicated` rows are left
+  untouched — re-evaluating already-published `fact_market_data_1min` is a separate, riskier
+  write-path question, deliberately out of scope) and **an unseeded ticker keeps today's blind-
+  promotion behavior** (not "flag everything" — same "ship schema, seed real values once validated"
+  precedent as `materiality_floor`/`data_quality_thresholds`). `migrations/
+  019_add_candidate_pair_mad_band` (new table + widens `fact_reconciliation.resolution_path`'s
+  `CHECK`) and `020_seed_candidate_pair_mad_band_spy` (SPY's own real conditional-MAD values, reused
+  verbatim from `.exp/budget/k_sweep.py`'s already-computed and twice-reviewed output). Volume stays
+  out of scope (rides along with the `ohlc` winner, unchanged); no cross-repo issue (every touched
+  path is internal to `src/reconcile/` and `quant_data._internal`, nothing under `src/quant_data/`'s
+  public surface changed). Implemented and unit-tested: 7 new tests (5 pure-algorithm-level in
+  `tests/unit/test_reconcile_algorithm.py`, 2 end-to-end through `FakeReconcileDatabase` in
+  `tests/unit/test_reconcile_cli.py`, the latter specifically to verify the real `field_id`↔
+  `field_name` wiring and ticker scoping in `reconcile/cli.py`, not just the pure function in
+  isolation) — `ruff`/`pytest` both green (398 passed, up from 391).
+  **Migrations `019`/`020` applied live to CroicuWS2's real `quant_data` database (2026-08-26,
+  repo owner's explicit request)** — verified directly: `candidate_pair_mad_band` holds SPY's 4
+  seeded rows, `fact_reconciliation`'s `CHECK` constraint now includes
+  `'historical_mad_agreement'`. Also granted `quant_writer` `SELECT` on the new table (same
+  precedent as `materiality_floor`'s own grant, `docs/DATABASE.md` updated) — without it
+  `quant-reconcile` would have hit `permission denied` the first time it tried to read the table,
+  since it connects as `quant_writer` in real usage, not `alex`. **The application code itself
+  (`resolve_automatic`'s new tier, `cli.py`'s wiring) is still uncommitted** — the schema exists
+  and is seeded, but nothing consumes it yet until this branch is committed, pushed, and a real
+  `quant-reconcile` run picks it up. Awaiting the repo owner's diff review per this file's "Before
+  committing" rule before that happens.
+
 - **Work-item scheduler (`quant-schedule`)** —
   [issue #68](https://github.com/croicu/quant-data/issues/68), `status:implementation` — branch
   `quant-schedule-cli`. Ad-hoc task: takes a bulk backfill request (one ticker, an inclusive date

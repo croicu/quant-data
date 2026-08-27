@@ -155,6 +155,14 @@ class MaterialityFloorRow:
     floor_type: str
 
 
+@dataclass
+class CandidatePairMadBandRow:
+    ticker_id: int
+    field_id: int
+    conditional_mad_scaled: float
+    k: float
+
+
 class PostgresDatabase:
     """Concrete MarketDataProvider implementation, plus a write path used only by ingest.
 
@@ -772,6 +780,31 @@ class PostgresDatabase:
                     field_id=field_id,
                     floor_value=float(floor_value),
                     floor_type=floor_type,
+                )
+            )
+        return result
+
+    def fetch_candidate_pair_mad_bands(self) -> list[CandidatePairMadBandRow]:
+        """Every seeded per-(ticker, field) pooled conditional-MAD band for the historical
+        (no-whistleblower) period -- small, bulk-fetched once per reconcile run. A (ticker, field)
+        with no row here has no historical MAD band at all, so quant-reconcile falls back to
+        today's unadjudicated blind-promotion behavior for that ticker until it gets one -- see
+        reconcile.algorithm.FieldMadBand and tasks/retroactive_revision.md."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT ticker_id, field_id, conditional_mad_scaled, k FROM candidate_pair_mad_band")
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch candidate_pair_mad_band: {error}") from error
+
+        result: list[CandidatePairMadBandRow] = []
+        for ticker_id, field_id, conditional_mad_scaled, k in rows:
+            result.append(
+                CandidatePairMadBandRow(
+                    ticker_id=ticker_id,
+                    field_id=field_id,
+                    conditional_mad_scaled=float(conditional_mad_scaled),
+                    k=float(k),
                 )
             )
         return result
