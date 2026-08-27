@@ -4,7 +4,15 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from quant_data._internal.shared.postgres import DisagreementStatsRow, FieldGroupRow, FieldRow, IngestionCoverageRow, ProviderRow, StagingRow
+from quant_data._internal.shared.postgres import (
+    CandidatePairMadBandRow,
+    DisagreementStatsRow,
+    FieldGroupRow,
+    FieldRow,
+    IngestionCoverageRow,
+    ProviderRow,
+    StagingRow,
+)
 from quant_data._internal.shared.settings import ReconcileSettings, Settings
 from reconcile import cli
 from reconcile.algorithm import GRADUATION_THRESHOLD_MATCHED_BARS
@@ -52,6 +60,16 @@ def _seed_disagreement_stats(provider_id: int, ticker_id: int, sample_count: int
                 running_m2=running_m2,
             )
         )
+    return result
+
+
+def _seed_candidate_pair_mad_band(ticker_id: int, conditional_mad_scaled: float, k: float) -> list[CandidatePairMadBandRow]:
+    """One row per OHLC field -- candidate_pair_mad_band (tasks/retroactive_revision.md) is keyed
+    (ticker_id, field_id), and resolve_automatic's _has_full_mad_band requires every field in the
+    group to have a row before it engages at all."""
+    result: list[CandidatePairMadBandRow] = []
+    for field in FIELDS:
+        result.append(CandidatePairMadBandRow(ticker_id=ticker_id, field_id=field.field_id, conditional_mad_scaled=conditional_mad_scaled, k=k))
     return result
 
 
@@ -649,6 +667,67 @@ def test_two_candidates_confirmed_absent_whistleblower_resolves_unadjudicated_an
         assert resolution_path == "unadjudicated"
         assert winning_provider_id == IBKR
     assert database.disagreement_stats == stats_before  # Welford untouched
+
+
+def test_historical_mad_band_promotes_via_new_resolution_path_instead_of_unadjudicated():
+    # tasks/retroactive_revision.md: same shape as the unadjudicated test above (confirmed-absent
+    # whistleblower, two already-graduated candidates agreeing), but this ticker also has a seeded
+    # candidate_pair_mad_band -- must resolve via 'historical_mad_agreement', not 'unadjudicated',
+    # and the fetch/field_id-to-field_name wiring in cli.py must actually engage it end-to-end.
+    staging_rows = [
+        _staging_row(IBKR, open=100.0, high=101.0, low=99.0, close=100.5, volume=500),
+        _staging_row(MASSIVE, open=100.0, high=101.0, low=99.0, close=100.5, volume=500),
+    ]
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    disagreement_stats += _seed_disagreement_stats(MASSIVE, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    ingestion_coverage = [IngestionCoverageRow(ticker_id=1, provider_id=YFINANCE, start_date_id=5, end_date_id=15)]
+    mad_bands = _seed_candidate_pair_mad_band(ticker_id=1, conditional_mad_scaled=1e-5, k=3.0)
+    database = FakeReconcileDatabase(
+        PROVIDERS_WITH_MASSIVE,
+        FIELD_GROUPS,
+        staging_rows,
+        fields=FIELDS,
+        disagreement_stats=disagreement_stats,
+        ingestion_coverage=ingestion_coverage,
+        candidate_pair_mad_bands=mad_bands,
+    )
+
+    resolved, stuck = run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"], preferred_provider="ibkr"), finalize=False)
+
+    assert resolved == 1
+    assert stuck == 0
+    for _, _, _, _, winning_provider_id, resolution_path in database.fact_reconciliation:
+        assert resolution_path == "historical_mad_agreement"
+        assert winning_provider_id == IBKR
+
+
+def test_historical_mad_band_leaves_bar_pending_when_candidates_disagree_beyond_band():
+    # Same setup, but the two candidates disagree by more than the seeded band allows -- must NOT
+    # fall back to unadjudicated's blind promotion; stays stuck for --finalize/manual review.
+    staging_rows = [
+        _staging_row(IBKR, open=100.0, high=101.0, low=99.0, close=100.5, volume=500),
+        _staging_row(MASSIVE, open=101.0, high=102.0, low=100.0, close=101.5, volume=500),
+    ]
+    disagreement_stats = _seed_disagreement_stats(IBKR, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    disagreement_stats += _seed_disagreement_stats(MASSIVE, ticker_id=1, sample_count=100, running_mean=0.0, running_m2=0.000064)
+    ingestion_coverage = [IngestionCoverageRow(ticker_id=1, provider_id=YFINANCE, start_date_id=5, end_date_id=15)]
+    mad_bands = _seed_candidate_pair_mad_band(ticker_id=1, conditional_mad_scaled=1e-5, k=3.0)
+    database = FakeReconcileDatabase(
+        PROVIDERS_WITH_MASSIVE,
+        FIELD_GROUPS,
+        staging_rows,
+        fields=FIELDS,
+        disagreement_stats=disagreement_stats,
+        ingestion_coverage=ingestion_coverage,
+        candidate_pair_mad_bands=mad_bands,
+    )
+
+    resolved, stuck = run_reconciliation(database, _settings(providers=["yfinance", "ibkr", "massive"], preferred_provider="ibkr"), finalize=False)
+
+    assert resolved == 0
+    assert stuck == 1
+    assert database.fact_reconciliation == []
+    assert (1, 10, 20, OHLC) in database.pending_manual_resolution
 
 
 def test_second_candidate_graduates_on_already_graduated_ticker():

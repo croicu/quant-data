@@ -23,6 +23,7 @@ from reconcile.algorithm import (
     ROLE_CANDIDATE,
     ROLE_WHISTLEBLOWER,
     DisagreementStats,
+    FieldMadBand,
     FieldTolerance,
     ProviderBar,
     batch_stats,
@@ -475,6 +476,24 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
     for floor_row in database.fetch_materiality_floors():
         floors_by_key[(floor_row.provider_id, floor_row.ticker_id, floor_row.field_id)] = floor_row
 
+    # tasks/retroactive_revision.md: pooled, fixed per-(ticker, field) historical MAD band, keyed
+    # by field *name* (not field_id) to match reconcile.algorithm.FieldMadBand's own dict shape --
+    # a ticker missing from this dict, or missing any one of its fields, has no band at all and
+    # resolve_automatic falls back to today's unadjudicated behavior for it (see
+    # _has_full_mad_band).
+    field_names_by_id: dict[int, str] = {}
+    for field_name, field_id in field_ids_by_name.items():
+        field_names_by_id[field_id] = field_name
+
+    mad_bands_by_ticker: dict[int, dict[str, FieldMadBand]] = {}
+    for mad_band_row in database.fetch_candidate_pair_mad_bands():
+        field_name = field_names_by_id.get(mad_band_row.field_id)
+        if field_name is None:
+            continue
+        if mad_band_row.ticker_id not in mad_bands_by_ticker:
+            mad_bands_by_ticker[mad_band_row.ticker_id] = {}
+        mad_bands_by_ticker[mad_band_row.ticker_id][field_name] = FieldMadBand(conditional_mad_scaled=mad_band_row.conditional_mad_scaled, k=mad_band_row.k)
+
     staging_rows = database.fetch_staging_rows_for_reconciliation(settings.providers, candidate_provider_names)
 
     bars: dict[tuple[int, int, int], list[StagingRow]] = {}
@@ -715,7 +734,13 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
                         tolerances[provider.provider_id] = field_tolerances
 
                 resolution = resolve_automatic(
-                    provider_bars, field_group_name, windows_by_bar_key[bar_key], tolerances, settings.reconcile.k, preferred_provider_id
+                    provider_bars,
+                    field_group_name,
+                    windows_by_bar_key[bar_key],
+                    tolerances,
+                    settings.reconcile.k,
+                    preferred_provider_id,
+                    mad_bands_by_ticker.get(ticker_id),
                 )
 
                 if resolution is None:

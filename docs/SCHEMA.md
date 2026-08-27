@@ -84,6 +84,15 @@ invalid) rather than either tier's silent no-op. See
 `quant_ingest` (croicu/quant-data#52) and `quant_schedule` (croicu/quant-data#66) are each a
 **separate database**, not a `migrations/` entry against `quant_data` — see their own "`quant_ingest`
 database"/"`quant_schedule` database" sections below.
+`019_add_candidate_pair_mad_band` added a per-(ticker, field) pooled, fixed conditional-MAD band on
+the `ibkr`/`massive` candidate-pair difference series — `quant-reconcile`'s stand-in adjudicator for
+the historical period `yfinance`'s ~30-day rolling window can't reach (no `ACCEPTED` whistleblower
+available at all), and widened `fact_reconciliation.resolution_path`'s `CHECK` with a fifth
+automatic-pass value, `'historical_mad_agreement'`. Built on `tasks/ibkr_massive_mad_calibration.md`'s
+validated E0-E8 findings and integrated per `tasks/retroactive_revision.md` — see that table's own
+section below for the full design and the concrete gap it closes (roughly half of `SPY`'s current
+`fact_market_data_1min` rows were promoted with zero cross-provider check at all).
+`020_seed_candidate_pair_mad_band_spy` seeded it with `SPY`'s own already-validated values.
 
 ## `dim_ticker`
 
@@ -285,23 +294,28 @@ change.
 | `time_id` | `INT NOT NULL` | FK → `dim_time` |
 | `field_group_id` | `INT NOT NULL` | FK → `dim_field_group` |
 | `winning_provider_id` | `INT NOT NULL` | FK → `dim_provider` |
-| `resolution_path` | `TEXT NOT NULL` | One of `'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'` / `'finalized'` / `'manual_override'`, enforced by a `CHECK` constraint. `'unadjudicated'` added in `017_add_unadjudicated_resolution_path` |
+| `resolution_path` | `TEXT NOT NULL` | One of `'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'` / `'historical_mad_agreement'` / `'finalized'` / `'manual_override'`, enforced by a `CHECK` constraint. `'unadjudicated'` added in `017_add_unadjudicated_resolution_path`; `'historical_mad_agreement'` added in `019_add_candidate_pair_mad_band` |
 | `resolved_at` | `TIMESTAMP` | Defaults to insert time |
 
 Primary key: `(ticker_id, date_id, time_id, field_group_id)`. Added in
 `004_add_reconciliation_tables`. One row per (bar, field group) once `quant-reconcile` resolves it
 — presence of a row *is* "resolved"; a bar with no row here for one of its groups is still stuck in
 `staging_market_data_1min`. `resolution_path` distinguishes `quant-reconcile`'s automatic pass
-(`'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'`) from `--finalize`'s
-`preferredProvider` algorithm (`'finalized'`) from an actual person directly correcting a bar
-(`'manual_override'` — the only path a whistleblower provider's value can ever reach
-`fact_market_data_1min` through). `'unadjudicated'` (added alongside `'massive'` becoming a second
-real candidate, croicu/quant-data#44) fires automatically, mid-automatic-pass, whenever no
+(`'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'` / `'historical_mad_agreement'`)
+from `--finalize`'s `preferredProvider` algorithm (`'finalized'`) from an actual person directly
+correcting a bar (`'manual_override'` — the only path a whistleblower provider's value can ever
+reach `fact_market_data_1min` through). `'unadjudicated'` (added alongside `'massive'` becoming a
+second real candidate, croicu/quant-data#44) fires automatically, mid-automatic-pass, whenever no
 `ACCEPTED` whistleblower exists to adjudicate between two or more valid candidates — resolves to
 `settings.reconcile.preferredProvider`'s raw value like `'finalized'` does, but kept as its own
 label since no tolerance comparison was ever attempted (unlike `'agreement'`/`'boundary_fix'`) and
 no human was involved (unlike `'manual_override'`); `fact_reconciliation_participant`'s non-winning
 rows for an `'unadjudicated'` resolution reflect "never compared," not "lost a comparison."
+`'historical_mad_agreement'` (`tasks/retroactive_revision.md`) takes over from `'unadjudicated'`
+whenever this bar's ticker has a fully-seeded `candidate_pair_mad_band` (below): the two candidates
+are actually compared against each other via the pooled conditional-MAD band before promoting —
+still resolves to `preferredProvider`'s value on agreement, but disagreement beyond the band leaves
+the bar stuck (Tier 4) instead of promoting blind, unlike `'unadjudicated'`.
 Since `005_remove_volume_field_group`, rows here only ever exist for the `'ohlc'` group — a bar
 promotes to fact as soon as `'ohlc'` resolves, with `volume` taken directly from the winning
 provider's own staging row (see `tasks/volume_reconciliation.md`). See `tasks/quant-reconcile.md`
@@ -515,6 +529,48 @@ since `005_remove_volume_field_group`), so this table is keyed to `dim_field`
 (`open`/`high`/`low`/`close`), not `dim_field_group` — there'd be nothing for a volume row to
 affect. Only consulted by the automatic pass (Tiers 1-3); `--finalize`'s `resolve_finalize` never
 touches tolerance at all, so it's unaffected either way.
+
+## `candidate_pair_mad_band`
+
+| Column | Type | Notes |
+|---|---|---|
+| `ticker_id` | `INT NOT NULL` | FK → `dim_ticker` |
+| `field_id` | `INT NOT NULL` | FK → `dim_field` |
+| `conditional_mad_scaled` | `NUMERIC NOT NULL` | `1.4826 * median(\|d\|)` among nonzero candidate-pair differences (excludes the exact-match point mass) |
+| `k` | `NUMERIC NOT NULL` | Multiplies `conditional_mad_scaled` into an actual tolerance |
+| `updated_at` | `TIMESTAMP` | Defaults to insert time |
+
+Primary key: `(ticker_id, field_id)` — not provider-scoped like `materiality_floor`/
+`provider_pair_disagreement`, since this compares the two *candidates* against each other, not a
+candidate against the whistleblower. Added in `019_add_candidate_pair_mad_band`
+(`tasks/retroactive_revision.md`), built on `tasks/ibkr_massive_mad_calibration.md`'s validated
+E0-E8 findings. A missing `(ticker, field)` — or a ticker with only some of a field group's fields
+seeded — means no band at all for that ticker; `quant-reconcile` falls back to
+`resolution_path = 'unadjudicated'` (blind `preferredProvider` promotion, unchanged) exactly as
+before this table existed.
+
+`020_seed_candidate_pair_mad_band_spy` seeds `SPY` with the exact pooled full-range values
+`tasks/ibkr_massive_mad_calibration.md`'s E4 already computed and verified against 146,272
+lag-0-joined `ibkr`/`massive` bars, `k = 3.0` (E8's recommendation, checked twice — see that task's
+Pre-report-blockers and Second-review-pass sections). No other ticker is seeded — same "ship
+schema, seed real values once validated" precedent as `materiality_floor`.
+
+Used exactly once, by `resolve_automatic`'s no-whistleblower branch: with no `ACCEPTED`
+whistleblower to adjudicate (the entire historical period before `yfinance`'s ~30-day rolling
+window can reach), and a fully-seeded band for this ticker's field group, the two candidates are
+compared directly against each other (`d = (a-b)/midpoint`, same formula the calibration task
+validated) instead of promoting blind. Agreement within the band promotes `preferredProvider`
+under `resolution_path = 'historical_mad_agreement'` — deliberately its own label, not
+`'agreement'`, since there's no whistleblower observation to feed `provider_pair_disagreement`'s
+Welford variance. Disagreement beyond the band does **not** fall back to `'unadjudicated'`'s blind
+promotion — the bar stays stuck (Tier 4) for a person to review via `--finalize`, same as any other
+unresolved bar. Deliberately pooled over the full range and fixed, never rolled per period — per
+the calibration task's own R3a finding, rolling this value would make drift structurally
+undetectable. Checked live against production before this table was built: 6,736 of `SPY`'s 13,437
+already-promoted `fact_reconciliation` rows (50.1%) had gone through `'unadjudicated'` with zero
+cross-provider check at all — this table (seeded for `SPY`) closes that gap for new
+`quant-reconcile` runs going forward; the existing `'unadjudicated'` rows are left untouched
+(deliberately out of scope, see `tasks/retroactive_revision.md`).
 
 ## `fact_pending_manual_resolution`
 
