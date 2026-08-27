@@ -390,19 +390,6 @@ under `/local/` to the box:
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
-- **File**: [Re-evaluate existing unadjudicated bars](tasks/reevaluate_unadjudicated_bars.md)
-- **Status**: Brainstorm, not converged — [issue #87](https://github.com/croicu/quant-data/issues/87)
-  opened for backlog visibility (`status:brainstorm`). One real open question blocking design:
-  what happens when re-evaluation finds a bar that disagrees beyond the band, given the bar is
-  already published in `fact_market_data_1min` and this repo has no existing "retract an
-  already-promoted fact row" mechanism.
-- **Key Context**: deferred follow-up from the historical MAD band (issue #85, closed/merged/
-  live-verified) — that task deliberately scoped to going-forward only, leaving SPY's 6,736
-  already-promoted `resolution_path = 'unadjudicated'` bars (zero cross-provider check) untouched.
-  Checked live before any design work: the underlying staging rows are gone (already purged), but
-  both providers' original values are recoverable from `market_data_archive`, so re-evaluation is
-  technically feasible — just needs a different read path than plain `quant-reconcile`.
-
 - **File**: [Pipeline accuracy hardening](tasks/pipeline_accuracy_hardening.md) (supersedes
   [Per-ticker disagreement stats](tasks/per_ticker_disagreement.md) — that file's motivating
   evidence/ticker concentration data still stand and were carried forward, but its
@@ -824,8 +811,9 @@ under `/local/` to the box:
   'historical_mad_agreement'`; disagreement beyond the band does **not** fall back to blind
   promotion — stays stuck (Tier 4) for `--finalize`/manual review. Two decisions confirmed
   explicitly with the repo owner: backfill scope is going-forward only (the 6,736 existing
-  `unadjudicated` rows left untouched — re-evaluation is its own follow-up, see the New Task entry
-  above), and an unseeded ticker keeps today's blind-promotion behavior. Migrations `019`/`020`
+  `unadjudicated` rows left untouched — re-evaluation is its own follow-up, see the "Re-evaluate
+  existing `unadjudicated` bars" entry below), and an unseeded ticker keeps today's blind-promotion
+  behavior. Migrations `019`/`020`
   plus a `quant_writer` grant applied live to CroicuWS2's real `quant_data` database (repo owner's
   explicit request). **Live-verified in production** (2026-08-26): a real `quant-reconcile` run
   resolved 3,099 SPY bars via `historical_mad_agreement`, left the existing 6,736 `unadjudicated`
@@ -834,6 +822,27 @@ under `/local/` to the box:
   threshold of `3.0 × 4.729e-6 ≈ 1.42e-5`) rather than promoting them blind. 7 new tests (5
   pure-algorithm-level, 2 end-to-end through `FakeReconcileDatabase`), `ruff`/`pytest` both green
   (398 passed).
+- **Re-evaluate existing `unadjudicated` bars** — closed issue #87 (PR #88 merged, commit
+  `7a4a357`), the deferred follow-up to the historical MAD band above (deliberately scoped to
+  going-forward only at the time). **Design decision, repo owner's explicit call**: no retraction
+  mechanism — re-evaluating a bar only ever relabels `resolution_path`, never touches
+  `fact_market_data_1min`/`winning_provider_id`. Confirmed agreement relabels to
+  `'historical_mad_agreement'` (same label the live tier uses); confirmed disagreement relabels to
+  a new value, `'unadjudicated_disputed'`, flagging it for a future manual-review pass via a plain
+  query rather than retracting an already-published value. New `quant-reconcile
+  --reevaluate-unadjudicated` flag (mutually exclusive with `--finalize`) reads each candidate's
+  original value from `market_data_archive`, since staging is already purged for these bars — new
+  `reevaluate_unadjudicated()` pure function reuses the same `_candidate_pair_agrees_within_
+  mad_band` comparison the live tier uses (extracted for this purpose), so a bar re-evaluated here
+  gets the identical verdict a live run would have given it at promotion time. Migration `021`
+  (widens `resolution_path`'s `CHECK`) applied live to CroicuWS2 (repo owner's explicit request,
+  full `pg_dump` backup taken first). **Live-verified in production**: a real `quant-reconcile
+  --reevaluate-unadjudicated` run re-evaluated all 6,736 SPY `unadjudicated` bars — 6,716 (99.7%)
+  confirmed agreed, only 20 (0.3%) genuinely disputed. Verified `winning_provider_id` unchanged on
+  every relabeled row (0 mismatches); spot-checked one disputed bar directly against
+  `market_data_archive` (`ibkr` open 750.41 vs `massive` open 750.36, ~6.7e-5 relative diff, well
+  over SPY's ~2.3e-5 threshold — genuine). 9 new tests (4 pure-algorithm-level, 5 CLI-level
+  including `parse_args`), `ruff`/`pytest` both green (407 passed).
 - **Auto-manage the SSH tunnel via a `ConnectionTransport` abstraction** — closed issue #17.
   `psycopg`/libpq has no SSH transport of its own, so on-prem hosting structurally needs a tunnel —
   but that's specific to *today's* Ubuntu-box hosting choice, not an architectural requirement (a
