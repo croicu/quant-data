@@ -135,7 +135,7 @@ rather than picking a provider on the caller's behalf.
 
 ### `quant-reconcile`
 
-- Usage: `quant-reconcile [--finalize] [--debug]`
+- Usage: `quant-reconcile [--finalize | --reevaluate-unadjudicated] [--debug]`
 - Reads `staging_market_data_1min`, resolves each not-yet-resolved (bar, field group) — today just
   `ohlc`, since `volume` no longer has its own field group and simply rides along with whichever
   provider wins `ohlc` (see `tasks/volume_reconciliation.md`) — against the providers that reported
@@ -188,15 +188,32 @@ rather than picking a provider on the caller's behalf.
   instead of printing a one-line error.
 - `settings.reconcile.preferredProvider` (default `"ibkr"`) — which candidate provider wins
   `--finalize`'s fallback, any Tier 2 tie-break among multiple agreeing candidates, and (since
-  croicu/quant-data#44) the automatic pass's `'unadjudicated'` fallback: whenever no `ACCEPTED`
-  whistleblower row exists to adjudicate between two or more valid candidates (an outlier-rejected
-  or confirmed-absent whistleblower), the bar resolves straight to `preferredProvider`'s raw value
-  with no tolerance comparison ever attempted, rather than either falling through to Tier 4
-  (unnecessarily, if the candidates would have agreed) or comparing against a value already known
-  to be wrong. Only ever a provider with `dim_provider.role = 'candidate'`, never the whistleblower.
-  `settings.reconcile.k` (default `3.0`, must be positive) — the tolerance multiplier
-  (`tolerance = k * stddev * reference_value`) applied against `provider_pair_disagreement`'s
-  measured variance.
+  croicu/quant-data#44) the automatic pass's `'unadjudicated'`/`'historical_mad_agreement'`
+  fallbacks: whenever no `ACCEPTED` whistleblower row exists to adjudicate between two or more
+  valid candidates (an outlier-rejected or confirmed-absent whistleblower, or — structurally, for
+  the entire period before `yfinance`'s ~30-day rolling window can reach — the historical period),
+  the bar resolves to `preferredProvider`'s raw value. If this ticker has a fully-seeded
+  `candidate_pair_mad_band` (`tasks/retroactive_revision.md`), the two candidates are actually
+  checked against each other first (`resolution_path = 'historical_mad_agreement'` on agreement;
+  disagreement beyond the band leaves the bar stuck at Tier 4 instead of promoting) — otherwise it
+  falls back to the original unconditional promotion (`resolution_path = 'unadjudicated'`, no
+  tolerance comparison ever attempted at all). Only ever a provider with `dim_provider.role =
+  'candidate'`, never the whistleblower. `settings.reconcile.k` (default `3.0`, must be positive) —
+  the tolerance multiplier (`tolerance = k * stddev * reference_value`) applied against
+  `provider_pair_disagreement`'s measured variance (unrelated to `candidate_pair_mad_band`'s own
+  separately-configured `k`).
+- **`--reevaluate-unadjudicated`** (`tasks/reevaluate_unadjudicated_bars.md`): a one-off backlog
+  pass, not part of the plain/`--finalize` cadence — retroactively re-checks every existing
+  `resolution_path = 'unadjudicated'` bar for a ticker with a (possibly since-seeded)
+  `candidate_pair_mad_band`, using each candidate's original value from `market_data_archive`
+  (`staging_market_data_1min` is already purged for these bars by the time this would run).
+  **Never touches `fact_market_data_1min` or `winning_provider_id`** — only `resolution_path`
+  changes: confirmed agreement relabels to `'historical_mad_agreement'` (the same label the live
+  tier uses); confirmed disagreement relabels to `'unadjudicated_disputed'`, flagging it for a
+  future manual-review pass to find via a plain query, not retracting the already-published value
+  (this repo has no mechanism to un-publish a fact row, and building one was explicitly out of
+  scope for this task). A bar that can't be re-evaluated (band not fully seeded for its ticker, or
+  not exactly two archived candidates) is left untouched. Mutually exclusive with `--finalize`.
 - Exit codes: `0` the run completed (regardless of how many groups ended up stuck — that's a
   normal outcome, not a failure); `1` settings load failure, `settings.postgres` not configured;
   `2` argument parsing error.

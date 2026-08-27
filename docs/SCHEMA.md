@@ -93,6 +93,10 @@ validated E0-E8 findings and integrated per `tasks/retroactive_revision.md` — 
 section below for the full design and the concrete gap it closes (roughly half of `SPY`'s current
 `fact_market_data_1min` rows were promoted with zero cross-provider check at all).
 `020_seed_candidate_pair_mad_band_spy` seeded it with `SPY`'s own already-validated values.
+`021_add_unadjudicated_disputed_resolution_path` widened `resolution_path`'s `CHECK` with a sixth
+value, `'unadjudicated_disputed'`, for `--reevaluate-unadjudicated`'s retroactive re-check of
+bars promoted before `candidate_pair_mad_band` existed — see `tasks/reevaluate_unadjudicated_bars.md`
+and `fact_reconciliation`'s own section below.
 
 ## `dim_ticker`
 
@@ -294,7 +298,7 @@ change.
 | `time_id` | `INT NOT NULL` | FK → `dim_time` |
 | `field_group_id` | `INT NOT NULL` | FK → `dim_field_group` |
 | `winning_provider_id` | `INT NOT NULL` | FK → `dim_provider` |
-| `resolution_path` | `TEXT NOT NULL` | One of `'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'` / `'historical_mad_agreement'` / `'finalized'` / `'manual_override'`, enforced by a `CHECK` constraint. `'unadjudicated'` added in `017_add_unadjudicated_resolution_path`; `'historical_mad_agreement'` added in `019_add_candidate_pair_mad_band` |
+| `resolution_path` | `TEXT NOT NULL` | One of `'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'` / `'historical_mad_agreement'` / `'unadjudicated_disputed'` / `'finalized'` / `'manual_override'`, enforced by a `CHECK` constraint. `'unadjudicated'` added in `017_add_unadjudicated_resolution_path`; `'historical_mad_agreement'` added in `019_add_candidate_pair_mad_band`; `'unadjudicated_disputed'` added in `021_add_unadjudicated_disputed_resolution_path` |
 | `resolved_at` | `TIMESTAMP` | Defaults to insert time |
 
 Primary key: `(ticker_id, date_id, time_id, field_group_id)`. Added in
@@ -304,7 +308,8 @@ Primary key: `(ticker_id, date_id, time_id, field_group_id)`. Added in
 (`'completeness'` / `'agreement'` / `'boundary_fix'` / `'unadjudicated'` / `'historical_mad_agreement'`)
 from `--finalize`'s `preferredProvider` algorithm (`'finalized'`) from an actual person directly
 correcting a bar (`'manual_override'` — the only path a whistleblower provider's value can ever
-reach `fact_market_data_1min` through). `'unadjudicated'` (added alongside `'massive'` becoming a
+reach `fact_market_data_1min` through) from `--reevaluate-unadjudicated`'s retroactive re-check
+(`'unadjudicated_disputed'`). `'unadjudicated'` (added alongside `'massive'` becoming a
 second real candidate, croicu/quant-data#44) fires automatically, mid-automatic-pass, whenever no
 `ACCEPTED` whistleblower exists to adjudicate between two or more valid candidates — resolves to
 `settings.reconcile.preferredProvider`'s raw value like `'finalized'` does, but kept as its own
@@ -316,6 +321,13 @@ whenever this bar's ticker has a fully-seeded `candidate_pair_mad_band` (below):
 are actually compared against each other via the pooled conditional-MAD band before promoting —
 still resolves to `preferredProvider`'s value on agreement, but disagreement beyond the band leaves
 the bar stuck (Tier 4) instead of promoting blind, unlike `'unadjudicated'`.
+`'unadjudicated_disputed'` (`tasks/reevaluate_unadjudicated_bars.md`) is what an already-promoted
+`'unadjudicated'` row gets relabeled to when `--reevaluate-unadjudicated` retroactively re-checks it
+against a since-seeded `candidate_pair_mad_band` and finds a genuine disagreement — the promoted
+`winning_provider_id`/`fact_market_data_1min` value is left completely unchanged (no retraction
+mechanism exists, by explicit design), this label only marks the bar for a future manual-review
+pass to find via a plain `WHERE resolution_path = 'unadjudicated_disputed'` query, distinguishing it
+from a bar that was simply never checked at all.
 Since `005_remove_volume_field_group`, rows here only ever exist for the `'ohlc'` group — a bar
 promotes to fact as soon as `'ohlc'` resolves, with `volume` taken directly from the winning
 provider's own staging row (see `tasks/volume_reconciliation.md`). See `tasks/quant-reconcile.md`

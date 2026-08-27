@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from quant_data._internal.shared.postgres import (
+    ArchivedCandidateBarRow,
     CandidatePairMadBandRow,
     DataQualityThresholdRow,
     DisagreementStatsRow,
@@ -31,6 +32,7 @@ class FakeReconcileDatabase:
         data_quality_thresholds: list[DataQualityThresholdRow] | None = None,
         materiality_floors: list[MaterialityFloorRow] | None = None,
         candidate_pair_mad_bands: list[CandidatePairMadBandRow] | None = None,
+        market_data_archive: list[tuple[int, int, int, int, float, float, float, float]] | None = None,
     ) -> None:
         self.providers = providers
         self.field_groups = field_groups
@@ -44,6 +46,10 @@ class FakeReconcileDatabase:
         self.data_quality_thresholds = data_quality_thresholds if data_quality_thresholds is not None else []
         self.materiality_floors = materiality_floors if materiality_floors is not None else []
         self.candidate_pair_mad_bands = candidate_pair_mad_bands if candidate_pair_mad_bands is not None else []
+        # (ticker_id, date_id, time_id, provider_id, open, high, low, close) -- mirrors
+        # market_data_archive's real shape (no field_group_id column there; the real fetch method
+        # gets it via a JOIN to fact_reconciliation, replicated the same way below).
+        self.market_data_archive = market_data_archive if market_data_archive is not None else []
 
         self.fact_reconciliation: list[tuple[int, int, int, int, int, str]] = []
         self.fact_reconciliation_participant: list[tuple[int, int, int, int, int, bool]] = []
@@ -160,6 +166,45 @@ class FakeReconcileDatabase:
             if (ticker_id, date_id, time_id) in staging_bar_keys:
                 result[(ticker_id, date_id, time_id, field_group_id)] = winning_provider_id
         return result
+
+    def fetch_archived_candidate_values_for_unadjudicated_bars(self, ticker_id: int) -> list[ArchivedCandidateBarRow]:
+        candidate_provider_ids: set[int] = set()
+        for provider in self.providers:
+            if provider.role == "candidate":
+                candidate_provider_ids.add(provider.provider_id)
+
+        unadjudicated_bars: dict[tuple[int, int], int] = {}
+        for row_ticker_id, date_id, time_id, field_group_id, _winning_provider_id, resolution_path in self.fact_reconciliation:
+            if row_ticker_id != ticker_id or resolution_path != "unadjudicated":
+                continue
+            unadjudicated_bars[(date_id, time_id)] = field_group_id
+
+        result: list[ArchivedCandidateBarRow] = []
+        for archive_ticker_id, date_id, time_id, provider_id, open_, high, low, close in self.market_data_archive:
+            if archive_ticker_id != ticker_id or provider_id not in candidate_provider_ids:
+                continue
+            field_group_id = unadjudicated_bars.get((date_id, time_id))
+            if field_group_id is None:
+                continue
+            result.append(
+                ArchivedCandidateBarRow(
+                    date_id=date_id, time_id=time_id, field_group_id=field_group_id, provider_id=provider_id, open=open_, high=high, low=low, close=close
+                )
+            )
+        return result
+
+    def update_unadjudicated_resolution_paths_batch(self, updates: list[tuple[int, int, int, int, str]]) -> None:
+        update_map: dict[tuple[int, int, int, int], str] = {}
+        for ticker_id, date_id, time_id, field_group_id, new_resolution_path in updates:
+            update_map[(ticker_id, date_id, time_id, field_group_id)] = new_resolution_path
+
+        updated_rows: list[tuple[int, int, int, int, int, str]] = []
+        for ticker_id, date_id, time_id, field_group_id, winning_provider_id, resolution_path in self.fact_reconciliation:
+            new_resolution_path = update_map.get((ticker_id, date_id, time_id, field_group_id))
+            if new_resolution_path is not None:
+                resolution_path = new_resolution_path
+            updated_rows.append((ticker_id, date_id, time_id, field_group_id, winning_provider_id, resolution_path))
+        self.fact_reconciliation = updated_rows
 
     def record_reconciliation(
         self,

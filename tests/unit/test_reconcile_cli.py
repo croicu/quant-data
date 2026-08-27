@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from quant_data._internal.shared.postgres import (
     CandidatePairMadBandRow,
     DisagreementStatsRow,
@@ -730,6 +732,75 @@ def test_historical_mad_band_leaves_bar_pending_when_candidates_disagree_beyond_
     assert (1, 10, 20, OHLC) in database.pending_manual_resolution
 
 
+def test_reevaluate_unadjudicated_relabels_agreement_without_touching_the_fact_row():
+    # tasks/reevaluate_unadjudicated_bars.md: an already-promoted 'unadjudicated' bar, now
+    # re-checked against a since-seeded band -- confirmed agreement relabels resolution_path but
+    # leaves winning_provider_id and fact_market_data_1min completely untouched.
+    database = FakeReconcileDatabase(
+        PROVIDERS_WITH_MASSIVE,
+        FIELD_GROUPS,
+        staging_rows=[],
+        fields=FIELDS,
+        candidate_pair_mad_bands=_seed_candidate_pair_mad_band(ticker_id=1, conditional_mad_scaled=1e-5, k=3.0),
+        market_data_archive=[
+            (1, 10, 20, IBKR, 100.0, 101.0, 99.0, 100.5),
+            (1, 10, 20, MASSIVE, 100.001, 101.001, 99.001, 100.501),
+        ],
+    )
+    database.fact_reconciliation.append((1, 10, 20, OHLC, IBKR, "unadjudicated"))
+    fact_before = dict(database.fact_market_data)
+
+    agreed, disputed = run_reconciliation(database, _settings(preferred_provider="ibkr"), finalize=False, reevaluate_unadjudicated_bars=True)
+
+    assert agreed == 1
+    assert disputed == 0
+    assert database.fact_reconciliation == [(1, 10, 20, OHLC, IBKR, "historical_mad_agreement")]
+    assert database.fact_market_data == fact_before  # untouched, no retraction/rewrite
+
+
+def test_reevaluate_unadjudicated_flags_disagreement_without_touching_the_fact_row():
+    database = FakeReconcileDatabase(
+        PROVIDERS_WITH_MASSIVE,
+        FIELD_GROUPS,
+        staging_rows=[],
+        fields=FIELDS,
+        candidate_pair_mad_bands=_seed_candidate_pair_mad_band(ticker_id=1, conditional_mad_scaled=1e-5, k=3.0),
+        market_data_archive=[
+            (1, 10, 20, IBKR, 100.0, 101.0, 99.0, 100.5),
+            (1, 10, 20, MASSIVE, 101.0, 102.0, 100.0, 101.5),
+        ],
+    )
+    database.fact_reconciliation.append((1, 10, 20, OHLC, IBKR, "unadjudicated"))
+    fact_before = dict(database.fact_market_data)
+
+    agreed, disputed = run_reconciliation(database, _settings(preferred_provider="ibkr"), finalize=False, reevaluate_unadjudicated_bars=True)
+
+    assert agreed == 0
+    assert disputed == 1
+    assert database.fact_reconciliation == [(1, 10, 20, OHLC, IBKR, "unadjudicated_disputed")]
+    assert database.fact_market_data == fact_before  # untouched -- no retraction mechanism exists
+
+
+def test_reevaluate_unadjudicated_leaves_unseeded_ticker_untouched():
+    database = FakeReconcileDatabase(
+        PROVIDERS_WITH_MASSIVE,
+        FIELD_GROUPS,
+        staging_rows=[],
+        fields=FIELDS,
+        market_data_archive=[
+            (1, 10, 20, IBKR, 100.0, 101.0, 99.0, 100.5),
+            (1, 10, 20, MASSIVE, 100.001, 101.001, 99.001, 100.501),
+        ],
+    )
+    database.fact_reconciliation.append((1, 10, 20, OHLC, IBKR, "unadjudicated"))
+
+    agreed, disputed = run_reconciliation(database, _settings(preferred_provider="ibkr"), finalize=False, reevaluate_unadjudicated_bars=True)
+
+    assert agreed == 0
+    assert disputed == 0
+    assert database.fact_reconciliation == [(1, 10, 20, OHLC, IBKR, "unadjudicated")]
+
+
 def test_second_candidate_graduates_on_already_graduated_ticker():
     # Regression test 6 (croicu/quant-data#44): ibkr is already graduated on ticker 1 with mature,
     # Welford-accumulated stats. massive joins as a second candidate and accumulates enough
@@ -847,6 +918,18 @@ def test_parse_args_recognizes_finalize_flag():
     arguments = parse_args(["--finalize"])
 
     assert arguments.finalize is True
+
+
+def test_parse_args_recognizes_reevaluate_unadjudicated_flag():
+    arguments = parse_args(["--reevaluate-unadjudicated"])
+
+    assert arguments.reevaluate_unadjudicated is True
+    assert arguments.finalize is False
+
+
+def test_parse_args_rejects_finalize_and_reevaluate_unadjudicated_together():
+    with pytest.raises(SystemExit):
+        parse_args(["--finalize", "--reevaluate-unadjudicated"])
 
 
 def _write_settings(tmp_path: Path, **overrides) -> Path:

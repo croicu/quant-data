@@ -163,6 +163,18 @@ class CandidatePairMadBandRow:
     k: float
 
 
+@dataclass
+class ArchivedCandidateBarRow:
+    date_id: int
+    time_id: int
+    field_group_id: int
+    provider_id: int
+    open: float
+    high: float
+    low: float
+    close: float
+
+
 class PostgresDatabase:
     """Concrete MarketDataProvider implementation, plus a write path used only by ingest.
 
@@ -1053,6 +1065,77 @@ class PostgresDatabase:
         for ticker_id, date_id, time_id, field_group_id, winning_provider_id in rows:
             result[(ticker_id, date_id, time_id, field_group_id)] = winning_provider_id
         return result
+
+    def fetch_archived_candidate_values_for_unadjudicated_bars(self, ticker_id: int) -> list[ArchivedCandidateBarRow]:
+        """tasks/reevaluate_unadjudicated_bars.md: for a ticker's fact_reconciliation rows still at
+        resolution_path='unadjudicated', pulls each candidate's original value from
+        market_data_archive -- staging_market_data_1min is already purged for these bars by the
+        time they'd be re-evaluated, market_data_archive is the only place the original
+        candidate-vs-candidate disagreement can still be reconstructed from. DISTINCT ON picks the
+        most-recently-archived row per (bar, provider): a bar can legitimately have more than one
+        archive_id for the same provider if it was archived more than once (e.g. a stray duplicate
+        staging write later purged again) -- the newest one is the one that matches what actually
+        promoted. Scoped to role='candidate' only; the whistleblower is never archived, so this
+        would never match one anyway, but the join makes the intent explicit rather than relying on
+        that absence."""
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT ON (m.date_id, m.time_id, m.provider_id)
+                        fr.date_id, fr.time_id, fr.field_group_id, m.provider_id, m.open, m.high, m.low, m.close
+                    FROM fact_reconciliation fr
+                    JOIN market_data_archive m
+                        ON m.ticker_id = fr.ticker_id AND m.date_id = fr.date_id AND m.time_id = fr.time_id
+                    JOIN dim_provider p ON p.provider_id = m.provider_id
+                    WHERE fr.ticker_id = %s AND fr.resolution_path = 'unadjudicated' AND p.role = 'candidate'
+                    ORDER BY m.date_id, m.time_id, m.provider_id, m.archived_at DESC
+                    """,
+                    (ticker_id,),
+                )
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise AppError(f"Failed to fetch archived candidate values for unadjudicated bars (ticker {ticker_id}): {error}") from error
+
+        result: list[ArchivedCandidateBarRow] = []
+        for date_id, time_id, field_group_id, provider_id, open_, high, low, close in rows:
+            result.append(
+                ArchivedCandidateBarRow(
+                    date_id=date_id,
+                    time_id=time_id,
+                    field_group_id=field_group_id,
+                    provider_id=provider_id,
+                    open=float(open_),
+                    high=float(high),
+                    low=float(low),
+                    close=float(close),
+                )
+            )
+        return result
+
+    def update_unadjudicated_resolution_paths_batch(self, updates: list[tuple[int, int, int, int, str]]) -> None:
+        """Bulk-updates fact_reconciliation.resolution_path for bars tasks/reevaluate_unadjudicated_
+        bars.md re-checked -- one commit per call regardless of row count, same reasoning as
+        save_provider_pair_disagreement_batch. `updates` is (ticker_id, date_id, time_id,
+        field_group_id, new_resolution_path). Deliberately never touches winning_provider_id or
+        fact_market_data_1min -- the promoted value doesn't change, only the confidence label."""
+        if not updates:
+            return
+        try:
+            with self._connection.cursor() as cursor:
+                for ticker_id, date_id, time_id, field_group_id, new_resolution_path in updates:
+                    cursor.execute(
+                        """
+                        UPDATE fact_reconciliation
+                        SET resolution_path = %s
+                        WHERE ticker_id = %s AND date_id = %s AND time_id = %s AND field_group_id = %s
+                        """,
+                        (new_resolution_path, ticker_id, date_id, time_id, field_group_id),
+                    )
+            self._connection.commit()
+        except psycopg.Error as error:
+            self._connection.rollback()
+            raise AppError(f"Failed to bulk-update unadjudicated resolution paths: {error}") from error
 
     def record_reconciliation(
         self,
