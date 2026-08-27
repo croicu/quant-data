@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from quant_data._internal.shared.diagnostics import ConsoleLogSink, Logger
 from quant_data._internal.shared.errors import AppError
-from quant_data._internal.shared.postgres import MaterialityFloorRow, PostgresDatabase, ProviderRow, StagingRow
+from quant_data._internal.shared.postgres import ArchivedCandidateBarRow, MaterialityFloorRow, PostgresDatabase, ProviderRow, StagingRow
 from quant_data._internal.shared.settings import PostgresSettings, Settings
 from quant_data._internal.shared.transports import resolve_transport
 from reconcile.algorithm import (
@@ -20,6 +20,7 @@ from reconcile.algorithm import (
     FIELD_GROUP_OHLC,
     GRADUATION_THRESHOLD_MATCHED_BARS,
     RESOLUTION_AGREEMENT,
+    RESOLUTION_HISTORICAL_MAD_AGREEMENT,
     ROLE_CANDIDATE,
     ROLE_WHISTLEBLOWER,
     DisagreementStats,
@@ -28,6 +29,7 @@ from reconcile.algorithm import (
     ProviderBar,
     batch_stats,
     fields_for_group,
+    reevaluate_unadjudicated,
     relative_diffs_for_stats_update,
     resolve_automatic,
     resolve_finalize,
@@ -46,13 +48,14 @@ CATEGORY_RECONCILE = "reconcile"
 @dataclass
 class CliArguments:
     finalize: bool = False
+    reevaluate_unadjudicated: bool = False
     debug: bool = False
 
 
 def parse_args(argv: list[str]) -> CliArguments:
     parser = argparse.ArgumentParser(
         prog="quant-reconcile",
-        usage="quant-reconcile [--finalize] [--debug]",
+        usage="quant-reconcile [--finalize | --reevaluate-unadjudicated] [--debug]",
         fromfile_prefix_chars="@",
         description=(
             "Reads staging_market_data_1min, resolves bars where every configured provider "
@@ -61,14 +64,24 @@ def parse_args(argv: list[str]) -> CliArguments:
             "fact_pending_manual_resolution and skipped by future plain runs. --finalize "
             "force-resolves only what's flagged there, using "
             "settings.reconcile.preferredProvider's raw value -- it does not also evaluate "
-            "not-yet-attempted bars."
+            "not-yet-attempted bars. --reevaluate-unadjudicated retroactively re-checks existing "
+            "resolution_path='unadjudicated' bars against a since-seeded historical MAD band "
+            "(tasks/reevaluate_unadjudicated_bars.md); it is a one-off backlog pass, not part of "
+            "either of the other two modes, and never changes a promoted bar's actual value."
         ),
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--finalize",
         action="store_true",
         default=False,
         help="force-resolve only the pending-manual-resolution queue using settings.reconcile.preferredProvider",
+    )
+    mode_group.add_argument(
+        "--reevaluate-unadjudicated",
+        action="store_true",
+        default=False,
+        help="retroactively re-check existing 'unadjudicated' bars against a since-seeded historical MAD band",
     )
     parser.add_argument(
         "--debug",
@@ -78,7 +91,7 @@ def parse_args(argv: list[str]) -> CliArguments:
     )
 
     args = parser.parse_args(argv)
-    return CliArguments(finalize=args.finalize, debug=args.debug)
+    return CliArguments(finalize=args.finalize, reevaluate_unadjudicated=args.reevaluate_unadjudicated, debug=args.debug)
 
 
 def _default_database_factory(postgres_settings: PostgresSettings) -> PostgresDatabase:
@@ -183,6 +196,28 @@ def _missing_graduation_keys(
             if key not in graduated_keys:
                 missing.add(key)
     return missing
+
+
+def _fetch_mad_bands_by_ticker(database: PostgresDatabase, field_ids_by_name: dict[str, int]) -> dict[int, dict[str, FieldMadBand]]:
+    """tasks/retroactive_revision.md: pooled, fixed per-(ticker, field) historical MAD band, keyed
+    by field *name* (not field_id) to match reconcile.algorithm.FieldMadBand's own dict shape -- a
+    ticker missing from the result, or missing any one of its fields, has no band at all. Shared by
+    both the live no-whistleblower tier (_run_automatic_pass) and tasks/reevaluate_unadjudicated_
+    bars.md's retroactive re-check (_run_reevaluate_unadjudicated_pass), so both read the exact
+    same seeded bands."""
+    field_names_by_id: dict[int, str] = {}
+    for field_name, field_id in field_ids_by_name.items():
+        field_names_by_id[field_id] = field_name
+
+    mad_bands_by_ticker: dict[int, dict[str, FieldMadBand]] = {}
+    for mad_band_row in database.fetch_candidate_pair_mad_bands():
+        field_name = field_names_by_id.get(mad_band_row.field_id)
+        if field_name is None:
+            continue
+        if mad_band_row.ticker_id not in mad_bands_by_ticker:
+            mad_bands_by_ticker[mad_band_row.ticker_id] = {}
+        mad_bands_by_ticker[mad_band_row.ticker_id][field_name] = FieldMadBand(conditional_mad_scaled=mad_band_row.conditional_mad_scaled, k=mad_band_row.k)
+    return mad_bands_by_ticker
 
 
 def _is_date_covered(coverage_ranges: dict[tuple[int, int], list[tuple[int, int]]], ticker_id: int, provider_id: int, date_id: int) -> bool:
@@ -476,23 +511,7 @@ def _run_automatic_pass(database: PostgresDatabase, settings: Settings) -> tuple
     for floor_row in database.fetch_materiality_floors():
         floors_by_key[(floor_row.provider_id, floor_row.ticker_id, floor_row.field_id)] = floor_row
 
-    # tasks/retroactive_revision.md: pooled, fixed per-(ticker, field) historical MAD band, keyed
-    # by field *name* (not field_id) to match reconcile.algorithm.FieldMadBand's own dict shape --
-    # a ticker missing from this dict, or missing any one of its fields, has no band at all and
-    # resolve_automatic falls back to today's unadjudicated behavior for it (see
-    # _has_full_mad_band).
-    field_names_by_id: dict[int, str] = {}
-    for field_name, field_id in field_ids_by_name.items():
-        field_names_by_id[field_id] = field_name
-
-    mad_bands_by_ticker: dict[int, dict[str, FieldMadBand]] = {}
-    for mad_band_row in database.fetch_candidate_pair_mad_bands():
-        field_name = field_names_by_id.get(mad_band_row.field_id)
-        if field_name is None:
-            continue
-        if mad_band_row.ticker_id not in mad_bands_by_ticker:
-            mad_bands_by_ticker[mad_band_row.ticker_id] = {}
-        mad_bands_by_ticker[mad_band_row.ticker_id][field_name] = FieldMadBand(conditional_mad_scaled=mad_band_row.conditional_mad_scaled, k=mad_band_row.k)
+    mad_bands_by_ticker = _fetch_mad_bands_by_ticker(database, field_ids_by_name)
 
     staging_rows = database.fetch_staging_rows_for_reconciliation(settings.providers, candidate_provider_names)
 
@@ -896,13 +915,97 @@ def _run_finalize_pass(database: PostgresDatabase, settings: Settings) -> tuple[
     return total_resolved, still_pending
 
 
-def run_reconciliation(database: PostgresDatabase, settings: Settings, finalize: bool) -> tuple[int, int]:
-    """Dispatches to the automatic pass or the --finalize sweep -- tasks/quant_reconcile.md's
-    "Updated (2026-08-03)" pending-manual-resolution queue design. Returns
+def _archived_row_to_provider_bar(row: ArchivedCandidateBarRow) -> ProviderBar:
+    """Only the OHLC fields feed reconcile.algorithm.reevaluate_unadjudicated's comparison --
+    role/provider_name/volume/data_quality are never read by it, so these are honest placeholders,
+    not guesses standing in for real unknowns. data_quality=ACCEPTED is still the correct fact, not
+    just a placeholder: an unadjudicated resolution could only ever have been reached with both
+    candidates already ACCEPTED (Tier 1 completeness catches any single-invalid-candidate case
+    first), so an archived row that fed one is known-ACCEPTED by construction."""
+    return ProviderBar(
+        provider_id=row.provider_id,
+        provider_name=str(row.provider_id),
+        role=ROLE_CANDIDATE,
+        open=row.open,
+        high=row.high,
+        low=row.low,
+        close=row.close,
+        volume=0.0,
+        data_quality=DATA_QUALITY_ACCEPTED,
+    )
+
+
+def _run_reevaluate_unadjudicated_pass(database: PostgresDatabase) -> tuple[int, int]:
+    """tasks/reevaluate_unadjudicated_bars.md: retroactively re-checks every existing
+    resolution_path='unadjudicated' fact_reconciliation row for a ticker with a since-seeded
+    candidate_pair_mad_band, using each candidate's original value from market_data_archive (the
+    live staging rows are already purged for all of them). Deliberately never touches
+    fact_market_data_1min or winning_provider_id -- only resolution_path changes, either to
+    'historical_mad_agreement' (confirmed agreement) or 'unadjudicated_disputed' (confirmed
+    disagreement, flagged for a future manual review pass, not retracted -- see that task's
+    converged design). A bar this can't re-evaluate (band not fully seeded for its ticker, or not
+    exactly two archived candidates) is left untouched, same as if this pass never ran for it.
+
+    Returns (agreed, disputed) -- deliberately not (resolved, needing_attention) despite the
+    similar shape, since neither number represents new Tier 1-4 work the way run_reconciliation's
+    other two passes do."""
+    fields = database.fetch_dim_fields()
+    field_ids_by_name: dict[str, int] = {}
+    for field in fields:
+        field_ids_by_name[field.name] = field.field_id
+
+    field_groups = database.fetch_dim_field_groups()
+    field_group_names_by_id: dict[int, str] = {}
+    for field_group in field_groups:
+        field_group_names_by_id[field_group.field_group_id] = field_group.name
+
+    mad_bands_by_ticker = _fetch_mad_bands_by_ticker(database, field_ids_by_name)
+
+    agreed = 0
+    disputed = 0
+    updates: list[tuple[int, int, int, int, str]] = []
+    for ticker_id, mad_bands in mad_bands_by_ticker.items():
+        archived_rows = database.fetch_archived_candidate_values_for_unadjudicated_bars(ticker_id)
+
+        rows_by_bar: dict[tuple[int, int, int], list[ArchivedCandidateBarRow]] = {}
+        for row in archived_rows:
+            bar_key = (row.date_id, row.time_id, row.field_group_id)
+            if bar_key not in rows_by_bar:
+                rows_by_bar[bar_key] = []
+            rows_by_bar[bar_key].append(row)
+
+        for (date_id, time_id, field_group_id), bar_rows in rows_by_bar.items():
+            field_group_name = field_group_names_by_id.get(field_group_id)
+            if field_group_name is None:
+                continue
+            archived_candidates = [_archived_row_to_provider_bar(row) for row in bar_rows]
+            new_resolution_path = reevaluate_unadjudicated(archived_candidates, field_group_name, mad_bands)
+            if new_resolution_path is None:
+                continue
+
+            updates.append((ticker_id, date_id, time_id, field_group_id, new_resolution_path))
+            if new_resolution_path == RESOLUTION_HISTORICAL_MAD_AGREEMENT:
+                agreed += 1
+            else:
+                disputed += 1
+
+    database.update_unadjudicated_resolution_paths_batch(updates)
+    return agreed, disputed
+
+
+def run_reconciliation(database: PostgresDatabase, settings: Settings, finalize: bool, reevaluate_unadjudicated_bars: bool = False) -> tuple[int, int]:
+    """Dispatches to the automatic pass, the --finalize sweep, or the --reevaluate-unadjudicated
+    retroactive re-check -- tasks/quant_reconcile.md's "Updated (2026-08-03)" pending-manual-
+    resolution queue design plus tasks/reevaluate_unadjudicated_bars.md's later addition. Returns
     (groups_resolved, groups_needing_attention): for a plain run the second value is newly marked
     pending this run (not a cumulative backlog count, since already-pending bars aren't even
     fetched); for --finalize it's whatever resolve_finalize itself couldn't resolve (expected to
-    be 0 in practice, since every pending bar already has every configured provider's data)."""
+    be 0 in practice, since every pending bar already has every configured provider's data); for
+    --reevaluate-unadjudicated it's (agreed, disputed) instead -- see
+    _run_reevaluate_unadjudicated_pass's own docstring for why that shape still fits the same
+    two-int return."""
+    if reevaluate_unadjudicated_bars:
+        return _run_reevaluate_unadjudicated_pass(database)
     if finalize:
         return _run_finalize_pass(database, settings)
     return _run_automatic_pass(database, settings)
@@ -946,11 +1049,16 @@ def main(
         active_database_factory = database_factory if database_factory is not None else _default_database_factory
         database = active_database_factory(settings.postgres)
         try:
-            resolved, needing_attention = run_reconciliation(database, settings, arguments.finalize)
+            resolved, needing_attention = run_reconciliation(database, settings, arguments.finalize, arguments.reevaluate_unadjudicated)
         finally:
             database.close()
 
-        if arguments.finalize:
+        if arguments.reevaluate_unadjudicated:
+            Logger.info(
+                f"quant-reconcile --reevaluate-unadjudicated: completed ({resolved} bar(s) confirmed agreed, {needing_attention} bar(s) confirmed disputed).",
+                category=CATEGORY_RECONCILE,
+            )
+        elif arguments.finalize:
             Logger.info(
                 f"quant-reconcile --finalize: completed ({resolved} group(s) resolved, {needing_attention} group(s) still unresolved).",
                 category=CATEGORY_RECONCILE,

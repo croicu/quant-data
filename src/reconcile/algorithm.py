@@ -27,6 +27,7 @@ RESOLUTION_AGREEMENT = "agreement"
 RESOLUTION_BOUNDARY_FIX = "boundary_fix"
 RESOLUTION_UNADJUDICATED = "unadjudicated"
 RESOLUTION_HISTORICAL_MAD_AGREEMENT = "historical_mad_agreement"
+RESOLUTION_UNADJUDICATED_DISPUTED = "unadjudicated_disputed"
 RESOLUTION_FINALIZED = "finalized"
 RESOLUTION_MANUAL_OVERRIDE = "manual_override"
 
@@ -339,6 +340,31 @@ def _has_full_mad_band(field_group: str, mad_bands: dict[str, FieldMadBand]) -> 
     return True
 
 
+def _candidate_pair_agrees_within_mad_band(
+    first: ProviderBar,
+    second: ProviderBar,
+    field_group: str,
+    mad_bands: dict[str, FieldMadBand],
+) -> bool:
+    """The one formula tasks/ibkr_massive_mad_calibration.md validated (d = (a-b)/midpoint,
+    matching .exp/budget/k_sweep.py exactly), factored out so both the live no-whistleblower tier
+    (_resolve_historical_mad_agreement) and tasks/reevaluate_unadjudicated_bars.md's retroactive
+    re-check use the byte-identical comparison -- a bar re-evaluated later must get the same
+    verdict a live run would have given it at promotion time. Caller is responsible for confirming
+    mad_bands is fully seeded for field_group (see _has_full_mad_band) -- this function assumes
+    every field already has a band and will KeyError otherwise, deliberately not defended against
+    here since that would silently mask a caller bug."""
+    for field_name in fields_for_group(field_group):
+        band = mad_bands[field_name]
+        first_value = getattr(first, field_name)
+        second_value = getattr(second, field_name)
+        reference = (first_value + second_value) / 2.0
+        diff = abs(first_value - second_value) / reference
+        if diff > band.k * band.conditional_mad_scaled:
+            return False
+    return True
+
+
 def _resolve_historical_mad_agreement(
     bars: list[ProviderBar],
     field_group: str,
@@ -350,11 +376,11 @@ def _resolve_historical_mad_agreement(
     caller via _has_full_mad_band) -- the historical-period stand-in validated by
     tasks/ibkr_massive_mad_calibration.md (E0-E8) and integrated per tasks/retroactive_revision.md.
 
-    Deliberately requires exactly two candidates: the validated band is a pairwise formula
-    (d = (a-b)/midpoint, matching .exp/budget/k_sweep.py exactly), not a generalized N-provider
-    one -- with any other candidate count this returns None (stays stuck, Tier 4) rather than
-    guessing at an ungeneralized formula. Today's production candidate set (ibkr, massive) is
-    always exactly two, so this is not a practical limitation, just an honest one.
+    Deliberately requires exactly two candidates: the validated band is a pairwise formula, not a
+    generalized N-provider one -- with any other candidate count this returns None (stays stuck,
+    Tier 4) rather than guessing at an ungeneralized formula. Today's production candidate set
+    (ibkr, massive) is always exactly two, so this is not a practical limitation, just an honest
+    one.
 
     Promotes preferredProvider on agreement -- the same winner _resolve_unadjudicated would have
     picked, now actually checked -- under its own resolution_path, distinct from 'agreement'
@@ -369,14 +395,8 @@ def _resolve_historical_mad_agreement(
         return None
 
     first, second = candidates
-    for field_name in fields_for_group(field_group):
-        band = mad_bands[field_name]
-        first_value = getattr(first, field_name)
-        second_value = getattr(second, field_name)
-        reference = (first_value + second_value) / 2.0
-        diff = abs(first_value - second_value) / reference
-        if diff > band.k * band.conditional_mad_scaled:
-            return None
+    if not _candidate_pair_agrees_within_mad_band(first, second, field_group, mad_bands):
+        return None
 
     if preferred_provider_id is None:
         return None
@@ -435,6 +455,37 @@ def resolve_finalize(bars: list[ProviderBar], preferred_provider_id: int) -> Res
         if bar.provider_id == preferred_provider_id and bar.role == ROLE_CANDIDATE:
             return Resolution(winning_provider_id=bar.provider_id, resolution_path=RESOLUTION_FINALIZED)
     return None
+
+
+def reevaluate_unadjudicated(
+    archived_candidates: list[ProviderBar],
+    field_group: str,
+    mad_bands: dict[str, FieldMadBand],
+) -> str | None:
+    """tasks/reevaluate_unadjudicated_bars.md: retroactively checks an already-promoted
+    RESOLUTION_UNADJUDICATED bar's archived candidate values against a since-seeded historical MAD
+    band, returning the new resolution_path label to write back -- or None if this bar can't be
+    re-evaluated at all (not exactly two archived candidates, or the band isn't fully seeded for
+    this field_group), in which case the caller must leave the row untouched.
+
+    Deliberately does NOT touch fact_market_data_1min -- the promoted value was always
+    preferredProvider's, unconditionally, under the old RESOLUTION_UNADJUDICATED path, so a
+    confirmed agreement changes nothing about which value is stored, only the confidence label.
+    A confirmed disagreement is flagged (RESOLUTION_UNADJUDICATED_DISPUTED) for a future manual
+    review pass to find via a plain query -- not retracted, since this repo has no mechanism (and,
+    per this task's own converged design, no stated need) to un-publish an already-promoted fact
+    row. Uses the byte-identical comparison _resolve_historical_mad_agreement's live tier uses
+    (_candidate_pair_agrees_within_mad_band), so a bar re-evaluated here gets the same verdict a
+    live run would have given it at promotion time, not a re-derived approximation."""
+    if not _has_full_mad_band(field_group, mad_bands):
+        return None
+    if len(archived_candidates) != 2:
+        return None
+
+    first, second = archived_candidates
+    if _candidate_pair_agrees_within_mad_band(first, second, field_group, mad_bands):
+        return RESOLUTION_HISTORICAL_MAD_AGREEMENT
+    return RESOLUTION_UNADJUDICATED_DISPUTED
 
 
 def relative_diffs_for_stats_update(candidate: ProviderBar, whistleblower: ProviderBar, field_group: str) -> list[float]:

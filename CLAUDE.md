@@ -390,6 +390,19 @@ under `/local/` to the box:
 - **Specific settings override generic ones on scope overlap** — when two configuration knobs can both influence the same outcome, the more specific/targeted one wins wherever they'd otherwise disagree, not the more generic/blanket one; the generic one only falls back into play when the specific one was left at its implicit default. Origin case: `settings.json`'s `logLevel` (a targeted verbosity control) vs. `debug` (a blanket flag) both used to influence the console log-category default, with `debug` winning outright — so setting `logLevel: "verbose"` alone did nothing, silently muted by `debug`'s separate default, which was surprising enough in practice to become this rule (see the Logging section above for the resulting behavior). Apply this whenever a new settings key's effect could overlap with an existing broader flag's — don't let a coarse toggle silently override an explicit, narrower setting the user actually configured.
 
 ## New Task
+- **File**: [Re-evaluate existing unadjudicated bars](tasks/reevaluate_unadjudicated_bars.md)
+- **Status**: Brainstorm, not converged — [issue #87](https://github.com/croicu/quant-data/issues/87)
+  opened for backlog visibility (`status:brainstorm`). One real open question blocking design:
+  what happens when re-evaluation finds a bar that disagrees beyond the band, given the bar is
+  already published in `fact_market_data_1min` and this repo has no existing "retract an
+  already-promoted fact row" mechanism.
+- **Key Context**: deferred follow-up from the historical MAD band (issue #85, closed/merged/
+  live-verified) — that task deliberately scoped to going-forward only, leaving SPY's 6,736
+  already-promoted `resolution_path = 'unadjudicated'` bars (zero cross-provider check) untouched.
+  Checked live before any design work: the underlying staging rows are gone (already purged), but
+  both providers' original values are recoverable from `market_data_archive`, so re-evaluation is
+  technically feasible — just needs a different read path than plain `quant-reconcile`.
+
 - **File**: [Pipeline accuracy hardening](tasks/pipeline_accuracy_hardening.md) (supersedes
   [Per-ticker disagreement stats](tasks/per_ticker_disagreement.md) — that file's motivating
   evidence/ticker concentration data still stand and were carried forward, but its
@@ -443,54 +456,6 @@ under `/local/` to the box:
   purpose in the GitHub issue, not assumed away.
 
 ## Pending Tasks
-
-- **Historical MAD band (`candidate_pair_mad_band`)** —
-  [issue #85](https://github.com/croicu/quant-data/issues/85), `status:implementation` — branch
-  `retroactive-revision-mad-band`. Production integration of `tasks/ibkr_massive_mad_calibration.md`'s
-  validated E0-E8 findings (`tasks/retroactive_revision.md`'s Brainstorm converged in the same
-  session, then trimmed to a pointer per this file's own convention once the issue existed).
-  **Motivating discovery, checked live against production before any code was written**: of SPY's
-  13,437 already-promoted `fact_reconciliation` rows, 6,736 (50.1%) went through
-  `resolution_path = 'unadjudicated'` — `resolve_automatic()`'s no-whistleblower branch promotes
-  `preferredProvider`'s raw value with zero comparison against the other candidate at all, for the
-  entire historical period before `yfinance`'s ~30-day rolling window can reach. New
-  `candidate_pair_mad_band` table (`ticker_id, field_id, conditional_mad_scaled, k`) — pooled over
-  the full historical range and deliberately fixed, not rolled (per the calibration task's own R3a
-  finding that rolling this value makes drift structurally undetectable). New
-  `_resolve_historical_mad_agreement` tier fires only when no `ACCEPTED` whistleblower exists and
-  this ticker has a fully-seeded band: agreement promotes `preferredProvider` under a new
-  `resolution_path = 'historical_mad_agreement'` (distinct from `'agreement'`, which must not feed
-  `provider_pair_disagreement`'s Welford variance here — there's no whistleblower observation to
-  record); disagreement beyond the band does **not** fall back to blind promotion like
-  `'unadjudicated'` does — stays stuck (Tier 4) for `--finalize`/manual review. `resolve_automatic()`
-  gained an optional `mad_bands` parameter defaulting to `None`, so every pre-existing call site is
-  unaffected. Two design decisions confirmed explicitly with the repo owner rather than assumed:
-  **backfill scope is going-forward only** (the 6,736 existing `unadjudicated` rows are left
-  untouched — re-evaluating already-published `fact_market_data_1min` is a separate, riskier
-  write-path question, deliberately out of scope) and **an unseeded ticker keeps today's blind-
-  promotion behavior** (not "flag everything" — same "ship schema, seed real values once validated"
-  precedent as `materiality_floor`/`data_quality_thresholds`). `migrations/
-  019_add_candidate_pair_mad_band` (new table + widens `fact_reconciliation.resolution_path`'s
-  `CHECK`) and `020_seed_candidate_pair_mad_band_spy` (SPY's own real conditional-MAD values, reused
-  verbatim from `.exp/budget/k_sweep.py`'s already-computed and twice-reviewed output). Volume stays
-  out of scope (rides along with the `ohlc` winner, unchanged); no cross-repo issue (every touched
-  path is internal to `src/reconcile/` and `quant_data._internal`, nothing under `src/quant_data/`'s
-  public surface changed). Implemented and unit-tested: 7 new tests (5 pure-algorithm-level in
-  `tests/unit/test_reconcile_algorithm.py`, 2 end-to-end through `FakeReconcileDatabase` in
-  `tests/unit/test_reconcile_cli.py`, the latter specifically to verify the real `field_id`↔
-  `field_name` wiring and ticker scoping in `reconcile/cli.py`, not just the pure function in
-  isolation) — `ruff`/`pytest` both green (398 passed, up from 391).
-  **Migrations `019`/`020` applied live to CroicuWS2's real `quant_data` database (2026-08-26,
-  repo owner's explicit request)** — verified directly: `candidate_pair_mad_band` holds SPY's 4
-  seeded rows, `fact_reconciliation`'s `CHECK` constraint now includes
-  `'historical_mad_agreement'`. Also granted `quant_writer` `SELECT` on the new table (same
-  precedent as `materiality_floor`'s own grant, `docs/DATABASE.md` updated) — without it
-  `quant-reconcile` would have hit `permission denied` the first time it tried to read the table,
-  since it connects as `quant_writer` in real usage, not `alex`. **The application code itself
-  (`resolve_automatic`'s new tier, `cli.py`'s wiring) is still uncommitted** — the schema exists
-  and is seeded, but nothing consumes it yet until this branch is committed, pushed, and a real
-  `quant-reconcile` run picks it up. Awaiting the repo owner's diff review per this file's "Before
-  committing" rule before that happens.
 
 - **Work-item scheduler (`quant-schedule`)** —
   [issue #68](https://github.com/croicu/quant-data/issues/68), `status:implementation` — branch
@@ -846,6 +811,29 @@ under `/local/` to the box:
   as a prerequisite.
 
 ## Completed Tasks
+- **Historical MAD band (`candidate_pair_mad_band`)** — closed issue #85 (PR #86 merged,
+  commit `8321aa1`), production integration of `tasks/ibkr_massive_mad_calibration.md`'s validated
+  E0-E8 findings. **Motivating discovery, checked live before any code was written**: of SPY's
+  13,437 already-promoted `fact_reconciliation` rows, 6,736 (50.1%) went through
+  `resolution_path = 'unadjudicated'` — `resolve_automatic()`'s no-whistleblower branch promoted
+  `preferredProvider`'s raw value with zero comparison against the other candidate at all, for the
+  entire historical period before `yfinance`'s ~30-day rolling window can reach. New
+  `candidate_pair_mad_band` table (`ticker_id, field_id, conditional_mad_scaled, k`), pooled over
+  the full historical range and deliberately fixed, not rolled. New `_resolve_historical_mad_
+  agreement` tier: agreement promotes `preferredProvider` under a new `resolution_path =
+  'historical_mad_agreement'`; disagreement beyond the band does **not** fall back to blind
+  promotion — stays stuck (Tier 4) for `--finalize`/manual review. Two decisions confirmed
+  explicitly with the repo owner: backfill scope is going-forward only (the 6,736 existing
+  `unadjudicated` rows left untouched — re-evaluation is its own follow-up, see the New Task entry
+  above), and an unseeded ticker keeps today's blind-promotion behavior. Migrations `019`/`020`
+  plus a `quant_writer` grant applied live to CroicuWS2's real `quant_data` database (repo owner's
+  explicit request). **Live-verified in production** (2026-08-26): a real `quant-reconcile` run
+  resolved 3,099 SPY bars via `historical_mad_agreement`, left the existing 6,736 `unadjudicated`
+  rows byte-for-byte unchanged, and correctly held back 101 bars on genuine disagreement (spot-
+  checked one: `ibkr`/`massive` disagreed on `low` by 0.000014 relative, just over SPY's seeded
+  threshold of `3.0 × 4.729e-6 ≈ 1.42e-5`) rather than promoting them blind. 7 new tests (5
+  pure-algorithm-level, 2 end-to-end through `FakeReconcileDatabase`), `ruff`/`pytest` both green
+  (398 passed).
 - **Auto-manage the SSH tunnel via a `ConnectionTransport` abstraction** — closed issue #17.
   `psycopg`/libpq has no SSH transport of its own, so on-prem hosting structurally needs a tunnel —
   but that's specific to *today's* Ubuntu-box hosting choice, not an architectural requirement (a

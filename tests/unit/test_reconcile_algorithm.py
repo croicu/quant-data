@@ -10,12 +10,14 @@ from reconcile.algorithm import (
     RESOLUTION_FINALIZED,
     RESOLUTION_HISTORICAL_MAD_AGREEMENT,
     RESOLUTION_UNADJUDICATED,
+    RESOLUTION_UNADJUDICATED_DISPUTED,
     ROLE_CANDIDATE,
     ROLE_WHISTLEBLOWER,
     DisagreementStats,
     FieldMadBand,
     FieldTolerance,
     ProviderBar,
+    reevaluate_unadjudicated,
     relative_diffs_for_stats_update,
     resolve_automatic,
     resolve_finalize,
@@ -274,6 +276,52 @@ def test_historical_mad_agreement_stays_stuck_with_more_than_two_candidates():
     )
 
     assert resolution is None
+
+
+def test_reevaluate_unadjudicated_confirms_agreement():
+    # tasks/reevaluate_unadjudicated_bars.md: two archived candidates that agree within the band --
+    # relabels to historical_mad_agreement, the same label the live tier uses.
+    archived = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.001, high=101.001, low=99.001, close=100.501),
+    ]
+
+    new_resolution_path = reevaluate_unadjudicated(archived, FIELD_GROUP_OHLC, _uniform_mad_band(conditional_mad_scaled=1e-5, k=3.0))
+
+    assert new_resolution_path == RESOLUTION_HISTORICAL_MAD_AGREEMENT
+
+
+def test_reevaluate_unadjudicated_confirms_disagreement():
+    # A genuine disagreement beyond the band -- relabels to unadjudicated_disputed, distinguishing
+    # "checked and found disputed" from plain 'unadjudicated' ("never checked").
+    archived = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=101.0, high=102.0, low=100.0, close=101.5),
+    ]
+
+    new_resolution_path = reevaluate_unadjudicated(archived, FIELD_GROUP_OHLC, _uniform_mad_band(conditional_mad_scaled=1e-5, k=3.0))
+
+    assert new_resolution_path == RESOLUTION_UNADJUDICATED_DISPUTED
+
+
+def test_reevaluate_unadjudicated_returns_none_when_band_not_fully_seeded():
+    archived = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+    partial_band = {"open": FieldMadBand(1e-5, 3.0)}
+
+    assert reevaluate_unadjudicated(archived, FIELD_GROUP_OHLC, partial_band) is None
+
+
+def test_reevaluate_unadjudicated_returns_none_with_more_than_two_archived_candidates():
+    archived = [
+        _bar(IBKR, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(MASSIVE, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+        _bar(4, ROLE_CANDIDATE, open_=100.0, high=101.0, low=99.0, close=100.5),
+    ]
+
+    assert reevaluate_unadjudicated(archived, FIELD_GROUP_OHLC, _uniform_mad_band(conditional_mad_scaled=1e-5, k=3.0)) is None
 
 
 def test_single_candidate_with_rejected_whistleblower_still_resolves_via_completeness():
